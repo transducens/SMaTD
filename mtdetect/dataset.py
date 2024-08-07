@@ -17,8 +17,6 @@ import transformers
 
 logger = logging.getLogger("mtdetect")
 
-# TODO adapt
-
 def remove_padding(sequence_batch, pad_token_id):
     _sequence_batch = sequence_batch.tolist()
 
@@ -60,13 +58,12 @@ def pad_sequence(sequence_batch, pad_token_id, max_length=0):
 class SmartBatchingURLsDataset(Dataset):
     # Code based on https://www.kaggle.com/code/rhtsingh/speeding-up-transformer-w-optimization-strategies?scriptVersionId=67176227&cellId=2
 
-    def __init__(self, input_data, output_data, tokenizer, max_length, regression=False, sampler_better_randomness=True,
-                 remove_instead_of_truncate=False, set_desc='', imbalanced_strategy='', tasks_data={}):
+    def __init__(self, input_data, output_data, tokenizer, max_length, sampler_better_randomness=True,
+                 remove_instead_of_truncate=False, set_desc=''):
         super(SmartBatchingURLsDataset, self).__init__()
 
         self.max_length = max_length
         self.pad_token_id = tokenizer.pad_token_id
-        self.regression = regression
         self.sampler_better_randomness = sampler_better_randomness
         self.dataloader = None
         self.set_desc = set_desc
@@ -103,55 +100,9 @@ class SmartBatchingURLsDataset(Dataset):
             raise Exception("Number of input entries from the main task is different of the labels len: "
                             f"{len(self.tokens)} vs {len(self.labels['urls_classification'])}")
 
-        if "labels_language_identification" in tasks_data and len(tasks_data["labels_language_identification"]) != 0:
-            logger.debug("Loading labels for task: language-identification and/or langid-and-urls_classification")
-
-            if len(tasks_data["labels_language_identification"]) != len(self.labels["urls_classification"]):
-                raise Exception("Number of labels from the main task is different for the lang. id. task: "
-                                f"{len(self.labels['urls_classification'])} vs {len(tasks_data['labels_language_identification'])}")
-
-            disable_balance = True
-            self.labels["language-identification"] = np.zeros(len(self.tokens))
-            self.labels["langid-and-urls_classification"] = np.zeros(len(self.tokens))
-
-            for idx, (label, lang_id_label) in enumerate(zip(self.labels["urls_classification"], tasks_data["labels_language_identification"])):
-                self.labels["language-identification"][idx] = lang_id_label
-
-                if tasks_data["reward_if_only_langid_is_correct_too"]:
-                    self.labels["langid-and-urls_classification"][idx] = (lang_id_label * label + lang_id_label) / 2 # (w * x * y + x) / (w + 1) ; w = 1
-                else:
-                    self.labels["langid-and-urls_classification"][idx] = lang_id_label * label
-
-        # Imbalanced strategy?
-        if imbalanced_strategy:
-            balance = False
-
-            if imbalanced_strategy in ("none", "weighted-loss"):
-                # It is not our responsability
-                pass
-            elif imbalanced_strategy == "over-sampling":
-                balance = True
-                imbalanced_obj = imblearn.over_sampling.RandomOverSampler(sampling_strategy="minority")
-            else:
-                raise Exception(f"Unknown imbalanced_strategy: {imbalanced_strategy}")
-
-            if balance and disable_balance:
-                logger.error("Currently is not supported to apply the selected imbalanced strategy with some auxiliary tasks: %s",
-                             imbalanced_strategy)
-            elif balance:
-                lengths_before = [np.sum(self.labels["urls_classification"] == 0), np.sum(self.labels["urls_classification"] == 1)]
-                self.tokens, _ = pad_sequence(self.tokens, self.pad_token_id, max_length=self.max_length) # We need to apply padding :/
-                self.tokens, self.labels["urls_classification"] = imbalanced_obj.fit_resample(self.tokens, self.labels["urls_classification"])
-                self.tokens = remove_padding(self.tokens, self.pad_token_id) # Remove padding
-                lengths_after = [np.sum(self.labels["urls_classification"] == 0), np.sum(self.labels["urls_classification"] == 1)]
-
-                logger.info("Imbalanced strategy '%s': from %s to %s", imbalanced_strategy, str(lengths_before), str(lengths_after))
-
         # Postprocess labels
-        for task in ("urls_classification", "language-identification", "langid-and-urls_classification"):
-            if task in self.labels:
-                self.labels[task] = torch.from_numpy(self.labels[task])
-                self.labels[task] = self.labels[task].type(torch.float) if regression else self.labels[task].type(torch.long)
+        self.labels["urls_classification"] = torch.from_numpy(self.labels["urls_classification"])
+        self.labels["urls_classification"] = self.labels["urls_classification"].type(torch.float) # Regression
 
     def __len__(self):
         return len(self.tokens)
@@ -171,11 +122,6 @@ class SmartBatchingURLsDataset(Dataset):
             "url_tokens": self.tokens[idx],
             "label": self.labels["urls_classification"][idx],
         }
-
-        if "language-identification" in self.labels:
-            result["label-language-identification"] = self.labels["language-identification"][idx]
-        if "langid-and-urls_classification" in self.labels:
-            result["label-langid-and-urls_classification"] = self.labels["langid-and-urls_classification"][idx]
 
         return result
 
@@ -298,13 +244,6 @@ class SmartBatchingCollate:
         targets_lang_id = None
         sequences = [b["url_tokens"] for b in batch]
         targets = [b["label"] for b in batch]
-        targets_lang_id = None
-        targets_lang_id_and_urls_classification = None
-
-        if "label-language-identification" in batch[0]:
-            targets_lang_id = [b["label-language-identification"] for b in batch]
-        if "label-langid-and-urls_classification" in batch[0]:
-            targets_lang_id_and_urls_classification = [b["label-langid-and-urls_classification"] for b in batch]
 
         input_ids, attention_mask = pad_sequence(sequences, self._pad_token_id)
 
@@ -313,11 +252,6 @@ class SmartBatchingCollate:
             "url_attention_mask": attention_mask,
             "labels": torch.tensor(targets),
         }
-
-        if targets_lang_id is not None:
-            output["labels_task_language_identification"] = torch.tensor(targets_lang_id)
-        if targets_lang_id_and_urls_classification is not None:
-            output["labels_task_language_identification_and_urls_classification"] = torch.tensor(targets_lang_id_and_urls_classification)
 
         return output
 
@@ -377,13 +311,6 @@ class MaxTokensCollate:
             # Return dynamic batch when max_tokens criteria is met or last batch is being processed
             sequences = [b["url_tokens"] for b in self._current_batch]
             targets = [b["label"] for b in self._current_batch]
-            targets_lang_id = None
-            targets_lang_id_and_urls_classification = None
-
-            if "label-language-identification" in self._current_batch[0]:
-                targets_lang_id = [b["label-language-identification"] for b in self._current_batch]
-            if "label-langid-and-urls_classification" in self._current_batch[0]:
-                targets_lang_id_and_urls_classification = [b["label-langid-and-urls_classification"] for b in self._current_batch]
 
             input_ids, attention_mask = pad_sequence(sequences, self._pad_token_id)
 
@@ -392,11 +319,6 @@ class MaxTokensCollate:
                 "url_attention_mask": attention_mask,
                 "labels": torch.tensor(targets),
             }
-
-            if targets_lang_id is not None:
-                output["labels_task_language_identification"] = torch.tensor(targets_lang_id)
-            if targets_lang_id_and_urls_classification is not None:
-                output["labels_task_language_identification_and_urls_classification"] = torch.tensor(targets_lang_id_and_urls_classification)
 
             # Reset variables
             self.reset_max_tokens_variables(last_or_first_batch=last_batch)
@@ -417,7 +339,7 @@ def tokenize_batch_from_iterator(iterator, tokenizer, batch_size, f=None, ignore
 
         return urls, initial_urls
 
-    f = lambda q: q if f is None else f
+    f = (lambda q: q) if f is None else f
     urls, initial_urls = reset()
 
     for idx, url in enumerate(iterator, 1):

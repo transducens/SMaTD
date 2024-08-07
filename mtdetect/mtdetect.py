@@ -1,18 +1,24 @@
 
 import os
 import sys
+import copy
+import random
 import logging
 import argparse
 
 import mtdetect.utils.utils as utils
+import mtdetect.dataset as dataset
 
 import torch
 from torch.optim.lr_scheduler import CyclicLR, LambdaLR
+from torch.optim import Adam, AdamW, SGD
+import torch.nn as nn
 import transformers
 from transformers import (
     get_linear_schedule_with_warmup,
 )
 import accelerate
+import numpy as np
 
 logger = logging.getLogger("mtdetect")
 accelerator = None
@@ -136,7 +142,7 @@ def save_model(accelerator, model, model_output, name="mtd"):
 
 def load_model(accelerator, model_input, pretrained_model, device, name="mtd"):
     local_model = model_input is not None
-    model = transformers.AutoModel.from_pretrained(pretrained_model)
+    model = transformers.AutoModelForSequenceClassification.from_pretrained(pretrained_model, num_labels=1)
     loaded_model = f"{pretrained_model}:{model_input}" if local_model else pretrained_model
 
     if local_model:
@@ -159,7 +165,7 @@ def load_dataset(filename_dataset, set_desc, **kwargs):
     output_data = []
 
     # Read data from input files
-    batch = datasets.tokenize_batch_from_iterator(file_dataset, kwargs["tokenizer"], kwargs["batch_size"], ignore_source_side=kwargs["monolingual"])
+    batch = dataset.tokenize_batch_from_iterator(file_dataset, kwargs["tokenizer"], kwargs["batch_size"], ignore_source_side=kwargs["monolingual"])
 
     for batch_urls in batch:
         input_data.extend(batch_urls["urls"])
@@ -237,6 +243,9 @@ def main(args):
     #is_device_gpu = device.type.startswith("cuda")
     tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model)
     model = load_model(accelerator, model_input, pretrained_model, device, name="mtd")
+    num_processes = accelerator.num_processes
+
+    logger.debug("Number of processes: %d", num_processes)
 
     if model_output is not None:
         save_model(accelerator, model, model_output, name="mtd")
@@ -260,17 +269,17 @@ def main(args):
     else:
         logger.warning("Deterministic values disable (you set a negative seed)")
 
-    if max_length_tokens > model.config.max_length:
-        logger.warning("%s can handle a max. of %d tokens at once but you set %d: changing value to %d", pretrained_model, model.config.max_length, max_length_tokens, model.config.max_length)
+    if max_length_tokens > tokenizer.model_max_length:
+        logger.warning("%s can handle a max. of %d tokens at once but you set %d: changing value to %d", pretrained_model, tokenizer.model_max_length, max_length_tokens, tokenizer.model_max_length)
 
-        max_length_tokens = model.config.max_length
+        max_length_tokens = tokenizer.model_max_length
 
     if not apply_inference:
         logger.debug("Train data file/s: %s", filename_dataset_train)
         logger.debug("Dev data file: %s", filename_dataset_dev)
         logger.debug("Test data file: %s", filename_dataset_test)
 
-    model_embeddings_size = model.get_base_model().base_model.embeddings.word_embeddings.weight.shape[0]
+    model_embeddings_size = model.base_model.embeddings.word_embeddings.weight.shape[0]
 
     assert model_embeddings_size == len(tokenizer), f"Embedding layer size does not match with the tokenizer size: {model_embeddings_size} vs {len(tokenizer)}"
 
@@ -303,14 +312,158 @@ def main(args):
         "max_length_tokens": max_length_tokens,
         "monolingual": monolingual,
     }
-
     dataset_train, dataloader_train = load_dataset(filename_dataset_train, "train", **dataset_static_args)
     dataset_dev, _ = load_dataset(filename_dataset_dev, "dev", **dataset_static_args)
     dataset_test, _ = load_dataset(filename_dataset_test, "test", **dataset_static_args)
-    training_steps_per_epoch = len(dataloader_train)
 
-    # TODO use next call
-    #model, optimizer, training_dataloader, scheduler = accelerator.prepare(model, optimizer, training_dataloader, scheduler)
+    #training_steps_per_epoch = len(dataloader_train) // num_processes
+    training_steps_per_epoch = len(dataloader_train) # it counts batches, not samples!
+    training_steps = training_steps_per_epoch * epochs # BE AWARE! "epochs" might be fake due to --train-until-patience
+    loss_function = nn.BCEWithLogitsLoss(reduction="mean") # Regression: raw input, not normalized
+                                                           #  (i.e. sigmoid is applied in the loss function)
+
+    # TODO verify that accelerate is handling correctly training_steps (e.g., linear LR scheduler with % of steps; use 10 epochs and verify that the first epoch the LR factor increases from 0 to 1)
+
+    model_parameters = filter(lambda p: p.requires_grad, model.parameters())
+
+    logger.debug("Optimizer args: %s", optimizer_args)
+
+    if optimizer_str == "none":
+        optimizer = None
+
+        logger.debug("Be aware that even with the optimizer disabled minor changes might be observed while training since the model is "
+                     "not in inference mode, so layers like Dropout have a random component which is enabled")
+    elif optimizer_str == "adam":
+        optimizer_kwargs = {
+            "betas": tuple(optimizer_args[0:2]),
+            "eps": optimizer_args[2],
+            "weight_decay": optimizer_args[3],
+        }
+        optimizer = Adam(model_parameters, lr=learning_rate, **optimizer_kwargs)
+    elif optimizer_str == "adamw":
+        optimizer_kwargs = {
+            "betas": tuple(optimizer_args[0:2]),
+            "eps": optimizer_args[2],
+            "weight_decay": optimizer_args[3],
+        }
+        optimizer = AdamW(model_parameters, lr=learning_rate, **optimizer_kwargs)
+    elif optimizer_str == "sgd":
+        optimizer_kwargs = {
+            "momentum": optimizer_args[0],
+            "weight_decay": optimizer_args[1],
+        }
+        optimizer = SGD(model_parameters, lr=learning_rate, **optimizer_kwargs)
+    else:
+        raise Exception(f"Unknown optimizer: {optimizer_str}")
+
+    # Get LR scheduler args
+    scheduler_args = []
+    scheduler_kwargs = {}
+
+    logger.debug("LR scheduler args: %s", lr_scheduler_args)
+
+    if scheduler_str == "none":
+        pass
+    elif scheduler_str == "linear":
+        if lr_scheduler_args[0][-1] == '%':
+            scheduler_args = [int((float(lr_scheduler_args[0][:-1]) / 100.0) * training_steps), training_steps]
+        else:
+            scheduler_args = [int(lr_scheduler_args[0]), training_steps]
+    elif scheduler_str == "CLR":
+        scheduler_max_lr, scheduler_step_size, scheduler_mode, scheduler_gamma, scheduler_max_lr_factor, scheduler_step_size_factor \
+            = lr_scheduler_args
+
+        if learning_rate > scheduler_max_lr:
+            new_scheduler_max_lr = learning_rate * scheduler_max_lr_factor # Based on the CLR paper (possible values are [3.0, 4.0])
+
+            logger.warning("LR scheduler: '%s': provided LR (%f) is greater than provided max. LR (%f): setting max. LR to %f",
+                           scheduler_str, learning_rate, scheduler_max_lr, new_scheduler_max_lr)
+
+            scheduler_max_lr = new_scheduler_max_lr
+        if scheduler_step_size <= 0:
+            scheduler_step_size = scheduler_step_size_factor * training_steps_per_epoch # Based on the CLR paper (possible values are [2, ..., 8])
+
+            logger.warning("LR scheduler: '%s': provided step size is 0 or negative: setting value to %d", scheduler_str, scheduler_step_size)
+
+        scheduler_args = [learning_rate, scheduler_max_lr]
+        scheduler_kwargs = {
+            "step_size_up": scheduler_step_size,
+            "step_size_down": scheduler_step_size,
+            "mode": scheduler_mode,
+            "gamma": scheduler_gamma,
+            "cycle_momentum": False, # https://github.com/pytorch/pytorch/issues/73910
+        }
+    elif scheduler_str == "inverse_sqrt":
+        if lr_scheduler_args[0][-1] == '%':
+            scheduler_args = [int((float(lr_scheduler_args[0][:-1]) / 100.0) * training_steps)]
+        else:
+            scheduler_args = [int(lr_scheduler_args[0])]
+    else:
+        raise Exception(f"Unknown LR scheduler: {scheduler}")
+
+    scheduler = get_lr_scheduler(scheduler_str, optimizer, *scheduler_args, **scheduler_kwargs)
+
+    model, optimizer, dataloader_train, scheduler = accelerator.prepare(model, optimizer, dataloader_train, scheduler)
+
+    stop_training = False
+    epoch = 0
+    current_patience = 0
+
+    while not stop_training:
+        logger.info("Epoch %d", epoch + 1)
+
+        model.train()
+
+        duplicated_data = {}
+
+        for batch in dataloader_train:
+            if max_tokens and batch is None:
+                # Batch is under construction using max_tokens...
+                continue
+
+            #optimizer.zero_grad() # https://discuss.pytorch.org/t/model-zero-grad-or-optimizer-zero-grad/28426/6
+            model.zero_grad()
+
+            #inputs, targets = batch
+            inputs = batch["url_tokens"]
+            attention_mask = batch["url_attention_mask"]
+            targets = batch["labels"]
+            outputs = model(inputs, attention_mask).logits # .last_hidden_state
+            outputs = outputs.squeeze(1) # (batch_size, 1) -> (batch_size,)
+            loss = loss_function(outputs, targets)
+
+            for i in inputs:
+                _i = tokenizer.decode(i.squeeze().tolist(), skip_special_tokens=True)
+
+                if _i not in duplicated_data:
+                    duplicated_data[_i] = 0
+
+                duplicated_data[_i] += 1
+
+            accelerator.backward(loss)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step()
+
+        total_duplicated = 0
+
+        for i, v in duplicated_data.items():
+            total_duplicated += v - 1
+
+        assert total_duplicated < batch_size, f"{total_duplicated} >= {batch_size}"
+        assert abs(len(duplicated_data) - batch_size * training_steps_per_epoch // num_processes) < batch_size, f"abs({len(duplicated_data)} - {batch_size} * {training_steps_per_epoch} // {num_processes}) >= {batch_size}"
+
+        epoch += 1
+
+        # Stop training?
+        if patience > 0 and current_patience >= patience:
+            # End of patience
+
+            stop_training = True
+        elif not train_until_patience:
+            stop_training = epoch >= epochs
+
+    logger.info("Done!")
 
 def get_options_from_argv(argv_flag, default_value, dict_with_options):
     choices = list(dict_with_options.keys())
@@ -411,6 +564,7 @@ def cli():
     logger = utils.set_up_logging_logger(logger, level=logging.DEBUG if args.verbose else logging.INFO)
 
     logger.debug("Arguments processed: {}".format(str(args))) # First logging message should be the processed arguments
+
     main(args)
 
 if __name__ == "__main__":

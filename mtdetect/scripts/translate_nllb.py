@@ -26,7 +26,7 @@ for l in sys.stdin:
 batch_size = 128
 
 def get_translator(batch_size):
-    return pipeline("translation", batch_size=batch_size, model=model, tokenizer=tokenizer, src_lang=source_lang, tgt_lang=target_lang, max_length=model.config.max_length, device=device, truncation=True)
+    return pipeline("translation", batch_size=batch_size, model=model, tokenizer=tokenizer, src_lang=source_lang, tgt_lang=target_lang, max_length=tokenizer.model_max_length, device=device, truncation=True)
 
 translator = get_translator(batch_size)
 
