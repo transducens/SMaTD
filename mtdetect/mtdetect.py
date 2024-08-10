@@ -8,22 +8,25 @@ import argparse
 
 import mtdetect.utils.utils as utils
 import mtdetect.dataset as dataset
+import mtdetect.inference as inference
 
 import torch
-from torch.optim.lr_scheduler import CyclicLR, LambdaLR
+from torch.optim.lr_scheduler import CyclicLR
 from torch.optim import Adam, AdamW, SGD
 import torch.nn as nn
 import transformers
 from transformers import (
     get_linear_schedule_with_warmup,
+    get_inverse_sqrt_schedule,
 )
 import accelerate
 import numpy as np
+from torch.utils.tensorboard import SummaryWriter
 
 logger = logging.getLogger("mtdetect")
 accelerator = None
+writer = None
 
-DEBUG = bool(int(os.environ["MTD_DEBUG"])) if "MTD_DEBUG" in os.environ else False
 _lr_scheduler_args = {
     "none": {},
     "linear": {
@@ -98,22 +101,7 @@ def get_lr_scheduler(scheduler, optimizer, *args, **kwargs):
         if optimizer is None:
             raise Exception(f"Optimizer not provided, so the selected LR scheduler can't be configured: {scheduler}")
 
-        def inverse_sqrt(current_step):
-            num_warmup_steps = args[0]
-
-            if current_step < num_warmup_steps:
-                return float(current_step) / float(max(1, num_warmup_steps))
-
-            # From https://fairseq.readthedocs.io/en/latest/_modules/fairseq/optim/lr_scheduler/inverse_square_root_schedule.html
-            # In fairseq they set directly the LR to the optimizer, but we use it for a LR scheduler, so for us is a value which will multiply the LR
-            initial_lr = optimizer.defaults["lr"]
-            decay_factor = initial_lr * num_warmup_steps**0.5
-            lr = decay_factor * current_step**-0.5
-
-            return lr / initial_lr # This step makes that the multiplication of initial_lr doesn't affect, but the previous lines are just being similar
-                                   #  to the version of fairseq
-
-        scheduler_instance = LambdaLR(optimizer, inverse_sqrt, **kwargs)
+        scheduler_instance = get_inverse_sqrt_schedule(optimizer, *args, **kwargs)
     else:
         raise Exception(f"Unknown LR scheduler: {scheduler}")
 
@@ -122,9 +110,12 @@ def get_lr_scheduler(scheduler, optimizer, *args, **kwargs):
 
     return scheduler_instance
 
-def save_model(accelerator, model, model_output, name="mtd"):
+def save_model(accelerator, model, model_output=None, name="mtd"):
     # Be aware that all threads need to reach this function
     accelerator.wait_for_everyone()
+
+    if model_output is None:
+        return
 
     unwrapped_model = accelerator.unwrap_model(model)
     #unwrapped_model.save_pretrained(
@@ -136,18 +127,19 @@ def save_model(accelerator, model, model_output, name="mtd"):
     if accelerator.is_local_main_process:
         accelerator.save(unwrapped_model.state_dict(), f"{model_output}/{name}.pt")
 
-        logger.info("%d: model saved: %s", accelerator.process_index, model_output)
+        logger.info("%d: model saved: %s", accelerator.process_index, f"{model_output}/{name}.pt")
 
     accelerator.wait_for_everyone()
 
-def load_model(accelerator, model_input, pretrained_model, device, name="mtd"):
+def load_model(accelerator, model_input, pretrained_model, device, name=None):
     local_model = model_input is not None
     model = transformers.AutoModelForSequenceClassification.from_pretrained(pretrained_model, num_labels=1)
     loaded_model = f"{pretrained_model}:{model_input}" if local_model else pretrained_model
 
     if local_model:
         model = accelerator.unwrap_model(model)
-        state_dict = torch.load(f"{model_input}/{name}.pt", weights_only=True) # https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models
+        _model_input = f"{model_input}/{name}.pt" if name is not None else model_input
+        state_dict = torch.load(_model_input, weights_only=True) # https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models
 
         model.load_state_dict(state_dict)
 
@@ -235,6 +227,7 @@ def main(args):
     optimizer_args = args.optimizer_args # Content might vary depending on the value of optimizer_str
     dataset_workers = args.dataset_workers
     monolingual = args.monolingual
+    threshold = args.threshold
 
     # Model
     #use_cuda = utils.use_cuda(force_cpu=force_cpu) # Will be True if possible and False otherwise
@@ -242,13 +235,12 @@ def main(args):
     device = accelerator.device
     #is_device_gpu = device.type.startswith("cuda")
     tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model)
-    model = load_model(accelerator, model_input, pretrained_model, device, name="mtd")
+    model = load_model(accelerator, model_input, pretrained_model, device, name=None)
     num_processes = accelerator.num_processes
 
     logger.debug("Number of processes: %d", num_processes)
 
-    if model_output is not None:
-        save_model(accelerator, model, model_output, name="mtd")
+    save_model(accelerator, model, model_output=model_output, name="mtd_epoch_0")
 
     ##################
 
@@ -289,10 +281,21 @@ def main(args):
 
         max_tokens = max_length_tokens
 
-    if apply_inference:
-        # TODO
+    loss_function = nn.BCEWithLogitsLoss(reduction="mean") # Regression: raw input, not normalized
+                                                           #  (i.e. sigmoid is applied in the loss function)
 
-        logger.info("Done!")
+    if apply_inference:
+        assert writer is None
+
+        if accelerator.is_local_main_process:
+            dataset = '-' if inference_from_stdin else None
+            metrics = inference.inference_eval(model, tokenizer, dataset, loss_function=loss_function, device=device,
+                                               max_tokens=max_tokens, threshold=threshold, monolingual=monolingual)
+
+            if metrics is not None:
+                logger.info("Inference metrics: %s", metrics)
+
+        logger.info("%d: done!", accelerator.process_index)
 
         # Stop execution
         return
@@ -319,10 +322,8 @@ def main(args):
     #training_steps_per_epoch = len(dataloader_train) // num_processes
     training_steps_per_epoch = len(dataloader_train) # it counts batches, not samples!
     training_steps = training_steps_per_epoch * epochs # BE AWARE! "epochs" might be fake due to --train-until-patience
-    loss_function = nn.BCEWithLogitsLoss(reduction="mean") # Regression: raw input, not normalized
-                                                           #  (i.e. sigmoid is applied in the loss function)
 
-    # TODO verify that accelerate is handling correctly training_steps (e.g., linear LR scheduler with % of steps; use 10 epochs and verify that the first epoch the LR factor increases from 0 to 1)
+    # I have checked out that the use of accelerate+LR scheduler is correctly adapted according to the number of GPUs used for training
 
     model_parameters = filter(lambda p: p.requires_grad, model.parameters())
 
@@ -408,6 +409,10 @@ def main(args):
     stop_training = False
     epoch = 0
     current_patience = 0
+    dev_best_metric = "acc"
+    dev_best_epoch = 0
+    dev_best_metric_value = -np.inf
+    global_step = 0
 
     while not stop_training:
         logger.info("Epoch %d", epoch + 1)
@@ -424,13 +429,9 @@ def main(args):
             #optimizer.zero_grad() # https://discuss.pytorch.org/t/model-zero-grad-or-optimizer-zero-grad/28426/6
             model.zero_grad()
 
-            #inputs, targets = batch
             inputs = batch["url_tokens"]
-            attention_mask = batch["url_attention_mask"]
-            targets = batch["labels"]
-            outputs = model(inputs, attention_mask).logits # .last_hidden_state
-            outputs = outputs.squeeze(1) # (batch_size, 1) -> (batch_size,)
-            loss = loss_function(outputs, targets)
+            result = inference.inference(model, batch, loss_function=loss_function, device=device, threshold=threshold)
+            loss = result["loss"]
 
             for i in inputs:
                 _i = tokenizer.decode(i.squeeze().tolist(), skip_special_tokens=True)
@@ -445,6 +446,13 @@ def main(args):
             optimizer.step()
             scheduler.step()
 
+            loss = accelerator.gather(loss).mean().item()
+
+            if accelerator.is_main_process:
+                writer.add_scalar("loss/train", loss, global_step)
+
+            global_step += 1
+
         total_duplicated = 0
 
         for i, v in duplicated_data.items():
@@ -453,7 +461,31 @@ def main(args):
         assert total_duplicated < batch_size, f"{total_duplicated} >= {batch_size}"
         assert abs(len(duplicated_data) - batch_size * training_steps_per_epoch // num_processes) < batch_size, f"abs({len(duplicated_data)} - {batch_size} * {training_steps_per_epoch} // {num_processes}) >= {batch_size}"
 
-        epoch += 1
+        # Patience
+        #if accelerator.is_local_main_process: # Do not even think about it ;) for some good reason (that I would like to know), it gets stuck
+        dev_eval = inference.inference_eval(model, tokenizer, dataset_dev, loss_function=loss_function, device=device, max_tokens=max_tokens, threshold=threshold)
+        dev_patience_metric = dev_eval[dev_best_metric]
+
+        if accelerator.is_local_main_process:
+            logger.debug("Dev eval all metrics: %s", dev_eval)
+            logger.info("Dev eval metric: %s", dev_patience_metric)
+
+            writer.add_scalar(f"{dev_best_metric}/dev", dev_patience_metric, epoch + 1)
+
+        if dev_patience_metric <= dev_best_metric_value:
+            current_patience += 1
+
+            if patience > 0 and accelerator.is_local_main_process:
+                logger.info("Exhausting patience... %d/%d", current_patience, patience)
+        else:
+            if accelerator.is_local_main_process:
+                logger.info("Best dev patience metric update: %s -> %s", dev_best_metric_value, dev_patience_metric)
+
+            dev_best_metric_value = dev_patience_metric
+            dev_best_epoch = epoch + 1
+            current_patience = 0
+
+            save_model(accelerator, model, model_output=model_output, name="mtd_best_dev")
 
         # Stop training?
         if patience > 0 and current_patience >= patience:
@@ -461,9 +493,39 @@ def main(args):
 
             stop_training = True
         elif not train_until_patience:
-            stop_training = epoch >= epochs
+            stop_training = (epoch + 1) >= epochs
 
-    logger.info("Done!")
+        epoch += 1
+
+        save_model(accelerator, model, model_output=model_output, name=f"mtd_epoch_{epoch}")
+
+    # Eval test
+    if accelerator.is_local_main_process:
+        _break = model_output is None
+
+        for _epoch in range(epoch + 1):
+            if not _break:
+                # Eval model trained on epoch {_epoch}
+                model_name = f"mtd_epoch_{_epoch}"
+                desc = f" (best dev model)" if _epoch == dev_best_epoch else ''
+                model = load_model(accelerator, model_output, pretrained_model, device, name=model_name)
+            # else: eval last model
+
+            test_eval = inference.inference_eval(model, tokenizer, dataset_test, loss_function=loss_function, device=device, max_tokens=max_tokens, threshold=threshold)
+
+            if _break:
+                logger.info("Test metrics: %s", test_eval)
+            else:
+                logger.info("Test metrics for model %s%s: %s", model_name, desc, test_eval)
+
+            aux_epoch = epoch if _break else _epoch
+
+            writer.add_scalar(f"{dev_best_metric}/test", test_eval[dev_best_metric], aux_epoch)
+
+            if _break:
+                break
+
+    logger.info("%d: done!", accelerator.process_index)
 
 def get_options_from_argv(argv_flag, default_value, dict_with_options):
     choices = list(dict_with_options.keys())
@@ -536,6 +598,8 @@ def initialization():
                              "This option will be only applied to the training set")
     parser.add_argument('--monolingual', action="store_true",
                         help="Only the MT or HT will be processed instead of OT+MT|HT. This does not change the expected format in the data: OT+MT|HT+label")
+    parser.add_argument('--threshold', type=float, default=0.5,
+                        help="Threshold to consider a given text to be HT")
 
     parser.add_argument('--seed', type=int, default=71213,
                         help="Seed in order to have deterministic results (not fully guaranteed). "
@@ -550,8 +614,10 @@ def initialization():
 def cli():
     global logger
     global accelerator
+    global writer
 
     assert accelerator is None
+    assert writer is None
 
     accelerator = accelerate.Accelerator()
 
@@ -563,7 +629,14 @@ def cli():
     # Logging
     logger = utils.set_up_logging_logger(logger, level=logging.DEBUG if args.verbose else logging.INFO)
 
-    logger.debug("Arguments processed: {}".format(str(args))) # First logging message should be the processed arguments
+    if accelerator.is_local_main_process:
+        logger.debug("Arguments processed: {}".format(str(args))) # First logging message should be the processed arguments
+
+        if not args.inference:
+            # Let's avoid creating directories to do not log anything
+            writer = SummaryWriter()
+
+            logger.info("TensorBoard directory: %s", writer.log_dir)
 
     main(args)
 

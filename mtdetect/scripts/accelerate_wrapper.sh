@@ -9,5 +9,7 @@ if [[ -z "$GPUS" ]]; then
   exit 1
 fi
 
+echo "GPUs: $GPUS; Args: $ARGS"
+
 srun --gres=gpu:$GPUS \
 accelerate launch --no_python --num_processes="$GPUS" mtdetect $ARGS
