@@ -77,8 +77,9 @@ def inference_eval(model, tokenizer, _dataset, loss_function=None, device=None, 
 
     all_outputs = torch.as_tensor(all_outputs)
     all_labels = torch.as_tensor(all_labels)
+    all_loss = torch.as_tensor(all_loss)
     metrics = get_metrics(all_outputs, all_labels)
-    metrics["loss_average"] = sum(all_loss) / len(all_loss)
+    metrics["loss_average"] = all_loss.mean().item()
 
     if training:
         # Restore model status
@@ -163,8 +164,9 @@ def inference_from_stdin(model, tokenizer, batch_size, loss_function=None, devic
 
     all_outputs = torch.as_tensor(all_outputs)
     all_labels = torch.as_tensor(all_labels)
+    all_loss = torch.as_tensor(all_loss)
     metrics = get_metrics(all_outputs, all_labels)
-    metrics["loss_average"] = sum(all_loss) / len(all_loss)
+    metrics["loss_average"] = all_loss.mean().item()
 
     if training:
         # Restore model status

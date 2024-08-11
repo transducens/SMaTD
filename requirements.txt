@@ -6,3 +6,4 @@ psutil==5.9.0
 more-itertools==9.0.0
 tensorboard==2.17.0
 scikit-learn==1.5.1 # installed using -U (indicated in the official documentation)...
+sentencepiece==0.2.0

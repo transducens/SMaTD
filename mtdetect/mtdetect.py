@@ -5,6 +5,7 @@ import copy
 import random
 import logging
 import argparse
+import warnings
 
 import mtdetect.utils.utils as utils
 import mtdetect.dataset as dataset
@@ -70,6 +71,22 @@ _optimizer_args = {
         "type": utils.argparse_nargs_type(float, float),
     }
 }
+
+def get_tokenizer(pretrained_model):
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+
+        tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model, use_fast=True)
+
+        for warning in w:
+            if "The sentencepiece tokenizer that you are converting to a fast tokenizer uses the byte fallback option" in str(warning.message):
+                logger.warning("Loading slow tokenizer")
+
+                tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model, use_fast=False)
+            else:
+                logger.warning("Tokenizer warning: %s", str(warning.message))
+
+    return tokenizer
 
 def get_lr_scheduler(scheduler, optimizer, *args, **kwargs):
     scheduler_instance = None
@@ -205,8 +222,8 @@ def apply_patience(model, tokenizer, dataset_dev, loss_function, device, thresho
     dev_patience_metric = dev_eval[dev_best_metric]
 
     if accelerator.is_local_main_process:
-        logger.debug("Dev eval all metrics: %s", dev_eval)
-        logger.info("Dev eval metric: %s", dev_patience_metric)
+        logger.debug("[step_or_epoch:%s] Dev eval all metrics: %s", epoch, dev_eval)
+        logger.info("[step_or_epoch:%s] Dev eval metric (%s): %s", epoch, dev_best_metric, dev_patience_metric)
 
         writer.add_scalar(f"{dev_best_metric}/dev", dev_patience_metric, epoch)
 
@@ -254,13 +271,13 @@ def main(args):
     dataset_workers = args.dataset_workers
     monolingual = args.monolingual
     threshold = args.threshold
-    eval_strategy = args.strategy # TODO
-    eval_steps = args.strategy_steps # TODO use global_step to calculate
+    eval_strategy = args.strategy
+    eval_steps = args.strategy_steps
     classifier_dropout = args.classifier_dropout
 
     # Model
     device = accelerator.device
-    tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model)
+    tokenizer = get_tokenizer(pretrained_model)
     model = load_model(accelerator, model_input, pretrained_model, device, name=None, classifier_dropout=classifier_dropout)
     num_processes = accelerator.num_processes
     save_model_prefix = f"mtd_{eval_strategy}"
@@ -300,7 +317,9 @@ def main(args):
 
     model_embeddings_size = model.base_model.embeddings.word_embeddings.weight.shape[0]
 
-    assert model_embeddings_size == len(tokenizer), f"Embedding layer size does not match with the tokenizer size: {model_embeddings_size} vs {len(tokenizer)}"
+    if model_embeddings_size != len(tokenizer):
+        # microsoft/deberta-v3-large -> 128100 vs 128001 (why 99 unknown tokens in the model?)
+        logger.error("Embedding layer size does not match with the tokenizer size: %d vs %d", model_embeddings_size, len(tokenizer))
 
     loss_function = nn.BCEWithLogitsLoss(reduction="mean") # Regression: raw input, not normalized
                                                            #  (i.e. sigmoid is applied in the loss function)
@@ -339,7 +358,7 @@ def main(args):
     dataset_test, _ = load_dataset(filename_dataset_test, "test", **dataset_static_args)
 
     #training_steps_per_epoch = len(dataloader_train) // num_processes
-    training_steps_per_epoch = len(dataloader_train) # it counts batches, not samples!
+    training_steps_per_epoch = len(dataloader_train) # it counts batches, not samples! It is not necessary to divide by 'num_processes' -> if warmup is 10 steps and 2 GPUs, warmup will finish at step 5
     training_steps = training_steps_per_epoch * epochs # BE AWARE! "epochs" might be fake due to --train-until-patience
 
     # I have checked out that the use of accelerate+LR scheduler is correctly adapted according to the number of GPUs used for training
@@ -435,7 +454,8 @@ def main(args):
     saved_epochs_or_steps = [0]
 
     while not stop_training:
-        logger.info("Epoch %d", epoch + 1)
+        if accelerator.is_local_main_process:
+            logger.info("Epoch %d", epoch + 1)
 
         model.train()
 
@@ -463,6 +483,16 @@ def main(args):
             optimizer.step()
             scheduler.step()
 
+            #####################
+            #current_lr = scheduler.get_last_lr()
+            #
+            #assert len(current_lr) == 1, current_lr
+            #
+            #current_lr = current_lr[0]
+            #
+            #logger.info("LR: %d/%d (%.2f %%): %s", step + 1, len(dataloader_train), (step + 1) * 100. / len(dataloader_train), current_lr)
+            #####################
+
             loss = accelerator.gather(loss).mean().item()
 
             if accelerator.is_main_process:
@@ -471,7 +501,7 @@ def main(args):
             step += 1
             global_step += 1
 
-            if eval_strategy == "steps" and global_step % strategy_steps == 0:
+            if eval_strategy == "steps" and global_step % eval_steps == 0:
                 # Patience
                 current_patience, dev_best_metric_value, dev_best_epoch = apply_patience(
                     model, tokenizer, dataset_dev, loss_function, device, threshold, dev_best_metric, global_step, dev_best_metric_value,
@@ -486,7 +516,8 @@ def main(args):
                     # End of patience
                     stop_training = True
 
-                    logger.debug("Training stopped in the middle of an epoch: %d/%d (%.2f %%) steps completed", step, len(dataloader_train), step * 100. / len(dataloader_train))
+                    if accelerator.is_local_main_process:
+                        logger.debug("Training stopped in the middle of an epoch: %d/%d (%.2f %%) steps completed", step, len(dataloader_train), step * 100. / len(dataloader_train))
 
                     break
 
@@ -530,27 +561,53 @@ def main(args):
             assert stop_training
 
     # Eval test
+    models_not_available = model_output is None
+    results_keys, results_values = [], []
+
+    if models_not_available:
+        saved_epochs_or_steps = [epoch if strategy == "epoch" else global_step]
+
+    for idx, epoch_or_step in enumerate(saved_epochs_or_steps):
+        if idx % accelerator.num_processes != accelerator.process_index:
+            continue
+
+        logger.debug("[process:%d] [step_or_epoch:%s] Evaluating test set", accelerator.process_index, epoch_or_step)
+
+        if not models_not_available:
+            # Eval model trained on epoch {epoch_or_step}
+            model_name = f"{save_model_prefix}_{epoch_or_step}"
+            desc = f" (best dev model)" if epoch_or_step == dev_best_epoch else ''
+            model = load_model(accelerator, model_output, pretrained_model, device, name=model_name, classifier_dropout=classifier_dropout)
+        # else: eval last model
+
+        test_eval = inference.inference_eval(model, tokenizer, dataset_test, loss_function=loss_function, device=device, threshold=threshold)
+
+        results_keys.append(epoch_or_step)
+        results_values.append(test_eval)
+
+    accelerator.wait_for_everyone()
+
+    results_keys = accelerate.utils.gather_object(results_keys)
+    results_values = accelerate.utils.gather_object(results_values)
+    results = {k: v for k, v in zip(results_keys, results_values)}
+
+    # TODO check if results contain what is expected. Likely it will not because gather_object does not seem to work properly with dictionaries, and results_values is a dictionary
+
+    logger.info("DEBUG: %s", results)
+
+    # Print results
     if accelerator.is_local_main_process:
-        models_not_available = model_output is None
-
-        if models_not_available:
-            saved_epochs_or_steps = [epoch if strategy == "epoch" else global_step]
-
-        for epoch_or_step in saved_epochs_or_steps:
-            if not models_not_available:
-                # Eval model trained on epoch {epoch_or_step}
-                model_name = f"{save_model_prefix}_{epoch_or_step}"
-                desc = f" (best dev model)" if epoch_or_step == dev_best_epoch else ''
-                model = load_model(accelerator, model_output, pretrained_model, device, name=model_name, classifier_dropout=classifier_dropout)
-            # else: eval last model
-
-            test_eval = inference.inference_eval(model, tokenizer, dataset_test, loss_function=loss_function, device=device, threshold=threshold)
+        for idx, epoch_or_step in enumerate(saved_epochs_or_steps):
+            test_eval = results[epoch_or_step]
 
             writer.add_scalar(f"{dev_best_metric}/test", test_eval[dev_best_metric], epoch_or_step)
 
             if models_not_available:
                 logger.info("Test metrics: %s", test_eval)
             else:
+                model_name = f"{save_model_prefix}_{epoch_or_step}"
+                desc = f" (best dev model)" if epoch_or_step == dev_best_epoch else ''
+
                 logger.info("Test metrics for model %s%s: %s", model_name, desc, test_eval)
 
     logger.info("%d: done!", accelerator.process_index)
