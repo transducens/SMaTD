@@ -2,6 +2,7 @@
 import sys
 import logging
 
+import mtdetect.dataset as dataset
 import mtdetect.utils.utils as utils
 
 import torch
@@ -47,7 +48,7 @@ def inference(model, inputs_and_outputs, loss_function=None, device=None, thresh
     return results
 
 @torch.no_grad()
-def inference_eval(model, tokenizer, dataset, loss_function=None, device=None, max_tokens=None, threshold=0.5, monolingual=None):
+def inference_eval(model, tokenizer, _dataset, loss_function=None, device=None, threshold=0.5, monolingual=None):
     training = model.training
 
     model.eval()
@@ -56,80 +57,90 @@ def inference_eval(model, tokenizer, dataset, loss_function=None, device=None, m
     all_outputs = []
     all_labels = []
     total_tokens = 0
-    normal = False
-    do_eval = False
-
-    if dataset is None:
-        # interactive
-        dataloader = ["placeholder"]
-
-        assert max_tokens is None, max_tokens
-    elif dataset == '-':
-        dataloader = sys.stdin
-    else:
-        dataloader = dataset.dataloader
-        normal = True
-        do_eval = True
+    dataloader = _dataset.dataloader
 
     for batch in dataloader:
-        if max_tokens and batch is None:
-            # Batch is under construction using max_tokens...
-            continue
+        total_tokens += sum([len(urls[urls != tokenizer.pad_token_id]) for urls in batch["url_tokens"]])
 
-        if batch == "placeholder":
-            loss_function = None
+        # Inference
+        results = inference(model, batch, loss_function=loss_function, device=device, threshold=threshold)
+        outputs_classification = results["outputs_classification_detach_list"]
+        labels = batch["labels"].cpu()
+        labels = torch.round(labels).type(torch.long)
+        loss = results["loss"].cpu().detach().item()
 
-            assert dataset is None
+        all_outputs.extend(outputs_classification)
+        all_labels.extend(labels.tolist())
+        all_loss.append(loss)
 
-            if monolingual:
-                s = input("Sentence: ")
-            else:
-                s1 = input("Source sentence: ")
-                s2 = input("Target sentence: ")
-                s = f"{s1}{tokenizer.sep_token}{s2}"
+    assert total_tokens == _dataset.total_tokens, f"{total_tokens} != {_dataset.total_tokens}"
 
-            if s not in ('', tokenizer.sep_token):
-                dataloader.append("placeholder")
-            else:
-                break
+    all_outputs = torch.as_tensor(all_outputs)
+    all_labels = torch.as_tensor(all_labels)
+    metrics = get_metrics(all_outputs, all_labels)
+    metrics["loss_average"] = sum(all_loss) / len(all_loss)
 
-        if not normal:
-            if batch != "placeholder":
-                s = batch.rstrip("\r\n").split('\t')
+    if training:
+        # Restore model status
+        model.train()
 
-                if not do_eval:
-                    do_eval = (len(s) == 3) or (monolingual and (len(s) == 2))
+    return metrics
 
-                assert len(s) == ((1 + int(do_eval)) if monolingual else (2 + int(do_eval))), s
+@torch.no_grad()
+def inference_from_stdin(model, tokenizer, batch_size, loss_function=None, device=None, max_length_tokens=None, threshold=0.5, monolingual=None, dataset_workers=-1):
+    training = model.training
 
-                if do_eval:
-                    label = s[1 if monolingual else 2]
+    model.eval()
 
-                    assert label in ('0', '1'), label
+    all_loss = []
+    all_outputs = []
+    all_labels = []
+    total_tokens = 0
+    do_eval = False
+    columns = None
+    input_data = []
+    output_data = []
+    max_length_tokens = max_length_tokens if max_length_tokens is not None else tokenizer.model_max_length
 
-                    label = float(label)
-                else:
-                    loss_function = None
+    for l in sys.stdin:
+        s = l.rstrip("\r\n").split('\t')
 
-                s = tokenizer.sep_token.join(s[:1 if monolingual else 2])
+        if columns is None:
+            columns = len(s)
+            do_eval = (len(s) == 3) or (monolingual and (len(s) == 2)) # True if labels are provided
 
-            tokens = utils.encode(tokenizer, [s], max_length=tokenizer.model_max_length, return_tensors=None, truncation=True)["input_ids"]
-            tokens = torch.tensor(tokens)
-            attention_mask = torch.LongTensor(torch.ones_like(tokens))
-            labels = torch.tensor([label]) if do_eval else None
-            batch = {
-                "url_tokens": tokens,
-                "url_attention_mask": attention_mask,
-                "labels": labels,
-                }
+            if not do_eval:
+                loss_function = None
 
-        total_tokens += sum([len(urls[urls != tokenizer.pad_token_id]) for urls in batch["url_tokens"]]) if normal else 0
+        assert columns == len(s), f"{columns} != {len(s)}: {s}"
+        assert len(s) == ((1 + int(do_eval)) if monolingual else (2 + int(do_eval))), s
+
+        label = 0 # fake
+
+        if do_eval:
+            label = s[1 if monolingual else 2]
+
+            assert label in ('0', '1'), f"{label} :from: {s}"
+
+            label = float(label)
+
+        s = tokenizer.sep_token.join(s[:1 if monolingual else 2])
+
+        input_data.append(s)
+        output_data.append(label) # might be a fake value
+
+    _dataset = dataset.SmartBatchingURLsDataset(input_data, output_data, tokenizer, max_length_tokens,
+                                                set_desc="stdin_inference", remove_instead_of_truncate=False)
+    dataloader = _dataset.get_dataloader(batch_size, device, dataset_workers)
+
+    for batch in dataloader:
+        total_tokens += sum([len(urls[urls != tokenizer.pad_token_id]) for urls in batch["url_tokens"]])
 
         # Inference
         results = inference(model, batch, loss_function=loss_function, device=device, threshold=threshold)
 
         # Results
-        if not normal and not do_eval:
+        if not do_eval:
             output = torch.sigmoid(results["outputs"]).cpu().detach().item()
 
             logger.info("%s\t%s", s, output)
@@ -145,11 +156,10 @@ def inference_eval(model, tokenizer, dataset, loss_function=None, device=None, m
         all_labels.extend(labels.tolist())
         all_loss.append(loss)
 
-    if not normal and not do_eval:
-        return None
+    assert total_tokens == _dataset.total_tokens, f"{total_tokens} != {_dataset.total_tokens}"
 
-    if normal:
-        assert total_tokens == dataset.total_tokens, f"{total_tokens} != {dataset.total_tokens}"
+    if not do_eval:
+        return None
 
     all_outputs = torch.as_tensor(all_outputs)
     all_labels = torch.as_tensor(all_labels)

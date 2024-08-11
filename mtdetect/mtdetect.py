@@ -131,9 +131,10 @@ def save_model(accelerator, model, model_output=None, name="mtd"):
 
     accelerator.wait_for_everyone()
 
-def load_model(accelerator, model_input, pretrained_model, device, name=None):
+def load_model(accelerator, model_input, pretrained_model, device, name=None, classifier_dropout=0.0):
     local_model = model_input is not None
-    model = transformers.AutoModelForSequenceClassification.from_pretrained(pretrained_model, num_labels=1)
+    config = transformers.AutoConfig.from_pretrained(pretrained_model, num_labels=1, classifier_dropout=classifier_dropout)
+    model = transformers.AutoModelForSequenceClassification.from_pretrained(pretrained_model, config=config)
     loaded_model = f"{pretrained_model}:{model_input}" if local_model else pretrained_model
 
     if local_model:
@@ -191,12 +192,40 @@ def load_dataset(filename_dataset, set_desc, **kwargs):
 
     logger.debug("Allocated memory after removing pairs of URLs (str): %d", utils.get_current_allocated_memory_size())
 
-    dataloader_instance = dataset_instance.get_dataloader(kwargs["batch_size"], kwargs["device"],
-                                                          kwargs["dataset_workers"], max_tokens=kwargs["max_tokens"])
+    dataloader_instance = dataset_instance.get_dataloader(kwargs["batch_size"], kwargs["device"], kwargs["dataset_workers"])
 
     file_dataset.close()
 
     return dataset_instance, dataloader_instance
+
+def apply_patience(model, tokenizer, dataset_dev, loss_function, device, threshold, dev_best_metric, epoch, dev_best_metric_value,
+                   current_patience, patience, dev_best_epoch, model_output):
+    #if accelerator.is_local_main_process: # Do not even think about it ;) for some good reason (that I would like to know), it gets stuck
+    dev_eval = inference.inference_eval(model, tokenizer, dataset_dev, loss_function=loss_function, device=device, threshold=threshold)
+    dev_patience_metric = dev_eval[dev_best_metric]
+
+    if accelerator.is_local_main_process:
+        logger.debug("Dev eval all metrics: %s", dev_eval)
+        logger.info("Dev eval metric: %s", dev_patience_metric)
+
+        writer.add_scalar(f"{dev_best_metric}/dev", dev_patience_metric, epoch)
+
+    if dev_patience_metric <= dev_best_metric_value:
+        current_patience += 1
+
+        if patience > 0 and accelerator.is_local_main_process:
+            logger.info("Exhausting patience... %d/%d", current_patience, patience)
+    else:
+        if accelerator.is_local_main_process:
+            logger.info("Best dev patience metric update: %s -> %s", dev_best_metric_value, dev_patience_metric)
+
+        dev_best_metric_value = dev_patience_metric
+        dev_best_epoch = epoch
+        current_patience = 0
+
+        save_model(accelerator, model, model_output=model_output, name="mtd_best_dev")
+
+    return current_patience, dev_best_metric_value, dev_best_epoch
 
 def main(args):
     apply_inference = args.inference
@@ -208,15 +237,12 @@ def main(args):
 
     # Args
     batch_size = args.batch_size
-    #block_size = args.block_size
-    max_tokens = args.max_tokens if args.max_tokens > 0 else None
     epochs = args.epochs # BE AWARE! "epochs" might be fake due to --train-until-patience
     pretrained_model = args.pretrained_model
     max_length_tokens = args.max_length_tokens
     model_input = utils.resolve_path(args.model_input)
     model_output = utils.resolve_path(args.model_output)
     seed = args.seed
-    inference_from_stdin = args.inference_from_stdin
     patience = args.patience
     train_until_patience = args.train_until_patience
     learning_rate = args.learning_rate
@@ -228,19 +254,20 @@ def main(args):
     dataset_workers = args.dataset_workers
     monolingual = args.monolingual
     threshold = args.threshold
+    eval_strategy = args.strategy # TODO
+    eval_steps = args.strategy_steps # TODO use global_step to calculate
+    classifier_dropout = args.classifier_dropout
 
     # Model
-    #use_cuda = utils.use_cuda(force_cpu=force_cpu) # Will be True if possible and False otherwise
-    #device = torch.device("cuda:0" if use_cuda else "cpu")
     device = accelerator.device
-    #is_device_gpu = device.type.startswith("cuda")
     tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model)
-    model = load_model(accelerator, model_input, pretrained_model, device, name=None)
+    model = load_model(accelerator, model_input, pretrained_model, device, name=None, classifier_dropout=classifier_dropout)
     num_processes = accelerator.num_processes
+    save_model_prefix = f"mtd_{eval_strategy}"
 
     logger.debug("Number of processes: %d", num_processes)
 
-    save_model(accelerator, model, model_output=model_output, name="mtd_epoch_0")
+    save_model(accelerator, model, model_output=model_output, name=f"{save_model_prefix}_0")
 
     ##################
 
@@ -275,12 +302,6 @@ def main(args):
 
     assert model_embeddings_size == len(tokenizer), f"Embedding layer size does not match with the tokenizer size: {model_embeddings_size} vs {len(tokenizer)}"
 
-    if max_tokens and max_tokens < max_length_tokens:
-        logger.warning("The specified max_tokens has to be greater or equal that the max length tokens of the model: "
-                       "changing value from %d to %d", max_tokens, max_length_tokens)
-
-        max_tokens = max_length_tokens
-
     loss_function = nn.BCEWithLogitsLoss(reduction="mean") # Regression: raw input, not normalized
                                                            #  (i.e. sigmoid is applied in the loss function)
 
@@ -288,9 +309,8 @@ def main(args):
         assert writer is None
 
         if accelerator.is_local_main_process:
-            dataset = '-' if inference_from_stdin else None
-            metrics = inference.inference_eval(model, tokenizer, dataset, loss_function=loss_function, device=device,
-                                               max_tokens=max_tokens, threshold=threshold, monolingual=monolingual)
+            metrics = inference.inference_from_stdin(model, tokenizer, batch_size, loss_function=loss_function, device=device, max_length_tokens=max_length_tokens,
+                                                     threshold=threshold, monolingual=monolingual, dataset_workers=dataset_workers)
 
             if metrics is not None:
                 logger.info("Inference metrics: %s", metrics)
@@ -310,7 +330,6 @@ def main(args):
         "batch_size": batch_size,
         "device": device,
         "dataset_workers": dataset_workers,
-        "max_tokens": max_tokens,
         "tokenizer": tokenizer,
         "max_length_tokens": max_length_tokens,
         "monolingual": monolingual,
@@ -413,6 +432,7 @@ def main(args):
     dev_best_epoch = 0
     dev_best_metric_value = -np.inf
     global_step = 0
+    saved_epochs_or_steps = [0]
 
     while not stop_training:
         logger.info("Epoch %d", epoch + 1)
@@ -420,12 +440,9 @@ def main(args):
         model.train()
 
         duplicated_data = {}
+        step = 0
 
         for batch in dataloader_train:
-            if max_tokens and batch is None:
-                # Batch is under construction using max_tokens...
-                continue
-
             #optimizer.zero_grad() # https://discuss.pytorch.org/t/model-zero-grad-or-optimizer-zero-grad/28426/6
             model.zero_grad()
 
@@ -451,79 +468,90 @@ def main(args):
             if accelerator.is_main_process:
                 writer.add_scalar("loss/train", loss, global_step)
 
+            step += 1
             global_step += 1
 
-        total_duplicated = 0
+            if eval_strategy == "steps" and global_step % strategy_steps == 0:
+                # Patience
+                current_patience, dev_best_metric_value, dev_best_epoch = apply_patience(
+                    model, tokenizer, dataset_dev, loss_function, device, threshold, dev_best_metric, global_step, dev_best_metric_value,
+                    current_patience, patience, dev_best_epoch, model_output)
 
-        for i, v in duplicated_data.items():
-            total_duplicated += v - 1
+                # Save model
+                save_model(accelerator, model, model_output=model_output, name=f"{save_model_prefix}_{global_step}")
+                saved_epochs_or_steps.append(global_step)
 
-        assert total_duplicated < batch_size, f"{total_duplicated} >= {batch_size}"
-        assert abs(len(duplicated_data) - batch_size * training_steps_per_epoch // num_processes) < batch_size, f"abs({len(duplicated_data)} - {batch_size} * {training_steps_per_epoch} // {num_processes}) >= {batch_size}"
+                # Stop training?
+                if patience > 0 and current_patience >= patience:
+                    # End of patience
+                    stop_training = True
 
-        # Patience
-        #if accelerator.is_local_main_process: # Do not even think about it ;) for some good reason (that I would like to know), it gets stuck
-        dev_eval = inference.inference_eval(model, tokenizer, dataset_dev, loss_function=loss_function, device=device, max_tokens=max_tokens, threshold=threshold)
-        dev_patience_metric = dev_eval[dev_best_metric]
+                    logger.debug("Training stopped in the middle of an epoch: %d/%d (%.2f %%) steps completed", step, len(dataloader_train), step * 100. / len(dataloader_train))
 
-        if accelerator.is_local_main_process:
-            logger.debug("Dev eval all metrics: %s", dev_eval)
-            logger.info("Dev eval metric: %s", dev_patience_metric)
+                    break
 
-            writer.add_scalar(f"{dev_best_metric}/dev", dev_patience_metric, epoch + 1)
+        pre_stop = False
 
-        if dev_patience_metric <= dev_best_metric_value:
-            current_patience += 1
+        if stop_training:
+            pre_stop = True
 
-            if patience > 0 and accelerator.is_local_main_process:
-                logger.info("Exhausting patience... %d/%d", current_patience, patience)
+            assert eval_strategy == "steps", eval_strategy
         else:
-            if accelerator.is_local_main_process:
-                logger.info("Best dev patience metric update: %s -> %s", dev_best_metric_value, dev_patience_metric)
+            total_duplicated = 0
 
-            dev_best_metric_value = dev_patience_metric
-            dev_best_epoch = epoch + 1
-            current_patience = 0
+            for i, v in duplicated_data.items():
+                total_duplicated += v - 1
 
-            save_model(accelerator, model, model_output=model_output, name="mtd_best_dev")
+            assert total_duplicated < batch_size, f"{total_duplicated} >= {batch_size}"
+            assert abs(len(duplicated_data) - batch_size * training_steps_per_epoch // num_processes) < batch_size, f"abs({len(duplicated_data)} - {batch_size} * {training_steps_per_epoch} // {num_processes}) >= {batch_size}"
+
+        epoch += 1
+
+        if eval_strategy == "epoch":
+            # Patience
+            current_patience, dev_best_metric_value, dev_best_epoch = apply_patience(
+                model, tokenizer, dataset_dev, loss_function, device, threshold, dev_best_metric, epoch, dev_best_metric_value,
+                current_patience, patience, dev_best_epoch, model_output)
+
+            # Save model
+            save_model(accelerator, model, model_output=model_output, name=f"{save_model_prefix}_{epoch}")
+            saved_epochs_or_steps.append(epoch)
 
         # Stop training?
         if patience > 0 and current_patience >= patience:
             # End of patience
+            # We do not set as condition 'train_until_patience'; then, if patience > 0, training can stop because of patience or epochs
 
             stop_training = True
         elif not train_until_patience:
-            stop_training = (epoch + 1) >= epochs
+            stop_training = epoch >= epochs
 
-        epoch += 1
-
-        save_model(accelerator, model, model_output=model_output, name=f"mtd_epoch_{epoch}")
+        if pre_stop:
+            assert stop_training
 
     # Eval test
     if accelerator.is_local_main_process:
-        _break = model_output is None
+        models_not_available = model_output is None
 
-        for _epoch in range(epoch + 1):
-            if not _break:
-                # Eval model trained on epoch {_epoch}
-                model_name = f"mtd_epoch_{_epoch}"
-                desc = f" (best dev model)" if _epoch == dev_best_epoch else ''
-                model = load_model(accelerator, model_output, pretrained_model, device, name=model_name)
+        if models_not_available:
+            saved_epochs_or_steps = [epoch if strategy == "epoch" else global_step]
+
+        for epoch_or_step in saved_epochs_or_steps:
+            if not models_not_available:
+                # Eval model trained on epoch {epoch_or_step}
+                model_name = f"{save_model_prefix}_{epoch_or_step}"
+                desc = f" (best dev model)" if epoch_or_step == dev_best_epoch else ''
+                model = load_model(accelerator, model_output, pretrained_model, device, name=model_name, classifier_dropout=classifier_dropout)
             # else: eval last model
 
-            test_eval = inference.inference_eval(model, tokenizer, dataset_test, loss_function=loss_function, device=device, max_tokens=max_tokens, threshold=threshold)
+            test_eval = inference.inference_eval(model, tokenizer, dataset_test, loss_function=loss_function, device=device, threshold=threshold)
 
-            if _break:
+            writer.add_scalar(f"{dev_best_metric}/test", test_eval[dev_best_metric], epoch_or_step)
+
+            if models_not_available:
                 logger.info("Test metrics: %s", test_eval)
             else:
                 logger.info("Test metrics for model %s%s: %s", model_name, desc, test_eval)
-
-            aux_epoch = epoch if _break else _epoch
-
-            writer.add_scalar(f"{dev_best_metric}/test", test_eval[dev_best_metric], aux_epoch)
-
-            if _break:
-                break
 
     logger.info("%d: done!", accelerator.process_index)
 
@@ -578,10 +606,10 @@ def initialization():
     parser.add_argument('--model-input', help="Model input path which will be loaded")
     parser.add_argument('--model-output', help="Model output path where the model will be stored")
     parser.add_argument('--inference', action="store_true",
-                        help="Do not train, just apply inference (flag --model-input is recommended). "
-                             "If this option is set, it will not be necessary to provide the input dataset")
-    parser.add_argument('--inference-from-stdin', action="store_true", help="Read inference from stdin")
-    parser.add_argument('--patience', type=int, default=0, help="Patience before stopping the training")
+                        help="Do not train, just apply inference reading from stdin (flag --model-input is recommended). "
+                             "If this option is set, it will be necessary to do not provide the input dataset.")
+    parser.add_argument('--patience', type=int, default=0,
+                        help="Patience to stop training. If the specified value is greater than 0, epochs and patience will be taken into account")
     parser.add_argument('--train-until-patience', action="store_true",
                         help="Train until patience value is reached (--epochs will be ignored in order to stop, but will still be "
                              "used for other actions like LR scheduler)")
@@ -600,6 +628,9 @@ def initialization():
                         help="Only the MT or HT will be processed instead of OT+MT|HT. This does not change the expected format in the data: OT+MT|HT+label")
     parser.add_argument('--threshold', type=float, default=0.5,
                         help="Threshold to consider a given text to be HT")
+    parser.add_argument('--strategy', type=str, choices=["steps", "epoch"], default="epoch", help="Strategy for evaluating and saving. This will also affect to --patience")
+    parser.add_argument('--strategy-steps', type=int, default=1000, help="Steps to evaluate and save the model when the strategy is 'steps'")
+    parser.add_argument('--classifier-dropout', type=float, default=0.1, help="Dropout applied to the classifier layer")
 
     parser.add_argument('--seed', type=int, default=71213,
                         help="Seed in order to have deterministic results (not fully guaranteed). "
