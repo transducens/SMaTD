@@ -293,10 +293,11 @@ def main(args):
     model = load_model(model_input, pretrained_model, device, name=None, classifier_dropout=classifier_dropout)
     num_processes = accelerator.num_processes
     save_model_prefix = f"mtd_{eval_strategy}"
+    actual_batch_size = num_processes * batch_size * gradient_accumulation_steps # https://discuss.huggingface.co/t/what-is-my-batch-size/41390
 
     if accelerator.is_local_main_process:
         logger.debug("Number of processes: %d", num_processes)
-        logger.info("Actual batch size: %d", num_processes * batch_size * gradient_accumulation_steps) # https://discuss.huggingface.co/t/what-is-my-batch-size/41390
+        logger.info("Actual batch size: %d", actual_batch_size)
 
     save_model(model, model_output=model_output, name=f"{save_model_prefix}_0")
 
@@ -374,7 +375,8 @@ def main(args):
     dataset_test, _ = load_dataset(filename_dataset_test, "test", **dataset_static_args)
 
     #training_steps_per_epoch = len(dataloader_train) // num_processes
-    training_steps_per_epoch = len(dataloader_train) # it counts batches, not samples! It is not necessary to divide by 'num_processes' -> if warmup is 10 steps and 2 GPUs, warmup will finish at step 5
+    training_steps_per_epoch = len(dataloader_train) # it counts batches, not samples (value = samples // batch_size)!
+                                                     # it is not necessary to divide by 'num_processes' -> if warmup is 10 steps and 2 GPUs, warmup will finish at step 5
     training_steps = training_steps_per_epoch * epochs # BE AWARE! "epochs" might be fake due to --train-until-patience
 
     # I have checked out that the use of accelerate+LR scheduler is correctly adapted according to the number of GPUs used for training
@@ -504,22 +506,15 @@ def main(args):
                 optimizer.step()
                 scheduler.step()
 
-                #####################
-                #current_lr = scheduler.get_last_lr()
-                #
-                #assert len(current_lr) == 1, current_lr
-                #
-                #current_lr = current_lr[0]
-                #
-                #logger.info("LR: %d/%d (%.2f %%): %s", step + 1, len(dataloader_train), (step + 1) * 100. / len(dataloader_train), current_lr)
-                #####################
+                if accelerator.sync_gradients:
+                    loss = accelerator.gather(loss).mean().item()
 
-                loss = accelerator.gather(loss).mean().item()
+                    all_loss.append(loss)
 
-                all_loss.append(loss)
-
-            step += 1
-            global_step += 1
+                    step += 1
+                    global_step += 1
+                else:
+                    continue # avoid executing the following conditions more than once, because some variables will have the same value as in the previous iteration of the loop
 
             if accelerator.is_main_process:
                 writer.add_scalar("loss/train", loss, global_step)
@@ -527,7 +522,7 @@ def main(args):
                 if global_step % 100 == 0:
                     _loss = sum(all_loss[-100:])
 
-                    logger.debug("[global_step:%d] Loss (average last 100 steps): %s", global_step, _loss)
+                    logger.debug("[global_step:%d] Training loss (average last 100 steps): %s", global_step, _loss)
 
             if eval_strategy == "steps" and global_step % eval_steps == 0:
                 # Patience
@@ -545,7 +540,7 @@ def main(args):
                     stop_training = True
 
                     if accelerator.is_local_main_process:
-                        logger.debug("Training stopped in the middle of an epoch: %d/%d (%.2f %%) steps completed", step, len(dataloader_train), step * 100. / len(dataloader_train))
+                        logger.debug("Training stopped in the middle of an epoch")
 
                     break
 
@@ -555,7 +550,7 @@ def main(args):
             pre_stop = True
 
             assert eval_strategy == "steps", eval_strategy
-        else:
+        elif not monolingual: # if monolingual, duplicate data may be found...
             total_duplicated = 0
 
             for i, v in duplicated_data.items():
