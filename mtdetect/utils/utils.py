@@ -79,11 +79,18 @@ def get_current_allocated_memory_size():
 
     return size_in_bytes
 
-def set_up_logging_logger(logger, filename=None, level=logging.INFO, format="[%(asctime)s] [%(name)s] [%(levelname)s] [%(module)s:%(lineno)d] %(message)s",
-                          display_when_file=False):
+def set_up_logging_logger(logger, filename=None, level=logging.INFO, lformat=None, display_when_file=False, accelerator=None):
     handlers = [
         logging.StreamHandler()
     ]
+
+    if lformat is None:
+        lformat = "[%(asctime)s] [%(name)s] [%(levelname)s] [%(module)s:%(lineno)d]"
+
+        if accelerator is not None:
+            lformat += f" [accelerator:{accelerator.process_index}]"
+
+        lformat += " %(message)s"
 
     if filename is not None:
         if display_when_file:
@@ -93,7 +100,7 @@ def set_up_logging_logger(logger, filename=None, level=logging.INFO, format="[%(
             # Logging messages will be stored and not displayed
             handlers[0] = logging.FileHandler(filename)
 
-    formatter = logging.Formatter(format)
+    formatter = logging.Formatter(lformat)
 
     for h in handlers:
         h.setFormatter(formatter)

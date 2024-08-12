@@ -6,6 +6,7 @@ import random
 import logging
 import argparse
 import warnings
+import contextlib
 
 import mtdetect.utils.utils as utils
 import mtdetect.dataset as dataset
@@ -144,7 +145,7 @@ def save_model(model, model_output=None, name="mtd"):
     if accelerator.is_local_main_process:
         accelerator.save(unwrapped_model.state_dict(), f"{model_output}/{name}.pt")
 
-        logger.info("%d: model saved: %s", accelerator.process_index, f"{model_output}/{name}.pt")
+        logger.info("Model saved: %s", f"{model_output}/{name}.pt")
 
     accelerator.wait_for_everyone()
 
@@ -162,7 +163,7 @@ def load_model(model_input, pretrained_model, device, name=None, classifier_drop
 
         model.load_state_dict(state_dict)
 
-    logger.info("%d: model loaded: %s (local instead of pretrained? %s)", accelerator.process_index, loaded_model, local_model)
+    logger.info("Model loaded: %s (local instead of pretrained? %s)", loaded_model, local_model)
 
     model = model.to(device)
 
@@ -293,11 +294,15 @@ def main(args):
     num_processes = accelerator.num_processes
     save_model_prefix = f"mtd_{eval_strategy}"
 
-    logger.debug("Number of processes: %d", num_processes)
+    if accelerator.is_local_main_process:
+        logger.debug("Number of processes: %d", num_processes)
+        logger.info("Actual batch size: %d", num_processes * batch_size * gradient_accumulation_steps) # https://discuss.huggingface.co/t/what-is-my-batch-size/41390
 
     save_model(model, model_output=model_output, name=f"{save_model_prefix}_0")
 
     ##################
+
+    training_context_manager = accelerator.accumulate if gradient_accumulation_steps > 1 else contextlib.nullcontext
 
     if scheduler_str in ("linear",) and train_until_patience:
         # Depending on the LR scheduler, the training might even stop at some point (e.g. linear LR scheduler will set the LR=0 if the run epochs is greater than the provided epochs)
@@ -345,7 +350,7 @@ def main(args):
             if metrics is not None:
                 logger.info("Inference metrics: %s", metrics)
 
-        logger.info("%d: done!", accelerator.process_index)
+        logger.info("Done!")
 
         # Stop execution
         return
@@ -463,6 +468,7 @@ def main(args):
     dev_best_metric_value = -np.inf
     global_step = 0
     saved_epochs_or_steps = [0]
+    all_loss = []
 
     while not stop_training:
         if accelerator.is_local_main_process:
@@ -474,7 +480,7 @@ def main(args):
         step = 0
 
         for batch in dataloader_train:
-            with accelerator.accumulate(model):
+            with training_context_manager(model):
                 #optimizer.zero_grad() # https://discuss.pytorch.org/t/model-zero-grad-or-optimizer-zero-grad/28426/6
                 model.zero_grad()
 
@@ -491,7 +497,10 @@ def main(args):
                     duplicated_data[_i] += 1
 
                 accelerator.backward(loss)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(model.parameters(), 1.0)
+
                 optimizer.step()
                 scheduler.step()
 
@@ -507,31 +516,38 @@ def main(args):
 
                 loss = accelerator.gather(loss).mean().item()
 
-                if accelerator.is_main_process:
-                    writer.add_scalar("loss/train", loss, global_step)
+                all_loss.append(loss)
 
-                step += 1
-                global_step += 1
+            step += 1
+            global_step += 1
 
-                if eval_strategy == "steps" and global_step % eval_steps == 0:
-                    # Patience
-                    current_patience, dev_best_metric_value, dev_best_epoch = apply_patience(
-                        model, tokenizer, dataset_dev, loss_function, device, threshold, dev_best_metric, global_step, dev_best_metric_value,
-                        current_patience, patience, dev_best_epoch, model_output)
+            if accelerator.is_main_process:
+                writer.add_scalar("loss/train", loss, global_step)
 
-                    # Save model
-                    save_model(model, model_output=model_output, name=f"{save_model_prefix}_{global_step}")
-                    saved_epochs_or_steps.append(global_step)
+                if global_step % 100 == 0:
+                    _loss = sum(all_loss[-100:])
 
-                    # Stop training?
-                    if patience > 0 and current_patience >= patience:
-                        # End of patience
-                        stop_training = True
+                    logger.debug("[global_step:%d] Loss (average last 100 steps): %s", global_step, _loss)
 
-                        if accelerator.is_local_main_process:
-                            logger.debug("Training stopped in the middle of an epoch: %d/%d (%.2f %%) steps completed", step, len(dataloader_train), step * 100. / len(dataloader_train))
+            if eval_strategy == "steps" and global_step % eval_steps == 0:
+                # Patience
+                current_patience, dev_best_metric_value, dev_best_epoch = apply_patience(
+                    model, tokenizer, dataset_dev, loss_function, device, threshold, dev_best_metric, global_step, dev_best_metric_value,
+                    current_patience, patience, dev_best_epoch, model_output)
 
-                        break
+                # Save model
+                save_model(model, model_output=model_output, name=f"{save_model_prefix}_{global_step}")
+                saved_epochs_or_steps.append(global_step)
+
+                # Stop training?
+                if patience > 0 and current_patience >= patience:
+                    # End of patience
+                    stop_training = True
+
+                    if accelerator.is_local_main_process:
+                        logger.debug("Training stopped in the middle of an epoch: %d/%d (%.2f %%) steps completed", step, len(dataloader_train), step * 100. / len(dataloader_train))
+
+                    break
 
         pre_stop = False
 
@@ -583,7 +599,7 @@ def main(args):
         if idx % accelerator.num_processes != accelerator.process_index:
             continue
 
-        logger.debug("[process:%d] [step_or_epoch:%s] Evaluating test set", accelerator.process_index, epoch_or_step)
+        logger.debug("[step_or_epoch:%s] Evaluating test set", epoch_or_step)
 
         if not models_not_available:
             # Eval model trained on epoch {epoch_or_step}
@@ -618,7 +634,7 @@ def main(args):
 
                 logger.info("Test metrics for model %s%s: %s", model_name, desc, test_eval)
 
-    logger.info("%d: done!", accelerator.process_index)
+    logger.info("Done!")
 
 def get_options_from_argv(argv_flag, default_value, dict_with_options):
     choices = list(dict_with_options.keys())
@@ -719,7 +735,7 @@ def cli():
     accelerator = accelerate.Accelerator(gradient_accumulation_steps=args.gradient_accumulation)
 
     # Logging
-    logger = utils.set_up_logging_logger(logger, level=logging.DEBUG if args.verbose else logging.INFO)
+    logger = utils.set_up_logging_logger(logger, level=logging.DEBUG if args.verbose else logging.INFO, accelerator=accelerator)
 
     if accelerator.is_local_main_process:
         logger.debug("Arguments processed: {}".format(str(args))) # First logging message should be the processed arguments
