@@ -9,7 +9,11 @@ if [[ -z "$GPUS" ]]; then
   exit 1
 fi
 
-echo "GPUs: $GPUS; Args: $ARGS"
+if [[ -z "$MTD_ACCELERATE_PORT" ]]; then
+  MTD_ACCELERATE_PORT="29500"
+fi
+
+echo "MTD_ACCELERATE_PORT: $MTD_ACCELERATE_PORT; GPUs: $GPUS; Args: $ARGS"
 
 srun --gres=gpu:$GPUS \
-accelerate launch --no_python --num_processes="$GPUS" mtdetect $ARGS
+accelerate launch --main_process_port "$MTD_ACCELERATE_PORT" --no_python --num_processes="$GPUS" mtdetect $ARGS

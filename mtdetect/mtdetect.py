@@ -127,7 +127,7 @@ def get_lr_scheduler(scheduler, optimizer, *args, **kwargs):
 
     return scheduler_instance
 
-def save_model(accelerator, model, model_output=None, name="mtd"):
+def save_model(model, model_output=None, name="mtd"):
     # Be aware that all threads need to reach this function
     accelerator.wait_for_everyone()
 
@@ -148,7 +148,7 @@ def save_model(accelerator, model, model_output=None, name="mtd"):
 
     accelerator.wait_for_everyone()
 
-def load_model(accelerator, model_input, pretrained_model, device, name=None, classifier_dropout=0.0):
+def load_model(model_input, pretrained_model, device, name=None, classifier_dropout=0.0):
     local_model = model_input is not None
     config = transformers.AutoConfig.from_pretrained(pretrained_model, num_labels=1, classifier_dropout=classifier_dropout)
     model = transformers.AutoModelForSequenceClassification.from_pretrained(pretrained_model, config=config)
@@ -157,7 +157,8 @@ def load_model(accelerator, model_input, pretrained_model, device, name=None, cl
     if local_model:
         model = accelerator.unwrap_model(model)
         _model_input = f"{model_input}/{name}.pt" if name is not None else model_input
-        state_dict = torch.load(_model_input, weights_only=True) # https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models
+        state_dict = torch.load(_model_input, weights_only=True, map_location=device) # weights_only: https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models
+                                                                                      # map_location: avoid creating a new process and using additional and useless memory
 
         model.load_state_dict(state_dict)
 
@@ -240,7 +241,7 @@ def apply_patience(model, tokenizer, dataset_dev, loss_function, device, thresho
         dev_best_epoch = epoch
         current_patience = 0
 
-        save_model(accelerator, model, model_output=model_output, name="mtd_best_dev")
+        save_model(model, model_output=model_output, name="mtd_best_dev")
 
     return current_patience, dev_best_metric_value, dev_best_epoch
 
@@ -274,17 +275,27 @@ def main(args):
     eval_strategy = args.strategy
     eval_steps = args.strategy_steps
     classifier_dropout = args.classifier_dropout
+    gradient_accumulation_steps = args.gradient_accumulation
+
+    if gradient_accumulation_steps > 1:
+        assert (batch_size % gradient_accumulation_steps) == 0, f"batch_size % gradient_accumulation_steps != 0 -> {batch_size % gradient_accumulation_steps} != 0"
+
+        _batch_size = batch_size // gradient_accumulation_steps
+
+        logger.info("Gradient accumulation enabled: batch_size: %d -> %d", batch_size, _batch_size)
+
+        batch_size = _batch_size
 
     # Model
     device = accelerator.device
     tokenizer = get_tokenizer(pretrained_model)
-    model = load_model(accelerator, model_input, pretrained_model, device, name=None, classifier_dropout=classifier_dropout)
+    model = load_model(model_input, pretrained_model, device, name=None, classifier_dropout=classifier_dropout)
     num_processes = accelerator.num_processes
     save_model_prefix = f"mtd_{eval_strategy}"
 
     logger.debug("Number of processes: %d", num_processes)
 
-    save_model(accelerator, model, model_output=model_output, name=f"{save_model_prefix}_0")
+    save_model(model, model_output=model_output, name=f"{save_model_prefix}_0")
 
     ##################
 
@@ -293,7 +304,7 @@ def main(args):
         logger.warning("You set a LR scheduler ('%s' scheduler) which conflicts with --train-until-patince: you might want to check this out and change the configuration", scheduler_str)
 
     if apply_inference and not model_input:
-        logger.warning("Flag --model-input is recommended when --inference is provided: waiting %d seconds before proceed", waiting_time)
+        logger.warning("Flag --model-input is recommended when --inference is provided")
 
     if seed >= 0:
         random.seed(seed)
@@ -463,63 +474,64 @@ def main(args):
         step = 0
 
         for batch in dataloader_train:
-            #optimizer.zero_grad() # https://discuss.pytorch.org/t/model-zero-grad-or-optimizer-zero-grad/28426/6
-            model.zero_grad()
+            with accelerator.accumulate(model):
+                #optimizer.zero_grad() # https://discuss.pytorch.org/t/model-zero-grad-or-optimizer-zero-grad/28426/6
+                model.zero_grad()
 
-            inputs = batch["url_tokens"]
-            result = inference.inference(model, batch, loss_function=loss_function, device=device, threshold=threshold)
-            loss = result["loss"]
+                inputs = batch["url_tokens"]
+                result = inference.inference(model, batch, loss_function=loss_function, device=device, threshold=threshold)
+                loss = result["loss"]
 
-            for i in inputs:
-                _i = tokenizer.decode(i.squeeze().tolist(), skip_special_tokens=True)
+                for i in inputs:
+                    _i = tokenizer.decode(i.squeeze().tolist(), skip_special_tokens=True)
 
-                if _i not in duplicated_data:
-                    duplicated_data[_i] = 0
+                    if _i not in duplicated_data:
+                        duplicated_data[_i] = 0
 
-                duplicated_data[_i] += 1
+                    duplicated_data[_i] += 1
 
-            accelerator.backward(loss)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            scheduler.step()
+                accelerator.backward(loss)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                scheduler.step()
 
-            #####################
-            #current_lr = scheduler.get_last_lr()
-            #
-            #assert len(current_lr) == 1, current_lr
-            #
-            #current_lr = current_lr[0]
-            #
-            #logger.info("LR: %d/%d (%.2f %%): %s", step + 1, len(dataloader_train), (step + 1) * 100. / len(dataloader_train), current_lr)
-            #####################
+                #####################
+                #current_lr = scheduler.get_last_lr()
+                #
+                #assert len(current_lr) == 1, current_lr
+                #
+                #current_lr = current_lr[0]
+                #
+                #logger.info("LR: %d/%d (%.2f %%): %s", step + 1, len(dataloader_train), (step + 1) * 100. / len(dataloader_train), current_lr)
+                #####################
 
-            loss = accelerator.gather(loss).mean().item()
+                loss = accelerator.gather(loss).mean().item()
 
-            if accelerator.is_main_process:
-                writer.add_scalar("loss/train", loss, global_step)
+                if accelerator.is_main_process:
+                    writer.add_scalar("loss/train", loss, global_step)
 
-            step += 1
-            global_step += 1
+                step += 1
+                global_step += 1
 
-            if eval_strategy == "steps" and global_step % eval_steps == 0:
-                # Patience
-                current_patience, dev_best_metric_value, dev_best_epoch = apply_patience(
-                    model, tokenizer, dataset_dev, loss_function, device, threshold, dev_best_metric, global_step, dev_best_metric_value,
-                    current_patience, patience, dev_best_epoch, model_output)
+                if eval_strategy == "steps" and global_step % eval_steps == 0:
+                    # Patience
+                    current_patience, dev_best_metric_value, dev_best_epoch = apply_patience(
+                        model, tokenizer, dataset_dev, loss_function, device, threshold, dev_best_metric, global_step, dev_best_metric_value,
+                        current_patience, patience, dev_best_epoch, model_output)
 
-                # Save model
-                save_model(accelerator, model, model_output=model_output, name=f"{save_model_prefix}_{global_step}")
-                saved_epochs_or_steps.append(global_step)
+                    # Save model
+                    save_model(model, model_output=model_output, name=f"{save_model_prefix}_{global_step}")
+                    saved_epochs_or_steps.append(global_step)
 
-                # Stop training?
-                if patience > 0 and current_patience >= patience:
-                    # End of patience
-                    stop_training = True
+                    # Stop training?
+                    if patience > 0 and current_patience >= patience:
+                        # End of patience
+                        stop_training = True
 
-                    if accelerator.is_local_main_process:
-                        logger.debug("Training stopped in the middle of an epoch: %d/%d (%.2f %%) steps completed", step, len(dataloader_train), step * 100. / len(dataloader_train))
+                        if accelerator.is_local_main_process:
+                            logger.debug("Training stopped in the middle of an epoch: %d/%d (%.2f %%) steps completed", step, len(dataloader_train), step * 100. / len(dataloader_train))
 
-                    break
+                        break
 
         pre_stop = False
 
@@ -545,7 +557,7 @@ def main(args):
                 current_patience, patience, dev_best_epoch, model_output)
 
             # Save model
-            save_model(accelerator, model, model_output=model_output, name=f"{save_model_prefix}_{epoch}")
+            save_model(model, model_output=model_output, name=f"{save_model_prefix}_{epoch}")
             saved_epochs_or_steps.append(epoch)
 
         # Stop training?
@@ -577,7 +589,7 @@ def main(args):
             # Eval model trained on epoch {epoch_or_step}
             model_name = f"{save_model_prefix}_{epoch_or_step}"
             desc = f" (best dev model)" if epoch_or_step == dev_best_epoch else ''
-            model = load_model(accelerator, model_output, pretrained_model, device, name=model_name, classifier_dropout=classifier_dropout)
+            model = load_model(model_output, pretrained_model, device, name=model_name, classifier_dropout=classifier_dropout)
         # else: eval last model
 
         test_eval = inference.inference_eval(model, tokenizer, dataset_test, loss_function=loss_function, device=device, threshold=threshold)
@@ -590,10 +602,6 @@ def main(args):
     results_keys = accelerate.utils.gather_object(results_keys)
     results_values = accelerate.utils.gather_object(results_values)
     results = {k: v for k, v in zip(results_keys, results_values)}
-
-    # TODO check if results contain what is expected. Likely it will not because gather_object does not seem to work properly with dictionaries, and results_values is a dictionary
-
-    logger.info("DEBUG: %s", results)
 
     # Print results
     if accelerator.is_local_main_process:
@@ -645,21 +653,13 @@ def initialization():
         parser.add_argument('dataset_dev_filename', type=str, help="Filename with dev data (TSV format)")
         parser.add_argument('dataset_test_filename', type=str, help="Filename with test data (TSV format)")
 
-    #parser.add_argument('--batch-size', type=int, default=16,
-    #                    help="Batch size. Elements which will be processed before proceed to train, but the whole batch will "
-    #                         "be processed in blocks in order to avoid OOM errors")
     parser.add_argument('--batch-size', type=int, default=16,
                         help="Batch size. Elements which will be processed before proceed to train")
-    #parser.add_argument('--block-size', type=int, help="Block size. Elements which will be provided to the model at once")
-    parser.add_argument('--max-tokens', type=int, default=-1,
-                        help="Process batches in groups tokens size (fairseq style). "
-                             "Batch size is still relevant since the value is used when batches are needed (e.g. sampler from dataset)")
     parser.add_argument('--epochs', type=int, default=3, help="Epochs")
-    parser.add_argument('--do-not-fine-tune', action="store_true", help="Do not apply fine-tuning to the base model (default weights)")
     parser.add_argument('--dataset-workers', type=int, default=-1,
                         help="No. workers when loading the data in the dataset. When negative, all available CPUs will be used")
     parser.add_argument('--pretrained-model', default="xlm-roberta-base", help="Pretrained model")
-    parser.add_argument('--max-length-tokens', type=int, default=256, help="Max. length for the generated tokens")
+    parser.add_argument('--max-length-tokens', type=int, default=512, help="Max. length for the generated tokens")
     parser.add_argument('--model-input', help="Model input path which will be loaded")
     parser.add_argument('--model-output', help="Model output path where the model will be stored")
     parser.add_argument('--inference', action="store_true",
@@ -688,6 +688,7 @@ def initialization():
     parser.add_argument('--strategy', type=str, choices=["steps", "epoch"], default="epoch", help="Strategy for evaluating and saving. This will also affect to --patience")
     parser.add_argument('--strategy-steps', type=int, default=1000, help="Steps to evaluate and save the model when the strategy is 'steps'")
     parser.add_argument('--classifier-dropout', type=float, default=0.1, help="Dropout applied to the classifier layer")
+    parser.add_argument('--gradient-accumulation', type=int, default=1, help="Gradient accumulation steps")
 
     parser.add_argument('--seed', type=int, default=71213,
                         help="Seed in order to have deterministic results (not fully guaranteed). "
@@ -707,12 +708,15 @@ def cli():
     assert accelerator is None
     assert writer is None
 
-    accelerator = accelerate.Accelerator()
-
     # https://stackoverflow.com/questions/16549332/python-3-how-to-specify-stdin-encoding
     sys.stdin.reconfigure(encoding='utf-8', errors="backslashreplace")
 
     args = initialization()
+
+    # Accelerate
+    assert args.gradient_accumulation >= 1, args.gradient_accumulation
+
+    accelerator = accelerate.Accelerator(gradient_accumulation_steps=args.gradient_accumulation)
 
     # Logging
     logger = utils.set_up_logging_logger(logger, level=logging.DEBUG if args.verbose else logging.INFO)
