@@ -372,7 +372,6 @@ def main(args):
     }
     dataset_train, dataloader_train = load_dataset(filename_dataset_train, "train", **dataset_static_args)
     dataset_dev, _ = load_dataset(filename_dataset_dev, "dev", **dataset_static_args)
-    dataset_test, _ = load_dataset(filename_dataset_test, "test", **dataset_static_args)
 
     #training_steps_per_epoch = len(dataloader_train) // num_processes
     training_steps_per_epoch = len(dataloader_train) # it counts batches, not samples (value = samples // batch_size)!
@@ -575,7 +574,7 @@ def main(args):
             assert not pre_stop, pre_stop
 
         last_epoch = epoch >= epochs
-        last_step_patience = (strategy == "steps") and (not train_until_patience) and last_epoch and (not patience_applied) # Let's check the patience again in the last step if strategy is steps
+        last_step_patience = (eval_strategy == "steps") and (not train_until_patience) and last_epoch and (not patience_applied) # Let's check the patience again in the last step if strategy is steps
 
         if eval_strategy == "epoch" or last_step_patience:
             # Patience
@@ -612,6 +611,7 @@ def main(args):
     # Eval test
     models_not_available = model_output is None
     results_keys, results_values = [], []
+    dataset_test, _ = load_dataset(filename_dataset_test, "test", **dataset_static_args)
 
     if models_not_available:
         saved_epochs_or_steps = [epoch if strategy == "epoch" else global_step]
