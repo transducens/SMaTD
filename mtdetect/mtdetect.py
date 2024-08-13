@@ -480,6 +480,7 @@ def main(args):
 
         duplicated_data = {}
         step = 0
+        patience_applied = False
 
         for batch in dataloader_train:
             with training_context_manager(model):
@@ -491,6 +492,7 @@ def main(args):
                 loss = result["loss"]
 
                 for i in inputs:
+                    # Sanity check for later
                     _i = tokenizer.decode(i.squeeze().tolist(), skip_special_tokens=True)
 
                     if _i not in duplicated_data:
@@ -516,6 +518,8 @@ def main(args):
                 else:
                     continue # avoid executing the following conditions more than once, because some variables will have the same value as in the previous iteration of the loop
 
+            # When we reach this point, we have processed actual_batch_size samples (i.e., 1 batch)!
+
             if accelerator.is_main_process:
                 writer.add_scalar("loss/train", loss, global_step)
 
@@ -526,13 +530,15 @@ def main(args):
 
             if eval_strategy == "steps" and global_step % eval_steps == 0:
                 # Patience
+                save_model_suffix = epoch if eval_strategy == "epoch" else global_step
                 current_patience, dev_best_metric_value, dev_best_epoch = apply_patience(
-                    model, tokenizer, dataset_dev, loss_function, device, threshold, dev_best_metric, global_step, dev_best_metric_value,
+                    model, tokenizer, dataset_dev, loss_function, device, threshold, dev_best_metric, save_model_suffix, dev_best_metric_value,
                     current_patience, patience, dev_best_epoch, model_output)
+                patience_applied = True
 
                 # Save model
-                save_model(model, model_output=model_output, name=f"{save_model_prefix}_{global_step}")
-                saved_epochs_or_steps.append(global_step)
+                save_model(model, model_output=model_output, name=f"{save_model_prefix}_{save_model_suffix}")
+                saved_epochs_or_steps.append(save_model_suffix)
 
                 # Stop training?
                 if patience > 0 and current_patience >= patience:
@@ -544,12 +550,15 @@ def main(args):
 
                     break
 
+            patience_applied = False
+
         pre_stop = False
 
         if stop_training:
             pre_stop = True
 
             assert eval_strategy == "steps", eval_strategy
+            assert patience_applied, patience_applied
         elif not monolingual: # if monolingual, duplicate data may be found...
             total_duplicated = 0
 
@@ -561,15 +570,23 @@ def main(args):
 
         epoch += 1
 
-        if eval_strategy == "epoch":
+        if not patience_applied:
+            assert not stop_training, stop_training
+            assert not pre_stop, pre_stop
+
+        last_epoch = epoch >= epochs
+        last_step_patience = (strategy == "steps") and (not train_until_patience) and last_epoch and (not patience_applied) # Let's check the patience again in the last step if strategy is steps
+
+        if eval_strategy == "epoch" or last_step_patience:
             # Patience
+            save_model_suffix = epoch if eval_strategy == "epoch" else global_step
             current_patience, dev_best_metric_value, dev_best_epoch = apply_patience(
-                model, tokenizer, dataset_dev, loss_function, device, threshold, dev_best_metric, epoch, dev_best_metric_value,
+                model, tokenizer, dataset_dev, loss_function, device, threshold, dev_best_metric, save_model_suffix, dev_best_metric_value,
                 current_patience, patience, dev_best_epoch, model_output)
 
             # Save model
-            save_model(model, model_output=model_output, name=f"{save_model_prefix}_{epoch}")
-            saved_epochs_or_steps.append(epoch)
+            save_model(model, model_output=model_output, name=f"{save_model_prefix}_{save_model_suffix}")
+            saved_epochs_or_steps.append(save_model_suffix)
 
         # Stop training?
         if patience > 0 and current_patience >= patience:
@@ -578,10 +595,19 @@ def main(args):
 
             stop_training = True
         elif not train_until_patience:
-            stop_training = epoch >= epochs
+            stop_training = last_epoch
 
         if pre_stop:
             assert stop_training
+
+    # Free memory
+    del dataloader_train
+    del dataset_train
+    del dataset_dev
+    del model
+
+    #torch.cuda.empty_cache() # with del above is enough because this call releases reserved memory, not allocated memory (which is released with del)
+                              # this method would slow performance because the allocation would have to be done again and would not provide any benefit
 
     # Eval test
     models_not_available = model_output is None
