@@ -186,53 +186,6 @@ loss.backward(retain_graph=True)
 assert len(attentions_grad_store) == num_hidden_layers, f"{len(attentions_grad_store)} != {num_hidden_layers}"
 assert attentions_grad_store.keys() == attention_components.keys(), f"{attentions_grad_store.keys()} != {attention_components.keys()}"
 
-# Get gradients
-
-#gradients_components = {}
-#
-#for name, param in model.named_parameters():
-#    gradient = param.grad
-#
-#    if gradient is None:
-#        continue
-#
-#    # Model specific
-#    once = False
-#
-##    for attention_component in ("query", "key", "value"):
-##        for gradient_component in ("weight", "bias"):
-##            if name.endswith(f"attention.self.{attention_component}.{gradient_component}"):
-##                assert not once
-##
-##                once = True
-##                layer = int(name.split('.')[3])
-##
-##                if layer not in gradients_components:
-##                    gradients_components[layer] = {}
-##                if attention_component not in gradients_components[layer]:
-##                    gradients_components[layer][attention_component] = {}
-##
-##                assert gradient_component not in gradients_components[layer][attention_component], f"{layer}: {gradient_component}: {gradients_components[layer].keys()}: {gradients_components[layer]}"
-##
-##                gradients_components[layer][attention_component][gradient_component] = gradient
-#
-#    for gradient_component in ("weight", "bias"):
-#        if name.endswith(f"attention.output.LayerNorm.{gradient_component}"): # TODO "dense" or "LayerNorm"?
-#            assert not once
-#
-#            once = True
-#            layer = int(name.split('.')[3])
-#
-#            if layer not in gradients_components:
-#                gradients_components[layer] = {}
-#
-#            assert gradient_component not in gradients_components[layer], f"{layer}: {gradient_component}: {gradients_components[layer].keys()}: {gradients_components[layer]}"
-#
-#            gradients_components[layer][gradient_component] = gradient
-#
-#assert len(gradients_components) == num_hidden_layers, f"{len(gradients_components)} != {num_hidden_layers}"
-#assert gradients_components.keys() == attention_components.keys(), f"{gradients_components.keys()} != {attention_components.keys()}"
-
 ##########################################
 
 a_line = []
@@ -260,7 +213,6 @@ assert a_line[0].shape == (batch_size, seq_len, seq_len), a_line[0].shape
 
 # Update
 r_tt = np.identity(seq_len) # text
-#r_tt = np.zeros((seq_len, seq_len)) # text
 
 assert r_tt.shape == (seq_len, seq_len), r_tt.shape
 
@@ -277,8 +229,47 @@ assert r_tt.shape == (seq_len, seq_len), r_tt.shape
 r_tt = r_tt[0] # Classification: according to the paper, get first token (i.e., CLS token)
 r_tt = r_tt[1:-1] # Remove special tokens
 input_tensor_decoded = input_tensor_decoded[1:-1] # Remove special tokens
-#r_tt = torch.softmax(torch.tensor(r_tt), dim=0).numpy() # Easily interpreted
 r_tt = (r_tt - r_tt.min()) / (r_tt.max() - r_tt.min()) # min-max normalization
 
 for priority, token in zip(r_tt, input_tensor_decoded):
     print(f"{token}\t{priority}")
+
+##########################################
+# Results for https://es.wikipedia.org/wiki/Halo_3#Matchmaking
+########################################## spa (it makes sense that "▁es" is highlighted, as it is the main indication that the URL links to a Spanish document)
+# ▁es     1.0
+# ▁       0.655019430343012
+# .       0.7637193536636468
+# ▁       0.49272859413346826
+# wikipedia       0.4773227022720526
+# ▁       0.5286190934140631
+# .       0.6222616652878866
+# ▁org    0.2968295510435883
+# ▁/      0.5423566155537004
+# ▁wiki   0.4229652649238778
+# ▁/      0.7234402508753892
+# ▁Halo   0.48151405250875334
+# ▁_      0.7452003770495972
+# ▁3      0.04804429453348593
+# ▁#      0.2542532853981647
+# ▁Match  0.0
+# making  0.1237987899177173
+########################################## eng (it makes sense that the only English word has the most relevance: "▁Match" and "making")
+# ▁es     0.43261021987432907
+# ▁       0.10096244200177303
+# .       0.14804454251464105
+# ▁       0.0446340194062123
+# wikipedia       0.1581167806711341
+# ▁       0.07818782228045079
+# .       0.11523778021161747
+# ▁org    0.0
+# ▁/      0.1164210304358272
+# ▁wiki   0.19257041756315163
+# ▁/      0.2127387219243301
+# ▁Halo   0.5380063625371798
+# ▁_      0.3879838679373022
+# ▁3      0.5102079610685366
+# ▁#      0.29790781221112145
+# ▁Match  0.9626208961637784
+# making  1.0
+##########################################
