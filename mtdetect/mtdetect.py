@@ -605,8 +605,7 @@ def main(args):
     del dataset_dev
     del model
 
-    #torch.cuda.empty_cache() # with del above is enough because this call releases reserved memory, not allocated memory (which is released with del)
-                              # this method would slow performance because the allocation would have to be done again and would not provide any benefit
+    torch.cuda.empty_cache()
 
     # Eval test
     models_not_available = model_output is None
