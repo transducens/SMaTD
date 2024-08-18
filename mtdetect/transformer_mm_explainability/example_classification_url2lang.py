@@ -9,6 +9,7 @@ import torch
 import numpy as np
 
 url = sys.argv[1] # e.g., https://es.wikipedia.org/wiki/Halo_3#Matchmaking
+target_class = None if len(sys.argv) < 3 else sys.argv[2]
 preprocess_tokenizer_regex = r'[^\W_0-9]+|[^\w\s]+|_+|\s+|[0-9]+' # Similar to wordpunct_tokenize
 preprocess_tokenizer = nltk.tokenize.RegexpTokenizer(preprocess_tokenizer_regex).tokenize
 
@@ -77,10 +78,20 @@ print(f"Language (probability): {lang} ({probability})")
 
 ##########################################
 
+lang2id = {lang: int(_id) for _id, lang in model.config.id2lang.items()}
+
+if target_class is None:
+    target_class = lang_idx
+else:
+    assert target_class in lang2id, f"{target_class} not supported: {lang2id.keys()}"
+
+    target_class = lang2id[target_class]
+
+target_lang = model.config.id2lang[str(target_class)]
+
+print(f"Target lang: {target_lang}")
+
 criterion = torch.nn.BCEWithLogitsLoss()
-#lang2id = {lang: int(_id) for _id, lang in model.config.id2lang.items()}
-#target_class = lang2id[lang] # Other classes can be analyzed
-target_class = lang_idx
 target = torch.eye(len(model.config.id2lang))[target_class].unsqueeze(0)
 batch_size = output["logits"].shape[0]
 
@@ -88,7 +99,8 @@ assert output["logits"].shape, target.shape
 assert output["logits"].requires_grad
 
 target = target.to(device)
-loss = criterion(output["logits"], target)
+#loss = criterion(output["logits"], target)
+loss = torch.sum(output["logits"] * target) # Why is this the loss?????? Taken from: https://colab.research.google.com/github/hila-chefer/Transformer-MM-Explainability/blob/main/Transformer_MM_explainability_ViT.ipynb
 input_tensor = encoded_input["input_ids"]
 
 assert input_tensor.shape[0] == batch_size, input_tensor
@@ -168,7 +180,8 @@ for layer in range(num_hidden_layers):
 
 assert len(attentions_grad_store) == 0, f"{len(attentions_grad_store)} != 0"
 
-loss.backward()
+model.zero_grad()
+loss.backward(retain_graph=True)
 
 assert len(attentions_grad_store) == num_hidden_layers, f"{len(attentions_grad_store)} != {num_hidden_layers}"
 assert attentions_grad_store.keys() == attention_components.keys(), f"{attentions_grad_store.keys()} != {attention_components.keys()}"
@@ -262,11 +275,10 @@ for layer in range(num_hidden_layers):
 assert r_tt.shape == (seq_len, seq_len), r_tt.shape
 
 r_tt = r_tt[0] # Classification: according to the paper, get first token (i.e., CLS token)
-#r_tt = r_tt[1:-1] # Remove special tokens
-#input_tensor_decoded = input_tensor_decoded[1:-1] # Remove special tokens
+r_tt = r_tt[1:-1] # Remove special tokens
+input_tensor_decoded = input_tensor_decoded[1:-1] # Remove special tokens
 #r_tt = torch.softmax(torch.tensor(r_tt), dim=0).numpy() # Easily interpreted
-
-# TODO mmm does it work?
+r_tt = (r_tt - r_tt.min()) / (r_tt.max() - r_tt.min()) # min-max normalization
 
 for priority, token in zip(r_tt, input_tensor_decoded):
     print(f"{token}\t{priority}")
