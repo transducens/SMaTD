@@ -7,11 +7,14 @@ import transformers
 # NLLB supported languages: https://github.com/facebookresearch/flores/blob/main/flores200/README.md#languages-in-flores-200
 
 source_text = sys.argv[1]
-source_lang = sys.argv[2] if len(sys.argv) > 2 else "eng_Latn" # e.g., eng_Latn
-target_lang = sys.argv[3] if len(sys.argv) > 3 else "spa_Latn" # e.g., spa_Latn
+target_text = sys.argv[2] if len(sys.argv) > 2 else '' # Teacher forcing
+source_lang = sys.argv[3] if len(sys.argv) > 3 else "eng_Latn" # e.g., eng_Latn
+target_lang = sys.argv[4] if len(sys.argv) > 4 else "spa_Latn" # e.g., spa_Latn
 debug = True # Change manually
 
-print(f"Translating from {source_lang} to {target_lang}: {source_text}")
+print(f"Translating from {source_lang} to {target_lang}")
+print(f"Source text: {source_text}")
+print(f"Target text: {target_text}")
 
 # Load NLLB
 
@@ -21,6 +24,10 @@ model = transformers.AutoModelForSeq2SeqLM.from_pretrained("facebook/nllb-200-di
 tokenizer = transformers.AutoTokenizer.from_pretrained("facebook/nllb-200-distilled-600M", src_lang=source_lang, tgt_lang=target_lang)
 max_length = tokenizer.model_max_length
 translator_pipeline = None
+num_hidden_layers = model.config.num_hidden_layers # Model layers
+num_attention_heads = model.config.num_attention_heads # Heads each attention layer has
+
+model.eval()
 
 def get_lang_token(lang):
     token = tokenizer.convert_tokens_to_ids(lang)
@@ -58,7 +65,7 @@ def translate_from_pipeline():
 
     return translation
 
-inputs = tokenizer(source_text, return_tensors="pt").to(device)
+inputs = tokenizer(source_text, return_tensors="pt", add_special_tokens=True).to(device)
 
 # We can't use model.generate because we need to apply teacher forcing and need the attention...
 # Generation strategy: following https://huggingface.co/facebook/nllb-200-distilled-600M/blob/main/generation_config.json
@@ -81,7 +88,9 @@ decoder_start_token_id = tokenizer.eos_token_id
 # _from_model_config : https://github.com/huggingface/transformers/blob/52cb4034ada381fe1ffe8d428a1076e5411a8026/src/transformers/trainer_seq2seq.py#L315
 #  ... it handles the generation configuration override by the user, so we do not need to worry about it
 
-generated_tokens = [decoder_start_token_id, target_lang_id] # NLLB starts with these two tokens
+teacher_forcing = bool(target_text)
+outputs = tokenizer(target_text, return_tensors="pt", add_special_tokens=False).input_ids[0].tolist() if teacher_forcing else []
+generated_tokens = [decoder_start_token_id, target_lang_id] + outputs # NLLB starts with these two tokens
 initial_tokens = len(generated_tokens)
 
 assert batch_size == 1, batch_size
@@ -94,7 +103,7 @@ for i in range(max_length):
 
     assert decoder_input_ids.shape == (batch_size, i + initial_tokens), decoder_input_ids.shape
 
-    model_output = model(**inputs, decoder_input_ids=decoder_input_ids, output_attentions=True)
+    model_output = model(**inputs, decoder_input_ids=decoder_input_ids, output_attentions=True) # odict_keys(['logits', 'past_key_values', 'decoder_attentions', 'cross_attentions', 'encoder_last_hidden_state', 'encoder_attentions'])
     logits = model_output.logits
     vocab_size = logits.shape[-1] if vocab_size is None else vocab_size
 
@@ -107,12 +116,88 @@ for i in range(max_length):
 
     next_token_id = translated_tokens[-1].cpu().detach().item()
 
-    generated_tokens.append(next_token_id)
+    if teacher_forcing:
+        # Next token might be different of EoS -> force
+        if next_token_id != tokenizer.eos_token_id:
+            if debug:
+                print(f"DEBUG: last generated token is not EoS but {tokenizer.convert_ids_to_tokens(next_token_id)} (id: {next_token_id})")
+
+            next_token_id = tokenizer.eos_token_id
 
     if next_token_id == tokenizer.eos_token_id:
         break
 
+    generated_tokens.append(next_token_id) # We do not insert the token if it's the last because it's not provided to the model in the next iteration
+
+# Attention, and gradients hook
+
+attentions_grad_store = {}
+
+def capture_attention_grads(layer, component):
+    def _f(grad):
+        if layer not in attentions_grad_store:
+            attentions_grad_store[layer] = {}
+
+        assert component not in attentions_grad_store[layer]
+
+        attentions_grad_store[layer][component] = grad
+
+    return _f
+
+encoder_attentions = {l: a for l, a in enumerate(model_output.encoder_attentions)}
+decoder_attentions = {l: a for l, a in enumerate(model_output.decoder_attentions)}
+cross_attentions = {l: a for l, a in enumerate(model_output.cross_attentions)}
+
+for layer in range(num_hidden_layers):
+    assert encoder_attentions[layer].requires_grad
+    assert decoder_attentions[layer].requires_grad
+    assert cross_attentions[layer].requires_grad
+
+    encoder_attentions[layer].retain_grad()
+    decoder_attentions[layer].retain_grad()
+    cross_attentions[layer].retain_grad()
+    encoder_attentions[layer].register_hook(capture_attention_grads(layer, "encoder"))
+    decoder_attentions[layer].register_hook(capture_attention_grads(layer, "decoder"))
+    cross_attentions[layer].register_hook(capture_attention_grads(layer, "cross"))
+
+assert len(encoder_attentions) == num_hidden_layers, f"{len(encoder_attentions)} != {num_hidden_layers}"
+assert len(decoder_attentions) == num_hidden_layers, f"{len(decoder_attentions)} != {num_hidden_layers}"
+assert len(cross_attentions) == num_hidden_layers, f"{len(cross_attentions)} != {num_hidden_layers}"
+
+source_text_seq_len = len(inputs.input_ids[0])
+target_text_seq_len = len(generated_tokens)
+encoder_attention_expected_shape = (batch_size, num_attention_heads, source_text_seq_len, source_text_seq_len)
+decoder_attention_expected_shape = (batch_size, num_attention_heads, target_text_seq_len, target_text_seq_len)
+cross_attention_expected_shape = (batch_size, num_attention_heads, target_text_seq_len, source_text_seq_len)
+
+for l in range(num_hidden_layers):
+    assert encoder_attentions[l].shape == encoder_attention_expected_shape, f"{l}: {encoder_attentions[l].shape} != {encoder_attention_expected_shape}"
+    assert decoder_attentions[l].shape == decoder_attention_expected_shape, f"{l}: {decoder_attentions[l].shape} != {decoder_attention_expected_shape}"
+    assert cross_attentions[l].shape == cross_attention_expected_shape, f"{l}: {cross_attentions[l].shape} != {cross_attention_expected_shape}"
+
 translated_tokens = torch.tensor([generated_tokens]).to(device)
+
+# Calculate gradients
+
+logits = model_output.logits
+logits_expected_shape = (batch_size, len(generated_tokens), vocab_size)
+
+assert logits.shape == logits_expected_shape, f"{logits.shape} != {logits_expected_shape}"
+
+target = torch.zeros(logits_expected_shape)
+
+for i, token in enumerate(generated_tokens):
+    target[:, i, token] = 1.0
+
+target = target.to(device)
+loss = torch.sum(logits * target)
+
+assert len(attentions_grad_store) == 0, f"{len(attentions_grad_store)} != 0"
+
+model.zero_grad()
+loss.backward(retain_graph=True)
+
+assert len(attentions_grad_store) == num_hidden_layers, f"{len(attentions_grad_store)} != {num_hidden_layers}"
 
 # Decode
 
@@ -121,7 +206,7 @@ output = decode(translated_tokens)
 for translated_text in output:
     print(translated_text)
 
-if debug:
+if debug and not teacher_forcing:
     from_generate = translate_from_generate()
 
     print(f"DEBUG: from generate(): {from_generate}")
