@@ -67,6 +67,7 @@ def translate_from_pipeline():
     return translation
 
 inputs = tokenizer(source_text, return_tensors="pt", add_special_tokens=True).to(device)
+input_tokens = [tokenizer.convert_ids_to_tokens(_id) for _id in inputs.input_ids[0].cpu().detach().tolist()]
 
 # We can't use model.generate because we need to apply teacher forcing and need the attention...
 # Generation strategy: following https://huggingface.co/facebook/nllb-200-distilled-600M/blob/main/generation_config.json
@@ -201,9 +202,10 @@ assert len(attentions_grad_store) == num_hidden_layers, f"{len(attentions_grad_s
 # Decode
 
 output = decode(translated_tokens)
+output_tokens = [tokenizer.convert_ids_to_tokens(_id) for _id in generated_tokens]
 
-for translated_text in output:
-    print(translated_text)
+for i, translated_text in enumerate(output, 1):
+    print(f"Translation #{i}: {translated_text}")
 
 if debug:
     from_generate = translate_from_generate()
@@ -223,12 +225,12 @@ if debug:
             print(f"DEBUG: warning: different result than using pipeline (this is expected if teacher forcing is enabled): {o1} vs {o2}")
 
 # Apply explainability
-# i -> source, t -> target (following paper nomenclature)
+# e -> encoder, d -> decoder (following paper nomenclature section 3.2, encoder-decoder architecture)
 
-r_ii = np.identity(source_text_seq_len)
-r_tt = np.identity(target_text_seq_len)
-r_it = np.zeros((source_text_seq_len, target_text_seq_len)) # We only have co-attention in the decoder (i.e., r_ti)
-r_ti = np.zeros((target_text_seq_len, source_text_seq_len)) # influence of the input text on the translated text
+r_ee = np.identity(source_text_seq_len) # encoder
+r_dd = np.identity(target_text_seq_len) # decoder
+#r_ed = np.zeros((source_text_seq_len, target_text_seq_len)) # We only have co-attention in the decoder (i.e., r_de)
+r_de = np.zeros((target_text_seq_len, source_text_seq_len)) # influence of the input text on the translated text
 a_line = {}
 
 for layer in range(num_hidden_layers):
@@ -256,38 +258,27 @@ for layer in range(num_hidden_layers):
 
 assert len(a_line) == num_hidden_layers
 
-# Update attention layers
+# Update encoder self attention layers
 
 for layer in range(num_hidden_layers):
+    # Only equation 6
 
-    # equation 6
-    for component, r in (("encoder", r_ii), ("decoder", r_tt)):
-        a_line_aux = a_line[layer][component][0].numpy() # current layer, and batch size is 0
+    component = "encoder"
+    a_line_aux = a_line[layer][component][0].numpy() # current layer, and batch size is 0
 
-        assert a_line_aux.shape == attention_expected_shape[component][-2:], a_line_aux.shape
-        assert a_line_aux.shape == r.shape
+    assert a_line_aux.shape == attention_expected_shape[component][-2:], a_line_aux.shape
+    assert a_line_aux.shape == r_ee.shape
 
-        r += np.matmul(a_line_aux, r)
+    r_ee += np.matmul(a_line_aux, r_ee)
 
-    # equation 7
-    #for component, r in (("encoder", r_it), ("decoder", r_ti)):
-    for component, r in (("decoder", r_ti),): # is this equation useful for anything...??? (result is always 0...) (for cross attention we use the encoder A variable according
-                                              #  ... to https://github.com/hila-chefer/Transformer-MM-Explainability/blob/main/lxmert/lxmert/src/ExplanationGenerator.py#L169 )
-        a_line_aux = a_line[layer][component][0].numpy()
+# Update decoder self- and cross-attention
 
-        assert a_line_aux.shape == attention_expected_shape[component][-2:], a_line_aux.shape
-
-        r += np.matmul(a_line_aux, r)
-
-        assert (r == np.zeros_like(r)).all()
-
-# Update cross attention layers
 apply_normalization = True # equations 8 and 9
 
 def normalize(r):
     # Code: https://github.com/hila-chefer/Transformer-MM-Explainability/blob/58eaea85ac9c34aff052f368514b35d2e4c8dd3c/lxmert/lxmert/src/ExplanationGenerator.py#L45
 
-    self_attention = r
+    self_attention = np.array(r, copy=True)
     diag_idx = range(self_attention.shape[-1])
     self_attention -= np.eye(self_attention.shape[-1])
 
@@ -299,27 +290,86 @@ def normalize(r):
     return self_attention
 
 for layer in range(num_hidden_layers):
-    #if layer == num_hidden_layers - 1:
-    #    break
+    # Code: https://github.com/hila-chefer/Transformer-MM-Explainability/blob/58eaea85ac9c34aff052f368514b35d2e4c8dd3c/DETR/modules/ExplanationGenerator.py#L142
 
-    for component, r1, r2, r3, r4 in (("cross", r_it, r_tt, r_ii, r_ti),): # equations (8, 9,) 10 and 11
-        a_line_aux = a_line[layer][component][0].numpy()
+    # Encoder attention: equations 6 and 7
 
-        assert a_line_aux.shape == attention_expected_shape[component][-2:], a_line_aux.shape
+    component = "decoder"
+    a_line_aux = a_line[layer][component][0].numpy() # current layer, and batch size is 0
 
-        r2_normalized = np.array(r2, copy=True)
-        r3_normalized = np.array(r3, copy=True)
+    assert a_line_aux.shape == attention_expected_shape[component][-2:], a_line_aux.shape
+    assert a_line_aux.shape == r_dd.shape
 
-        if apply_normalization:
-            # equations 8 and 9
-            r2_normalized = normalize(r2_normalized)
-            r3_normalized = normalize(r3_normalized)
+    r_dd += np.matmul(a_line_aux, r_dd)
+    r_de += np.matmul(a_line_aux, r_de)
 
-        pre_r_sq_addition = np.matmul(a_line_aux, r3_normalized)
-        r_sq_addition = np.matmul(r2_normalized.transpose(), pre_r_sq_addition) # 1st
-        r_ss_addition = np.matmul(a_line_aux, r1) # 2nd
+    if layer == 0:
+        assert (r_de == np.zeros_like(r_de)).all()
+    else:
+        assert (r_de != np.zeros_like(r_de)).any() # Due to cross-attention!
 
-        # Update
+    # Cross-attention: equations 8, 9, 10 and 11
+    component = "cross"
+    a_line_aux = a_line[layer][component][0].numpy() # current layer, and batch size is 0
 
-        r4 += r_sq_addition
-        r2 += r_ss_addition
+    assert a_line_aux.shape == attention_expected_shape[component][-2:], a_line_aux.shape
+
+    r_dd_normalized = r_dd
+    r_ee_normalized = r_ee
+
+    if apply_normalization:
+        # Equations 8 and 9
+        r_dd_normalized = normalize(r_dd_normalized)
+        r_ee_normalized = normalize(r_ee_normalized)
+
+    pre_r_de_addition = np.matmul(a_line_aux, r_ee_normalized)
+    r_de_addition = np.matmul(r_dd_normalized.transpose(), pre_r_de_addition)
+
+    # Update cross-attention
+    r_de += r_de_addition
+
+assert r_de.shape == (len(output_tokens), len(input_tokens))
+
+# Min-max normalization
+
+# Fill self-attention diagonal with near-zeros to make easier the relevance analysis of the self-attention
+np.fill_diagonal(r_ee, sys.float_info.epsilon)
+np.fill_diagonal(r_dd, sys.float_info.epsilon)
+
+## "Absolute" normalization
+#r_ee = (r_ee - r_ee.min()) / (r_ee.max() - r_ee.min())
+#r_dd = (r_dd - r_dd.min()) / (r_dd.max() - r_dd.min())
+#r_de = (r_de - r_de.min()) / (r_de.max() - r_de.min()) # (target_text_seq_len, source_text_seq_len)
+## "Relative" normalization (easier to analize per translated token)
+r_ee = np.array([(r_ee[i] - r_ee[i].min()) / (r_ee[i].max() - r_ee[i].min()) for i in range(len(r_ee))])
+r_dd = np.array([(r_dd[i] - r_dd[i].min()) / (r_dd[i].max() - r_dd[i].min()) for i in range(len(r_dd))])
+r_de = np.array([(r_de[i] - r_de[i].min()) / (r_de[i].max() - r_de[i].min()) for i in range(len(r_de))])
+
+# Print results
+
+def print_attention(tokens_a, tokens_b, rel):
+    assert len(rel.shape) == 2
+    assert rel.shape[0] == len(tokens_a)
+    assert rel.shape[1] == len(tokens_b)
+
+    #for token in tokens_b:
+    #    sys.stdout.write(f"\t{token}")
+    #sys.stdout.write('\n')
+
+    for i in range(len(tokens_a)):
+        sys.stdout.write(tokens_a[i])
+
+        for j in range(len(tokens_b)):
+            sys.stdout.write(f"\t{tokens_b[j]}:{rel[i][j]:.2f}")
+
+        sys.stdout.write('\n')
+
+print()
+print("Encoder self-attention:")
+print_attention(input_tokens, input_tokens, r_ee)
+print()
+print("Decoder self-attention:")
+print_attention(output_tokens, output_tokens, r_dd)
+print()
+print("Decoder cross-attention:")
+print_attention(output_tokens, input_tokens, r_de)
