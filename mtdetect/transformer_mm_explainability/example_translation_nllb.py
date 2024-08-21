@@ -227,8 +227,8 @@ if debug:
 
 r_ii = np.identity(source_text_seq_len)
 r_tt = np.identity(target_text_seq_len)
-r_it = np.zeros((source_text_seq_len, target_text_seq_len)) # influence of the input text on the translated text
-#r_ti = np.zeros((target_text_seq_len, source_text_seq_len)) # We only have co-attention in the decoder (i.e., r_it)
+r_it = np.zeros((source_text_seq_len, target_text_seq_len)) # We only have co-attention in the decoder (i.e., r_ti)
+r_ti = np.zeros((target_text_seq_len, source_text_seq_len)) # influence of the input text on the translated text
 a_line = {}
 
 for layer in range(num_hidden_layers):
@@ -270,7 +270,8 @@ for layer in range(num_hidden_layers):
         r += np.matmul(a_line_aux, r)
 
     # equation 7
-    for component, r in (("encoder", r_it),): # is this equation useful for anything...??? (result is always 0...) (for cross attention we use the encoder A variable according
+    #for component, r in (("encoder", r_it), ("decoder", r_ti)):
+    for component, r in (("decoder", r_ti),): # is this equation useful for anything...??? (result is always 0...) (for cross attention we use the encoder A variable according
                                               #  ... to https://github.com/hila-chefer/Transformer-MM-Explainability/blob/main/lxmert/lxmert/src/ExplanationGenerator.py#L169 )
         a_line_aux = a_line[layer][component][0].numpy()
 
@@ -280,4 +281,45 @@ for layer in range(num_hidden_layers):
 
         assert (r == np.zeros_like(r)).all()
 
-    # TODO equation 8, 9, 10, and 11
+# Update cross attention layers
+apply_normalization = True # equations 8 and 9
+
+def normalize(r):
+    # Code: https://github.com/hila-chefer/Transformer-MM-Explainability/blob/58eaea85ac9c34aff052f368514b35d2e4c8dd3c/lxmert/lxmert/src/ExplanationGenerator.py#L45
+
+    self_attention = r
+    diag_idx = range(self_attention.shape[-1])
+    self_attention -= np.eye(self_attention.shape[-1])
+
+    assert self_attention[diag_idx, diag_idx].min() >= 0
+
+    self_attention = self_attention / self_attention.sum(axis=-1, keepdims=True)
+    self_attention += np.eye(self_attention.shape[-1])
+
+    return self_attention
+
+for layer in range(num_hidden_layers):
+    #if layer == num_hidden_layers - 1:
+    #    break
+
+    for component, r1, r2, r3, r4 in (("cross", r_it, r_tt, r_ii, r_ti),): # equations (8, 9,) 10 and 11
+        a_line_aux = a_line[layer][component][0].numpy()
+
+        assert a_line_aux.shape == attention_expected_shape[component][-2:], a_line_aux.shape
+
+        r2_normalized = np.array(r2, copy=True)
+        r3_normalized = np.array(r3, copy=True)
+
+        if apply_normalization:
+            # equations 8 and 9
+            r2_normalized = normalize(r2_normalized)
+            r3_normalized = normalize(r3_normalized)
+
+        pre_r_sq_addition = np.matmul(a_line_aux, r3_normalized)
+        r_sq_addition = np.matmul(r2_normalized.transpose(), pre_r_sq_addition) # 1st
+        r_ss_addition = np.matmul(a_line_aux, r1) # 2nd
+
+        # Update
+
+        r4 += r_sq_addition
+        r2 += r_ss_addition
