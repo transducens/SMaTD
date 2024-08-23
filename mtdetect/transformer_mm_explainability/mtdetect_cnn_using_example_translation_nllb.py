@@ -82,7 +82,7 @@ def read(filename, direction, source_lang, target_lang, self_attention_remove_di
     explainability_de = []
     fd = open(filename)
     first_msg = False
-    fn_pickle_array = f"{filename}.{direction}.{source_lang}.{target_lang}.{explainability_normalization}.{self_attention_remove_diagonal}.pickle"
+    fn_pickle_array = f"{filename}.{direction}.{source_lang}.{target_lang}.pickle"
     fn_pickle_array_exists = os.path.isfile(fn_pickle_array)
 
     if load_explainability_arrays and fn_pickle_array_exists:
@@ -123,8 +123,8 @@ def read(filename, direction, source_lang, target_lang, self_attention_remove_di
         if not fn_pickle_array_exists:
             input_tokens, output_tokens, r_ee, r_dd, r_de = \
                 example_translation_nllb.explainability(s, target_text=t, source_lang=source_lang, target_lang=target_lang, debug=False,
-                                                        apply_normalization=True, self_attention_remove_diagonal=self_attention_remove_diagonal,
-                                                        explainability_normalization=explainability_normalization)
+                                                        apply_normalization=True, self_attention_remove_diagonal=False,
+                                                        explainability_normalization="none")
 
             explainability_ee.append(r_ee)
             explainability_dd.append(r_dd)
@@ -133,6 +133,24 @@ def read(filename, direction, source_lang, target_lang, self_attention_remove_di
             r_ee = explainability_ee[idx]
             r_dd = explainability_dd[idx]
             r_de = explainability_de[idx]
+
+        ##### code from example_translation_nllb.py #####
+        if self_attention_remove_diagonal:
+            np.fill_diagonal(r_ee, sys.float_info.epsilon)
+            np.fill_diagonal(r_dd, sys.float_info.epsilon)
+
+        if explainability_normalization == "none":
+            pass
+        elif explainability_normalization == "absolute":
+            r_ee = (r_ee - r_ee.min()) / (r_ee.max() - r_ee.min())
+            r_dd = (r_dd - r_dd.min()) / (r_dd.max() - r_dd.min())
+            r_de = (r_de - r_de.min()) / (r_de.max() - r_de.min()) # (target_text_seq_len, source_text_seq_len)
+        elif explainability_normalization == "relative":
+            # "Relative" normalization (easier to analize per translated token)
+            r_ee = np.array([(r_ee[i] - r_ee[i].min()) / (r_ee[i].max() - r_ee[i].min()) for i in range(len(r_ee))])
+            r_dd = np.array([(r_dd[i] - r_dd[i].min()) / (r_dd[i].max() - r_dd[i].min()) for i in range(len(r_dd))])
+            r_de = np.array([(r_de[i] - r_de[i].min()) / (r_de[i].max() - r_de[i].min()) for i in range(len(r_de))])
+        ##### code from example_translation_nllb.py #####
 
         #print(f"{loaded_samples + 1} pairs loaded! {r_de.shape}")
 
