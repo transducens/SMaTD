@@ -38,6 +38,7 @@ attention_matrix = default_sys_argv(10, "cross")
 explainability_normalization = default_sys_argv(11, "relative")
 self_attention_remove_diagonal = default_sys_argv(12, True, f=lambda q: bool(int(q)))
 cnn_pooling = default_sys_argv(13, "max")
+save_model_path = default_sys_argv(14, '')
 
 assert direction in ("src2trg", "trg2src", "only_src", "only_trg"), direction
 assert attention_matrix in ("encoder", "decoder", "cross"), attention_matrix
@@ -59,7 +60,7 @@ print(f"NLLB conf:\n{translation_model_conf}")
 
 channels = 1
 device = "cuda" if torch.cuda.is_available() else "cpu"
-patience = 3
+patience = 10
 
 def extend_tensor_with_zeros(t, max_width, max_height, device):
     assert len(t.shape) == 2
@@ -352,13 +353,13 @@ dev_dataloader = DataLoader(dev_dataset, batch_size=batch_size, shuffle=False)
 
 # Model
 num_classes = 1
-epochs = 10
+epochs = 50
 model = SimpleCNN(channels, cnn_width, cnn_height, num_classes, pooling=cnn_pooling).to(device)
 
 model.train()
 
 loss_function = nn.BCEWithLogitsLoss(reduction="mean")
-learning_rate = 1e-5
+learning_rate = 1e-3
 model_parameters = filter(lambda p: p.requires_grad, model.parameters())
 optimizer = AdamW(model_parameters, lr=learning_rate, weight_decay=0.0)
 warmup_steps = 400
@@ -385,6 +386,11 @@ for epoch in range(epochs):
 
         current_patience = 0
         early_stopping_best_result = early_stopping_metric
+
+        if save_model_path:
+            print(f"Saving best model: {save_model_path}")
+
+            torch.save(model, save_model_path)
     else:
         current_patience += 1
 
@@ -411,6 +417,11 @@ for epoch in range(epochs):
         scheduler.step()
 
     print(f"Loss: {epoch_loss}")
+
+if save_model_path:
+    print(f"Loading best model: {save_model_path}")
+
+    model = torch.load(save_model_path, weights_only=False, map_location=device)
 
 train_results = eval(model, train_dataloader, device)
 

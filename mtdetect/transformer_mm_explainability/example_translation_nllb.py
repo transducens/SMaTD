@@ -7,6 +7,8 @@ import numpy as np
 
 # NLLB supported languages: https://github.com/facebookresearch/flores/blob/main/flores200/README.md#languages-in-flores-200
 
+# Use wrapper_example_translation_nllb.py to parallelize with parallel
+
 # Functions
 
 def get_lang_token(tokenizer, lang):
@@ -23,7 +25,7 @@ def decode(tokenizer, translated_tokens):
     return output
 
 def translate_from_generate(tokenizer, model, inputs, target_lang_id, max_length):
-    translated_tokens = model.generate(**inputs, forced_bos_token_id=target_lang_id, max_length=max_length)
+    translated_tokens = model.generate(**inputs, forced_bos_token_id=target_lang_id, max_new_tokens=max_length)
     translation = decode(tokenizer, translated_tokens)
 
     return translation
@@ -103,14 +105,15 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
 
         tokenizer = transformers.AutoTokenizer.from_pretrained("facebook/nllb-200-distilled-600M", src_lang=source_lang, tgt_lang=target_lang)
 
-    max_length = tokenizer.model_max_length
+    max_length_encoder = tokenizer.model_max_length
+    max_length_decoder = 200 # Value from generation_config.json
     num_hidden_layers = model.config.num_hidden_layers # Model layers
     num_attention_heads = model.config.num_attention_heads # Heads each attention layer has
 
     if debug:
         if translator_pipeline is None:
             translator_pipeline = transformers.pipeline("translation", model=model, tokenizer=tokenizer, batch_size=batch_size, src_lang=source_lang,
-                                                        tgt_lang=target_lang, max_length=max_length, truncation=True, device=device)
+                                                        tgt_lang=target_lang, max_new_tokens=max_length_decoder, truncation=True, device=device)
 
     model.eval()
 
@@ -119,7 +122,7 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
 
     # Translate
 
-    inputs = tokenizer(source_text, return_tensors="pt", add_special_tokens=True).to(device)
+    inputs = tokenizer(source_text, return_tensors="pt", add_special_tokens=True, max_length=max_length_encoder, truncation=True).to(device)
     input_tokens = [tokenizer.convert_ids_to_tokens(_id) for _id in inputs.input_ids[0].cpu().detach().tolist()]
 
     # We can't use model.generate because we need to apply teacher forcing and need the attention...
@@ -153,7 +156,7 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
     vocab_size = None
 
     # Greedy generation
-    for i in range(max_length):
+    for i in range(max_length_decoder):
         decoder_input_ids = torch.tensor([generated_tokens]).to(device)
 
         assert decoder_input_ids.shape == (batch_size, i + initial_tokens), decoder_input_ids.shape
@@ -180,6 +183,9 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
                 next_token_id = tokenizer.eos_token_id
 
         if next_token_id == tokenizer.eos_token_id:
+            break
+
+        if i + 1 == max_length_decoder:
             break
 
         generated_tokens.append(next_token_id) # We do not insert the token if it's the last because it's not provided to the model in the next iteration
@@ -215,7 +221,7 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
 
     for l in range(num_hidden_layers):
         for component in ("encoder", "decoder", "cross"):
-            assert attentions[l][component].shape == attention_expected_shape[component], f"{l}: {attentions[l][component].shape} != {attention_expected_shape[component]}"
+            assert attentions[l][component].shape == attention_expected_shape[component], f"{l}: {component}: {attentions[l][component].shape} != {attention_expected_shape[component]}"
 
     translated_tokens = torch.tensor([generated_tokens]).to(device)
 
@@ -251,7 +257,7 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
             print(f"DEBUG: translation #{i}: {translated_text}")
 
     if debug:
-        from_generate = translate_from_generate(tokenizer, model, inputs, target_lang_id, max_length)
+        from_generate = translate_from_generate(tokenizer, model, inputs, target_lang_id, max_length_decoder)
 
         assert len(from_generate) == len(output)
 
