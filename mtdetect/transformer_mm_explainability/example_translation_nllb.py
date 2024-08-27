@@ -2,6 +2,7 @@
 import sys
 
 import torch
+import torch.nn.functional as F
 import transformers
 import numpy as np
 
@@ -24,14 +25,14 @@ def decode(tokenizer, translated_tokens):
 
     return output
 
-def translate_from_generate(tokenizer, model, inputs, target_lang_id, max_length):
-    translated_tokens = model.generate(**inputs, forced_bos_token_id=target_lang_id, max_new_tokens=max_length)
+def translate_from_generate(tokenizer, model, inputs, target_lang_id, max_length, beam_size=1):
+    translated_tokens = model.generate(**inputs, forced_bos_token_id=target_lang_id, max_new_tokens=max_length, num_return_sequences=1, num_beams=beam_size)
     translation = decode(tokenizer, translated_tokens)
 
     return translation
 
-def translate_from_pipeline(translator_pipeline, source_text):
-    output = translator_pipeline(source_text)
+def translate_from_pipeline(translator_pipeline, source_text, beam_size=1):
+    output = translator_pipeline(source_text, num_beams=beam_size)
     translation = [_output["translation_text"] for _output in output]
 
     return translation
@@ -83,7 +84,7 @@ model = None
 tokenizer = None
 
 def explainability(source_text, target_text='', source_lang="eng_Latn", target_lang="spa_Latn", debug=False, apply_normalization=True,
-                   self_attention_remove_diagonal=True, explainability_normalization="relative"):
+                   self_attention_remove_diagonal=True, explainability_normalization="relative", device=None, beam_size=1):
     # Load NLLB
     assert isinstance(source_text, str), type(source_text)
     assert isinstance(target_text, str), type(target_text)
@@ -91,7 +92,9 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
     global model, tokenizer, translator_pipeline
 
     batch_size = 1
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
 
     if model is None:
         if debug:
@@ -147,6 +150,14 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
     #  ... it handles the generation configuration override by the user, so we do not need to worry about it
 
     teacher_forcing = bool(target_text)
+
+    if teacher_forcing and beam_size != 1:
+        print(f"warning: beam_size is going to be modified ({beam_size} -> 1) because teacher forcing is enabled")
+
+        beam_size = 1
+
+    # TODO if beam_size > 1, how to improve GPU memory allocated?
+
     outputs = tokenizer(target_text, return_tensors="pt", add_special_tokens=False).input_ids[0].tolist() if teacher_forcing else []
     generated_tokens = [decoder_start_token_id, target_lang_id] + outputs # NLLB starts with these two tokens
     initial_tokens = len(generated_tokens)
@@ -154,41 +165,79 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
     assert batch_size == 1, batch_size
 
     vocab_size = None
+    beams = [(list(generated_tokens), 0.0)] # copy generated_tokens using list()
+    completed_beams = []
 
-    # Greedy generation
+    # Beam search generation (greedy generation iff beam_size=1)
     for i in range(max_length_decoder):
-        decoder_input_ids = torch.tensor([generated_tokens]).to(device)
-
-        assert decoder_input_ids.shape == (batch_size, i + initial_tokens), decoder_input_ids.shape
-
-        model_output = model(**inputs, decoder_input_ids=decoder_input_ids, output_attentions=True) # odict_keys(['logits', 'past_key_values', 'decoder_attentions', 'cross_attentions', 'encoder_last_hidden_state', 'encoder_attentions'])
-        logits = model_output.logits
-        vocab_size = logits.shape[-1] if vocab_size is None else vocab_size
-
-        assert logits.shape == (batch_size, i + initial_tokens, vocab_size), f"{logits.shape} ... {vocab_size}"
-
-        logits = logits[:, -1, :] # Get last token logits
-        translated_tokens = torch.argmax(logits, dim=-1)
-
-        assert translated_tokens.shape == (batch_size,), translated_tokens.shape
-
-        next_token_id = translated_tokens[-1].cpu().detach().item()
-
-        if teacher_forcing:
-            # Next token might be different of EoS -> force
-            if next_token_id != tokenizer.eos_token_id:
-                if debug:
-                    print(f"DEBUG: last generated token is not EoS but {tokenizer.convert_ids_to_tokens(next_token_id)} (id: {next_token_id}). This is expected due to teacher forcing")
-
-                next_token_id = tokenizer.eos_token_id
-
-        if next_token_id == tokenizer.eos_token_id:
-            break
+        new_beams = []
 
         if i + 1 == max_length_decoder:
             break
 
-        generated_tokens.append(next_token_id) # We do not insert the token if it's the last because it's not provided to the model in the next iteration
+        for beam_tokens, beam_score in beams:
+            decoder_input_ids = torch.tensor([beam_tokens]).to(device)
+
+            assert decoder_input_ids.shape == (batch_size, i + initial_tokens), decoder_input_ids.shape
+
+            model_output = model(**inputs, decoder_input_ids=decoder_input_ids, output_attentions=False if beam_size > 1 else True) # odict_keys(['logits', 'past_key_values', 'decoder_attentions', 'cross_attentions', 'encoder_last_hidden_state', 'encoder_attentions'])
+            logits = model_output.logits
+            vocab_size = logits.shape[-1] if vocab_size is None else vocab_size
+
+            assert logits.shape == (batch_size, i + initial_tokens, vocab_size), f"{logits.shape} ... {vocab_size}"
+
+            logits = logits[:, -1, :] # Get last token logits
+            log_probs = F.log_softmax(logits, dim=-1)
+            token_ids = torch.topk(-log_probs, beam_size, largest=False, sorted=True).indices.squeeze(0).tolist() # get minimum (instead of maximum due to log) values (i.e., tokens)
+
+            if teacher_forcing:
+                # Next token might be different of EoS -> force
+                assert len(token_ids) == 1, token_ids
+
+                next_token_id = token_ids[0]
+
+                if next_token_id != tokenizer.eos_token_id:
+                    if debug:
+                        print(f"DEBUG: last generated token is not EoS but {tokenizer.convert_ids_to_tokens(next_token_id)} (id: {next_token_id}). This is expected due to teacher forcing")
+
+                    token_ids = [tokenizer.eos_token_id]
+
+            for token_id in token_ids:
+                token_log_prob = log_probs[0, token_id].item()
+                new_score = beam_score + token_log_prob
+                new_sequence = beam_tokens + [token_id]
+
+                if token_id == tokenizer.eos_token_id:
+                    new_sequence = new_sequence[:-1]
+                    completed_beams.append((new_sequence, new_score / len(new_sequence)))
+                else:
+                    new_beams.append((new_sequence, new_score))
+
+        # Sort and select top beams
+        new_beams.sort(key=lambda x: x[1], reverse=True)
+        beams = new_beams[:beam_size]
+
+        # If all beams are complete, sort them and break
+        if len(beams) == 0 and len(completed_beams) > 0:
+            break
+
+    for beam_tokens, beam_score in beams:
+        completed_beams.append((beam_tokens, beam_score / len(beam_tokens)))
+
+    completed_beams.sort(key=lambda x: x[1], reverse=True)
+    best_sequence, best_score = completed_beams[0]
+    generated_tokens = best_sequence
+
+    if beam_size > 1:
+        # Re-cacalculate to properly obtain the attention
+        decoder_input_ids = torch.tensor(generated_tokens).unsqueeze(0).to(device)
+        model_output = model(**inputs, decoder_input_ids=decoder_input_ids, output_attentions=True)
+
+    if debug:
+        for translated_tokens, score in completed_beams:
+            sequence = decode(tokenizer, [translated_tokens])[0]
+
+            print(f"DEBUG: beam search result (normalized score: {score} -> probability: {torch.e ** score}): {sequence}")
 
     # Attention, and gradients hook
 
@@ -257,21 +306,21 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
             print(f"DEBUG: translation #{i}: {translated_text}")
 
     if debug:
-        from_generate = translate_from_generate(tokenizer, model, inputs, target_lang_id, max_length_decoder)
+        from_generate = translate_from_generate(tokenizer, model, inputs, target_lang_id, max_length_decoder, beam_size=beam_size)
 
         assert len(from_generate) == len(output)
 
         for o1, o2 in zip(output, from_generate):
-            if o1 != o2:
-                print(f"DEBUG: warning: different result than using generate (this is expected if teacher forcing is enabled): {o1} vs {o2}")
+            if o1 != o2 and not teacher_forcing:
+                print(f"DEBUG: warning: different result than using generate: {o1} vs {o2}")
 
-        from_pipeline = translate_from_pipeline(translator_pipeline, source_text)
+        from_pipeline = translate_from_pipeline(translator_pipeline, source_text, beam_size=beam_size)
 
         assert len(from_pipeline) == len(output)
 
         for o1, o2 in zip(output, from_pipeline):
-            if o1 != o2:
-                print(f"DEBUG: warning: different result than using pipeline (this is expected if teacher forcing is enabled): {o1} vs {o2}")
+            if o1 != o2  and not teacher_forcing:
+                print(f"DEBUG: warning: different result than using pipeline: {o1} vs {o2}")
 
     # Apply explainability
     # e -> encoder, d -> decoder (following paper nomenclature section 3.2, encoder-decoder architecture)
@@ -389,9 +438,12 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
 if __name__ == "__main__":
     source_text = sys.argv[1]
     target_text = sys.argv[2] if len(sys.argv) > 2 else '' # Teacher forcing
-    source_lang = sys.argv[3] if len(sys.argv) > 3 else "eng_Latn" # e.g., eng_Latn
-    target_lang = sys.argv[4] if len(sys.argv) > 4 else "spa_Latn" # e.g., spa_Latn
+    source_lang = sys.argv[3] if (len(sys.argv) > 3 and len(sys.argv[3]) > 0) else "eng_Latn" # e.g., eng_Latn
+    target_lang = sys.argv[4] if (len(sys.argv) > 4 and len(sys.argv[4]) > 0) else "spa_Latn" # e.g., spa_Latn
+    beam_size = int(sys.argv[5]) if len(sys.argv) > 5 else 1
     debug = True # Change manually
+
+    print(f"Provided args: {sys.argv}")
 
     if source_text == '-' or target_text == '-':
         source_text, target_text = [], []
@@ -412,7 +464,7 @@ if __name__ == "__main__":
         print(f"Target text: {_target_text}")
 
         input_tokens, output_tokens, r_ee, r_dd, r_de = explainability(_source_text, target_text=_target_text, source_lang=source_lang,
-                                                                       target_lang=target_lang, debug=debug)
+                                                                       target_lang=target_lang, debug=debug, beam_size=beam_size)
 
         # Print results
 
