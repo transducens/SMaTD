@@ -156,8 +156,6 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
 
         beam_size = 1
 
-    # TODO if beam_size > 1, how to improve GPU memory allocated?
-
     outputs = tokenizer(target_text, return_tensors="pt", add_special_tokens=False).input_ids[0].tolist() if teacher_forcing else []
     generated_tokens = [decoder_start_token_id, target_lang_id] + outputs # NLLB starts with these two tokens
     initial_tokens = len(generated_tokens)
@@ -187,8 +185,15 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
             assert logits.shape == (batch_size, i + initial_tokens, vocab_size), f"{logits.shape} ... {vocab_size}"
 
             logits = logits[:, -1, :] # Get last token logits
-            log_probs = F.log_softmax(logits, dim=-1)
+            log_probs = F.log_softmax(logits, dim=-1).cpu()
             token_ids = torch.topk(-log_probs, beam_size, largest=False, sorted=True).indices.squeeze(0).tolist() # get minimum (instead of maximum due to log) values (i.e., tokens)
+
+            if beam_size > 1:
+                del decoder_input_ids
+                del model_output
+                del logits
+
+                torch.cuda.empty_cache()
 
             if teacher_forcing:
                 # Next token might be different of EoS -> force
@@ -209,6 +214,7 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
 
                 if token_id == tokenizer.eos_token_id:
                     new_sequence = new_sequence[:-1]
+
                     completed_beams.append((new_sequence, new_score / len(new_sequence)))
                 else:
                     new_beams.append((new_sequence, new_score))
@@ -221,23 +227,26 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
         if len(beams) == 0 and len(completed_beams) > 0:
             break
 
-    for beam_tokens, beam_score in beams:
-        completed_beams.append((beam_tokens, beam_score / len(beam_tokens)))
+    if len(completed_beams) < beam_size:
+        beams.sort(key=lambda x: x[1], reverse=True)
+
+        beams = beams[:beam_size - len(completed_beams)]
+
+        for beam_tokens, beam_score in beams:
+            completed_beams.append((beam_tokens, beam_score / len(beam_tokens)))
 
     completed_beams.sort(key=lambda x: x[1], reverse=True)
+
+    completed_beams = completed_beams[:beam_size]
     best_sequence, best_score = completed_beams[0]
     generated_tokens = best_sequence
 
     if beam_size > 1:
         # Re-cacalculate to properly obtain the attention
+        torch.cuda.empty_cache()
+
         decoder_input_ids = torch.tensor(generated_tokens).unsqueeze(0).to(device)
         model_output = model(**inputs, decoder_input_ids=decoder_input_ids, output_attentions=True)
-
-    if debug:
-        for translated_tokens, score in completed_beams:
-            sequence = decode(tokenizer, [translated_tokens])[0]
-
-            print(f"DEBUG: beam search result (normalized score: {score} -> probability: {torch.e ** score}): {sequence}")
 
     # Attention, and gradients hook
 
@@ -302,8 +311,10 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
     output_tokens = [tokenizer.convert_ids_to_tokens(_id) for _id in generated_tokens]
 
     if debug:
-        for i, translated_text in enumerate(output, 1):
-            print(f"DEBUG: translation #{i}: {translated_text}")
+        for i, (translated_tokens, score) in enumerate(completed_beams, 1):
+            translated_text = decode(tokenizer, [translated_tokens])[0]
+
+            print(f"DEBUG: translation #{i} (normalized score: {score} -> probability: {torch.e ** score}): {translated_text}")
 
     if debug:
         from_generate = translate_from_generate(tokenizer, model, inputs, target_lang_id, max_length_decoder, beam_size=beam_size)
@@ -441,6 +452,7 @@ if __name__ == "__main__":
     source_lang = sys.argv[3] if (len(sys.argv) > 3 and len(sys.argv[3]) > 0) else "eng_Latn" # e.g., eng_Latn
     target_lang = sys.argv[4] if (len(sys.argv) > 4 and len(sys.argv[4]) > 0) else "spa_Latn" # e.g., spa_Latn
     beam_size = int(sys.argv[5]) if len(sys.argv) > 5 else 1
+    device = sys.argv[6] if (len(sys.argv) > 6 and len(sys.argv[6]) > 0) else None
     debug = True # Change manually
 
     print(f"Provided args: {sys.argv}")
@@ -464,7 +476,7 @@ if __name__ == "__main__":
         print(f"Target text: {_target_text}")
 
         input_tokens, output_tokens, r_ee, r_dd, r_de = explainability(_source_text, target_text=_target_text, source_lang=source_lang,
-                                                                       target_lang=target_lang, debug=debug, beam_size=beam_size)
+                                                                       target_lang=target_lang, debug=debug, beam_size=beam_size, device=device)
 
         # Print results
 
