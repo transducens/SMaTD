@@ -1,5 +1,6 @@
 
 import sys
+import pickle
 
 import torch
 import torch.nn.functional as F
@@ -84,10 +85,14 @@ model = None
 tokenizer = None
 
 def explainability(source_text, target_text='', source_lang="eng_Latn", target_lang="spa_Latn", debug=False, apply_normalization=True,
-                   self_attention_remove_diagonal=True, explainability_normalization="relative", device=None, beam_size=1):
+                   self_attention_remove_diagonal=True, explainability_normalization="relative", device=None, beam_size=1,
+                   pretrained_model=None):
     # Load NLLB
     assert isinstance(source_text, str), type(source_text)
     assert isinstance(target_text, str), type(target_text)
+
+    if not pretrained_model:
+        pretrained_model = "facebook/nllb-200-distilled-600M"
 
     global model, tokenizer, translator_pipeline
 
@@ -100,16 +105,16 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
         if debug:
             print("DEBUG: model initialization")
 
-        model = transformers.AutoModelForSeq2SeqLM.from_pretrained("facebook/nllb-200-distilled-600M").to(device)
+        model = transformers.AutoModelForSeq2SeqLM.from_pretrained(pretrained_model).to(device)
 
     if tokenizer is None:
         if debug:
             print("DEBUG: tokenizer initialization")
 
-        tokenizer = transformers.AutoTokenizer.from_pretrained("facebook/nllb-200-distilled-600M", src_lang=source_lang, tgt_lang=target_lang)
+        tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model, src_lang=source_lang, tgt_lang=target_lang)
 
     max_length_encoder = tokenizer.model_max_length
-    max_length_decoder = 200 # Value from generation_config.json
+    max_length_decoder = model.generation_config.max_length
     num_hidden_layers = model.config.num_hidden_layers # Model layers
     num_attention_heads = model.config.num_attention_heads # Heads each attention layer has
 
@@ -447,13 +452,23 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
     return input_tokens, output_tokens, r_ee, r_dd, r_de
 
 if __name__ == "__main__":
+    debug = True # Change manually
     source_text = sys.argv[1]
     target_text = sys.argv[2] if len(sys.argv) > 2 else '' # Teacher forcing
     source_lang = sys.argv[3] if (len(sys.argv) > 3 and len(sys.argv[3]) > 0) else "eng_Latn" # e.g., eng_Latn
     target_lang = sys.argv[4] if (len(sys.argv) > 4 and len(sys.argv[4]) > 0) else "spa_Latn" # e.g., spa_Latn
     beam_size = int(sys.argv[5]) if len(sys.argv) > 5 else 1
     device = sys.argv[6] if (len(sys.argv) > 6 and len(sys.argv[6]) > 0) else None
-    debug = True # Change manually
+    pickle_prefix_filename = sys.argv[7] if (len(sys.argv) > 7 and len(sys.argv[7]) > 0) else ''
+    pretrained_model = sys.argv[8] if (len(sys.argv) > 8 and len(sys.argv[8]) > 0) else None
+
+    if pickle_prefix_filename:
+        debug = False
+        self_attention_remove_diagonal = False
+        explainability_normalization = "none"
+    else:
+        self_attention_remove_diagonal = True
+        explainability_normalization = "relative"
 
     print(f"Provided args: {sys.argv}")
 
@@ -470,22 +485,49 @@ if __name__ == "__main__":
 
     print(f"Translating from {source_lang} to {target_lang}")
 
-    for _source_text, _target_text in zip(source_text, target_text):
-        print()
-        print(f"Source text: {_source_text}")
-        print(f"Target text: {_target_text}")
+    pickle_data = {
+                "explainability_encoder": [],
+                "explainability_decoder": [],
+                "explainability_cross": [],
+            }
+    fn_pickle_array = f"{pickle_prefix_filename}.{source_lang}.{target_lang}.pickle"
+
+    for idx, (_source_text, _target_text) in enumerate(zip(source_text, target_text), 1):
+        if not pickle_prefix_filename:
+            print()
+            print(f"Source text: {_source_text}")
+            print(f"Target text: {_target_text}")
 
         input_tokens, output_tokens, r_ee, r_dd, r_de = explainability(_source_text, target_text=_target_text, source_lang=source_lang,
-                                                                       target_lang=target_lang, debug=debug, beam_size=beam_size, device=device)
+                                                                       target_lang=target_lang, debug=debug, beam_size=beam_size, device=device,
+                                                                       self_attention_remove_diagonal=self_attention_remove_diagonal,
+                                                                       explainability_normalization=explainability_normalization,
+                                                                       pretrained_model=pretrained_model)
 
         # Print results
 
-        print()
-        print("Encoder self-attention:")
-        print_attention(input_tokens, input_tokens, r_ee)
-        print()
-        print("Decoder self-attention:")
-        print_attention(output_tokens, output_tokens, r_dd)
-        print()
-        print("Decoder cross-attention:")
-        print_attention(output_tokens, input_tokens, r_de)
+        if not pickle_prefix_filename:
+            print()
+            print("Encoder self-attention:")
+            print_attention(input_tokens, input_tokens, r_ee)
+            print()
+            print("Decoder self-attention:")
+            print_attention(output_tokens, output_tokens, r_dd)
+            print()
+            print("Decoder cross-attention:")
+            print_attention(output_tokens, input_tokens, r_de)
+        else:
+            if idx % 10 == 0:
+                print(f"pickle: {idx}/{len(source_text)} sentences finished")
+
+                sys.stdout.flush()
+
+            pickle_data["explainability_encoder"].append(r_ee)
+            pickle_data["explainability_decoder"].append(r_dd)
+            pickle_data["explainability_cross"].append(r_de)
+
+    if pickle_prefix_filename:
+        with open(fn_pickle_array, "wb") as pickle_fd:
+            pickle.dump(pickle_data, pickle_fd)
+
+        print(f"pickle: all data stored: {fn_pickle_array}")
