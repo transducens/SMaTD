@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
-from transformers import get_inverse_sqrt_schedule, get_linear_schedule_with_warmup
+from transformers import get_linear_schedule_with_warmup
 
 print(f"Provided args: {sys.argv}")
 
@@ -23,29 +23,45 @@ def default_sys_argv(n, default, f=str):
 train_filename = sys.argv[1]
 dev_filename = sys.argv[2]
 test_filename = sys.argv[3]
-batch_size = default_sys_argv(4, 16, f=int)
-batch_size = batch_size if batch_size > 0 else 16
-cnn_max_width = default_sys_argv(5, -np.inf, f=int)
-cnn_max_width = cnn_max_width if cnn_max_width > 0 else -np.inf
-cnn_max_height = default_sys_argv(6, -np.inf, f=int)
-cnn_max_height = cnn_max_height if cnn_max_height > 0 else -np.inf
+batch_size = default_sys_argv(4, 32, f=int)
+batch_size = batch_size if batch_size > 0 else 32
+cnn_max_width = default_sys_argv(5, 64, f=int)
+cnn_max_width = cnn_max_width if cnn_max_width > 0 else 64
+cnn_max_height = default_sys_argv(6, 64, f=int)
+cnn_max_height = cnn_max_height if cnn_max_height > 0 else 64
 source_lang = default_sys_argv(7, "eng_Latn")
 source_lang = source_lang if source_lang != '' else "eng_Latn"
 target_lang = default_sys_argv(8, "spa_Latn")
 target_lang = target_lang if target_lang != '' else "spa_Latn"
 direction = default_sys_argv(9, "src2trg")
-attention_matrix = default_sys_argv(10, "cross")
-explainability_normalization = default_sys_argv(11, "relative")
+attention_matrix = default_sys_argv(10, "cross+decoder")
+attention_matrix = attention_matrix.split('+') # The order is not important (i.e., cross+decoder should be equivalent to decoder+cross) -> sorted
+explainability_normalization = default_sys_argv(11, "none")
 self_attention_remove_diagonal = default_sys_argv(12, True, f=lambda q: bool(int(q)))
-cnn_pooling = default_sys_argv(13, "max")
+cnn_pooling = default_sys_argv(13, "avg+max")
+cnn_pooling = cnn_pooling.split('+')
 save_model_path = default_sys_argv(14, '')
+learning_rate = default_sys_argv(15, 1e-3, f=float)
+
+for _attention_matrix in attention_matrix:
+    assert _attention_matrix in ("encoder", "decoder", "cross"), attention_matrix
+
+for _cnn_pooling in cnn_pooling:
+    assert _cnn_pooling in ("max", "avg"), cnn_pooling
+
+assert len(cnn_pooling) <= len(attention_matrix)
+
+if len(cnn_pooling) < len(attention_matrix):
+    assert len(cnn_pooling) == 1, cnn_pooling
+
+    cnn_pooling = [cnn_pooling[0]] * len(attention_matrix)
 
 assert direction in ("src2trg", "trg2src", "only_src", "only_trg"), direction
-assert attention_matrix in ("encoder", "decoder", "cross"), attention_matrix
 assert explainability_normalization in ("none", "absolute", "relative"), explainability_normalization
-assert cnn_pooling in ("max", "avg"), cnn_pooling
+assert cnn_max_width > 0, cnn_max_width
+assert cnn_max_height > 0, cnn_max_height
 
-attention_matrix = f"explainability_{attention_matrix}"
+attention_matrix = [f"explainability_{_attention_matrix}" for _attention_matrix in attention_matrix]
 translation_model_conf = {
     "source_lang": source_lang,
     "target_lang": target_lang,
@@ -60,7 +76,7 @@ print(f"NLLB conf:\n{translation_model_conf}")
 
 channels = 1
 device = "cuda" if torch.cuda.is_available() else "cpu"
-patience = 10
+patience = 100
 
 def extend_tensor_with_zeros(t, max_width, max_height, device):
     assert len(t.shape) == 2
@@ -71,7 +87,7 @@ def extend_tensor_with_zeros(t, max_width, max_height, device):
     return result
 
 def read(filename, direction, source_lang, target_lang, self_attention_remove_diagonal, explainability_normalization,
-         focus="cross", store_explainability_arrays=True, load_explainability_arrays=True):
+         focus=["explainability_cross"], store_explainability_arrays=True, load_explainability_arrays=True):
     cnn_width = -np.inf
     cnn_height = -np.inf
     loaded_samples = 0
@@ -155,14 +171,21 @@ def read(filename, direction, source_lang, target_lang, self_attention_remove_di
 
         #print(f"{loaded_samples + 1} pairs loaded! {r_de.shape}")
 
-        if focus == "explainability_encoder":
-            width, height = r_ee.shape
-        elif focus == "explainability_decoder":
-            width, height = r_dd.shape
-        elif focus == "explainability_cross":
-            width, height = r_de.shape
-        else:
-            raise Exception(f"Unexpected focus: {focus}")
+        width = -np.inf
+        height = -np.inf
+
+        if "explainability_encoder" in focus:
+            width = max(width, r_ee.shape[0])
+            height = max(height, r_ee.shape[1])
+        if "explainability_decoder" in focus:
+            width = max(width, r_dd.shape[0])
+            height = max(height, r_dd.shape[1])
+        if "explainability_cross" in focus:
+            width = max(width, r_de.shape[0])
+            height = max(height, r_de.shape[1])
+
+        assert width != -np.inf
+        assert height != -np.inf
 
         cnn_width = cnn_max_width if cnn_max_width > 0 else max(cnn_width, width)
         cnn_height = cnn_max_height if cnn_max_height > 0 else max(cnn_height, height)
@@ -236,32 +259,51 @@ dev_data = read(dev_filename, direction, source_lang, target_lang, self_attentio
 test_data = read(test_filename, direction, source_lang, target_lang, self_attention_remove_diagonal, explainability_normalization, focus=attention_matrix)
 cnn_width = max(train_data["cnn_width"], dev_data["cnn_width"], test_data["cnn_width"])
 cnn_height = max(train_data["cnn_height"], dev_data["cnn_height"], test_data["cnn_height"])
-train_data_data = get_data(train_data[attention_matrix], train_data["labels"], train_data["loaded_samples"], cnn_width, cnn_height, device)
-dev_data_data = get_data(dev_data[attention_matrix], dev_data["labels"], dev_data["loaded_samples"], cnn_width, cnn_height, device)
-test_data_data = get_data(test_data[attention_matrix], test_data["labels"], test_data["loaded_samples"], cnn_width, cnn_height, device)
-train_data["inputs"], train_data["labels"] = train_data_data
-dev_data["inputs"], dev_data["labels"] = dev_data_data
-test_data["inputs"], test_data["labels"] = test_data_data
+
+for _attention_matrix in attention_matrix:
+    inputs = f"inputs_{_attention_matrix}"
+    train_data[inputs], train_data["labels"] = get_data(train_data[_attention_matrix], train_data["labels"], train_data["loaded_samples"], cnn_width, cnn_height, device)
+    dev_data[inputs], dev_data["labels"] = get_data(dev_data[_attention_matrix], dev_data["labels"], dev_data["loaded_samples"], cnn_width, cnn_height, device)
+    test_data[inputs], test_data["labels"] = get_data(test_data[_attention_matrix], test_data["labels"], test_data["loaded_samples"], cnn_width, cnn_height, device)
 
 print(f"CNN width and height: {cnn_width} {cnn_height}")
 
 class MyDataset(Dataset):
-    def __init__(self, x, y):
-        self.x = x
-        self.y = y
+    def __init__(self, data, attention_matrix):
+        self.attention_matrix = attention_matrix
+        self.x = {_attention_matrix: data[f"inputs_{_attention_matrix}"] for _attention_matrix in self.attention_matrix}
+        self.y = data[f"labels"]
+
+        for i in range(len(self.attention_matrix) - 1):
+            _attention_matrix1 = self.attention_matrix[i]
+            _attention_matrix2 = self.attention_matrix[i + 1]
+
+            assert len(self.x[_attention_matrix1]) == len(self.x[_attention_matrix2])
+            assert len(self.x[_attention_matrix1]) == len(self.y)
 
     def __len__(self):
-        return len(self.x)
+        return len(self.y)
 
     def __getitem__(self, idx):
-        x = self.x[idx].clone().detach().type(torch.float32)
+        x = {}
         y = self.y[idx].clone().detach().type(torch.float32)
+
+        for _attention_matrix in self.attention_matrix:
+            _x = self.x[_attention_matrix][idx].clone().detach().type(torch.float32)
+
+            assert _attention_matrix not in x
+
+            x[_attention_matrix] = _x
+
+        assert len(x) == len(self.attention_matrix)
 
         return x, y
 
 class SimpleCNN(nn.Module):
-    def __init__(self, c, w, h, num_classes, pooling="max"):
+    def __init__(self, c, w, h, num_classes, pooling="max", only_conv=True):
         super(SimpleCNN, self).__init__()
+
+        self.only_conv = only_conv
 
         # First convolutional layer
         self.conv1 = nn.Conv2d(in_channels=c, out_channels=16, kernel_size=3, stride=1, padding=0)
@@ -284,6 +326,22 @@ class SimpleCNN(nn.Module):
         self.fc1 = nn.Linear(self._to_linear, 128)
         self.fc2 = nn.Linear(128, num_classes)
 
+        self.dropout = nn.Dropout(p=0.5)
+
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_in", nonlinearity="relu")
+
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.01)
+
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                nn.init.constant_(m.bias, 0)
+
     def _calculate_linear_input(self, c, w, h):
         x = torch.rand(1, c, w, h)
         x = self.pool(F.relu(self.conv1(x)))
@@ -293,9 +351,61 @@ class SimpleCNN(nn.Module):
     def forward(self, x):
         x = self.pool(F.relu(self.conv1(x)))
         x = self.pool(F.relu(self.conv2(x)))
+
+        if self.only_conv:
+            return x
+
         x = x.view(-1, self._to_linear)
         x = F.relu(self.fc1(x))
+        x = self.dropout(x)
         x = self.fc2(x)
+        return x
+
+class MultiChannelCNN(nn.Module):
+    def __init__(self, num_classes, simple_cnns, attention_matrix):
+        super(MultiChannelCNN, self).__init__()
+
+        self.attention_matrix = attention_matrix
+        self._attention_matrix = sorted(self.attention_matrix)
+
+        for k, simple_cnn in simple_cnns.items():
+            assert k in attention_matrix
+            assert isinstance(simple_cnn, SimpleCNN), type(simple_cnn)
+
+        assert len(self.attention_matrix) == len(simple_cnns)
+
+        self.simple_cnns = nn.ModuleDict({k: v for k, v in simple_cnns.items()})
+        self._to_linear = {k: simple_cnns[k]._to_linear for k in simple_cnns.keys()}
+        self._to_linear_sum = sum([self._to_linear[k] for k in self._to_linear.keys()])
+
+        # Fully connected layers
+        self.fc1 = nn.Linear(self._to_linear_sum, 128)
+        self.fc2 = nn.Linear(128, num_classes)
+
+        self.dropout = nn.Dropout(p=0.5)
+
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_in", nonlinearity="relu")
+
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.01)
+
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        x = [self.simple_cnns[k](x[k]) for k in self._attention_matrix]
+        x = [_x.view(-1, self._to_linear[k]) for _x, k in zip(x, self._attention_matrix)]
+        x = torch.cat(x, dim=1)
+        x = F.relu(self.fc1(x))
+        x = self.dropout(x)
+        x = self.fc2(x)
+
         return x
 
 def apply_inference(model, data, target=None, loss_function=None, threshold=0.5):
@@ -318,7 +428,7 @@ def apply_inference(model, data, target=None, loss_function=None, threshold=0.5)
 
     return results
 
-def eval(model, dataloader, device):
+def eval(model, dataloader, attention_matrix, device):
     training = model.training
 
     model.eval()
@@ -327,7 +437,7 @@ def eval(model, dataloader, device):
     all_labels = []
 
     for data, target in dataloader:
-        data = data.to(device)
+        data = {k: data[k].to(device) for k in attention_matrix}
         results = apply_inference(model, data, target=None, loss_function=None)
         outputs_classification = results["outputs_classification_detach_list"]
         labels = target.cpu()
@@ -346,46 +456,71 @@ def eval(model, dataloader, device):
     return results
 
 # Load data
-train_dataset = MyDataset(train_data["inputs"], train_data["labels"])
+train_dataset = MyDataset(train_data, attention_matrix)
 train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-dev_dataset = MyDataset(dev_data["inputs"], dev_data["labels"])
+dev_dataset = MyDataset(dev_data, attention_matrix)
 dev_dataloader = DataLoader(dev_dataset, batch_size=batch_size, shuffle=False)
 
 # Model
 num_classes = 1
-epochs = 50
-model = SimpleCNN(channels, cnn_width, cnn_height, num_classes, pooling=cnn_pooling).to(device)
+epochs = 500
+simple_cnns = {k: SimpleCNN(channels, cnn_width, cnn_height, num_classes, pooling=pooling, only_conv=True) for k, pooling in zip(attention_matrix, cnn_pooling)}
+model = MultiChannelCNN(num_classes, simple_cnns, attention_matrix).to(device)
 
 model.train()
 
 loss_function = nn.BCEWithLogitsLoss(reduction="mean")
-learning_rate = 1e-3
 model_parameters = filter(lambda p: p.requires_grad, model.parameters())
-optimizer = AdamW(model_parameters, lr=learning_rate, weight_decay=0.0)
+optimizer = AdamW(model_parameters, lr=learning_rate, weight_decay=0.01)
 warmup_steps = 400
 #scheduler = get_inverse_sqrt_schedule(optimizer, warmup_steps)
 #scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0) # Disable LR scheduler
 scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, len(train_dataloader) * epochs)
-early_stopping_best_result = -np.inf # accuracy
+early_stopping_best_result_dev = -np.inf # accuracy
+early_stopping_best_result_train = -np.inf # accuracy
+early_stopping_best_loss = np.inf
 current_patience = 0
+epoch_loss = None
+
+print("Training...")
+
+sys.stdout.flush()
 
 for epoch in range(epochs):
     print(f"Epoch {epoch}")
 
-    train_results = eval(model, train_dataloader, device)
-    dev_results = eval(model, dev_dataloader, device)
-    epoch_loss = 0.0
+    train_results = eval(model, train_dataloader, attention_matrix, device)
+    dev_results = eval(model, dev_dataloader, attention_matrix, device)
+    better_loss_result = False
+
+    if epoch_loss is not None and epoch_loss < early_stopping_best_loss:
+        print(f"Better loss result: {early_stopping_best_loss} -> {epoch_loss}")
+
+        better_loss_result = True
+        early_stopping_best_loss = epoch_loss
 
     print(f"Train eval: {train_results}")
     print(f"Dev eval: {dev_results}")
 
-    early_stopping_metric = dev_results["acc"]
+    epoch_loss = 0.0
+    early_stopping_metric_train = train_results["acc"]
+    early_stopping_metric_dev = dev_results["acc"]
+    better_train_result = False
+    patience_dev_equal = np.isclose(early_stopping_metric_dev, early_stopping_best_result_dev)
+    patience_train_equal = np.isclose(early_stopping_metric_train, early_stopping_best_result_train)
 
-    if early_stopping_metric > early_stopping_best_result:
-        print(f"Patience better result: {early_stopping_best_result} -> {early_stopping_metric}")
+
+    if early_stopping_metric_train > early_stopping_best_result_train:
+        print(f"Better train result: {early_stopping_best_result_train} -> {early_stopping_metric_train}")
+
+        better_train_result = True
+        early_stopping_best_result_train = early_stopping_metric_train
+
+    if early_stopping_metric_dev > early_stopping_best_result_dev or ((patience_dev_equal and better_train_result) or (patience_dev_equal and patience_train_equal and better_loss_result)):
+        print(f"Patience better dev result: {early_stopping_best_result_dev} -> {early_stopping_metric_dev}")
 
         current_patience = 0
-        early_stopping_best_result = early_stopping_metric
+        early_stopping_best_result_dev = early_stopping_metric_dev
 
         if save_model_path:
             print(f"Saving best model: {save_model_path}")
@@ -402,7 +537,7 @@ for epoch in range(epochs):
         break
 
     for batch_idx, (data, target) in enumerate(train_dataloader, 1):
-        data = data.to(device)
+        data = {k: data[k].to(device) for k in attention_matrix}
 
         model.zero_grad()
 
@@ -418,12 +553,14 @@ for epoch in range(epochs):
 
     print(f"Loss: {epoch_loss}")
 
+    sys.stdout.flush()
+
 if save_model_path:
     print(f"Loading best model: {save_model_path}")
 
     model = torch.load(save_model_path, weights_only=False, map_location=device)
 
-train_results = eval(model, train_dataloader, device)
+train_results = eval(model, train_dataloader, attention_matrix, device)
 
 print(f"Final train eval: {train_results}")
 
@@ -432,7 +569,7 @@ del train_dataloader
 
 torch.cuda.empty_cache()
 
-dev_results = eval(model, dev_dataloader, device)
+dev_results = eval(model, dev_dataloader, attention_matrix, device)
 
 print(f"Final dev eval: {dev_results}")
 
@@ -441,9 +578,9 @@ del dev_dataloader
 
 torch.cuda.empty_cache()
 
-test_dataset = MyDataset(test_data["inputs"], test_data["labels"])
+test_dataset = MyDataset(test_data, attention_matrix)
 test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
-test_results = eval(model, test_dataloader, device)
+test_results = eval(model, test_dataloader, attention_matrix, device)
 
 print(f"Final test eval: {test_results}")
