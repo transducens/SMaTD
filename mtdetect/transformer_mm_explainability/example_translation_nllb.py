@@ -218,8 +218,6 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
                 new_sequence = beam_tokens + [token_id]
 
                 if token_id == tokenizer.eos_token_id:
-                    new_sequence = new_sequence[:-1]
-
                     completed_beams.append((new_sequence, new_score / len(new_sequence)))
                 else:
                     new_beams.append((new_sequence, new_score))
@@ -274,30 +272,32 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
             attentions[layer][component].retain_grad()
             attentions[layer][component].register_hook(capture_attention_grads(layer, component, attentions_grad_store))
 
+    generated_tokens_wo_last_token = generated_tokens[:-1] # [:-1]: we don't have the attention values for the last token because has not been processed autoregressively
     source_text_seq_len = len(inputs.input_ids[0])
     target_text_seq_len = len(generated_tokens)
+    target_text_seq_len_attention = len(generated_tokens_wo_last_token)
     attention_expected_shape = {
         "encoder": (batch_size, num_attention_heads, source_text_seq_len, source_text_seq_len),
-        "decoder": (batch_size, num_attention_heads, target_text_seq_len, target_text_seq_len),
-        "cross": (batch_size, num_attention_heads, target_text_seq_len, source_text_seq_len),
+        "decoder": (batch_size, num_attention_heads, target_text_seq_len_attention, target_text_seq_len_attention),
+        "cross": (batch_size, num_attention_heads, target_text_seq_len_attention, source_text_seq_len),
         }
 
     for l in range(num_hidden_layers):
         for component in ("encoder", "decoder", "cross"):
             assert attentions[l][component].shape == attention_expected_shape[component], f"{l}: {component}: {attentions[l][component].shape} != {attention_expected_shape[component]}"
 
-    translated_tokens = torch.tensor([generated_tokens]).to(device)
+    translated_tokens = torch.tensor(generated_tokens).unsqueeze(0).to(device)
 
     # Calculate gradients
 
     logits = model_output.logits
-    logits_expected_shape = (batch_size, len(generated_tokens), vocab_size)
+    logits_expected_shape = (batch_size, target_text_seq_len_attention, vocab_size)
 
     assert logits.shape == logits_expected_shape, f"{logits.shape} != {logits_expected_shape}"
 
     target = torch.zeros(logits_expected_shape)
 
-    for i, token in enumerate(generated_tokens):
+    for i, token in enumerate(generated_tokens_wo_last_token):
         target[:, i, token] = 1.0
 
     target = target.to(device)
@@ -313,7 +313,7 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
     # Decode
 
     output = decode(tokenizer, translated_tokens)
-    output_tokens = [tokenizer.convert_ids_to_tokens(_id) for _id in generated_tokens]
+    output_tokens = [tokenizer.convert_ids_to_tokens(_id) for _id in generated_tokens_wo_last_token]
 
     if debug:
         for i, (translated_tokens, score) in enumerate(completed_beams, 1):
@@ -342,9 +342,9 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
     # e -> encoder, d -> decoder (following paper nomenclature section 3.2, encoder-decoder architecture)
 
     r_ee = np.identity(source_text_seq_len) # encoder
-    r_dd = np.identity(target_text_seq_len) # decoder
-    #r_ed = np.zeros((source_text_seq_len, target_text_seq_len)) # We only have co-attention in the decoder (i.e., r_de)
-    r_de = np.zeros((target_text_seq_len, source_text_seq_len)) # influence of the input text on the translated text
+    r_dd = np.identity(target_text_seq_len_attention) # decoder
+    #r_ed = np.zeros((source_text_seq_len, target_text_seq_len_attention)) # We only have co-attention in the decoder (i.e., r_de)
+    r_de = np.zeros((target_text_seq_len_attention, source_text_seq_len)) # influence of the input text on the translated text
     a_line = {}
 
     for layer in range(num_hidden_layers):
@@ -440,7 +440,7 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
     elif explainability_normalization == "absolute":
         r_ee = (r_ee - r_ee.min()) / (r_ee.max() - r_ee.min())
         r_dd = (r_dd - r_dd.min()) / (r_dd.max() - r_dd.min())
-        r_de = (r_de - r_de.min()) / (r_de.max() - r_de.min()) # (target_text_seq_len, source_text_seq_len)
+        r_de = (r_de - r_de.min()) / (r_de.max() - r_de.min()) # (target_text_seq_len_attention, source_text_seq_len)
     elif explainability_normalization == "relative":
         # "Relative" normalization (easier to analize per translated token)
         r_ee = np.array([(r_ee[i] - r_ee[i].min()) / (r_ee[i].max() - r_ee[i].min()) for i in range(len(r_ee))])
