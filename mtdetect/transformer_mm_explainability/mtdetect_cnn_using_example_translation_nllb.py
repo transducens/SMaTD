@@ -41,6 +41,7 @@ cnn_pooling = cnn_pooling.split('+')
 save_model_path = default_sys_argv(14, '')
 learning_rate = default_sys_argv(15, 5e-3, f=float)
 multichannel = default_sys_argv(16, True, f=lambda q: bool(int(q)))
+pretrained_model = default_sys_argv(17, '')
 
 for _attention_matrix in attention_matrix:
     assert _attention_matrix in ("encoder", "decoder", "cross"), attention_matrix
@@ -89,13 +90,15 @@ def extend_tensor_with_zeros(t, max_width, max_height, device):
     return result
 
 def read(filename, direction, source_lang, target_lang, self_attention_remove_diagonal, explainability_normalization,
-         focus=["explainability_cross"], store_explainability_arrays=True, load_explainability_arrays=True):
+         focus=["explainability_cross"], store_explainability_arrays=True, load_explainability_arrays=True,
+         device=None, pretrained_model=None):
     cnn_width = -np.inf
     cnn_height = -np.inf
     loaded_samples = 0
     source_text = []
     target_text = []
     labels = []
+    groups = [] # If more than 1 entry belongs to the same group, they will be randomly selected dynamically
     explainability_ee = []
     explainability_dd = []
     explainability_de = []
@@ -114,36 +117,41 @@ def read(filename, direction, source_lang, target_lang, self_attention_remove_di
             explainability_de = pickle_data["explainability_cross"]
 
     for idx, l in enumerate(fd):
-        s, t, l = l.rstrip("\r\n").split('\t')
+        l = l.rstrip("\r\n").split('\t')
+        source = l[0]
+        target = l[1]
+        label = float(l[2])
+        group = l[3] if len(l) > 3 else str(idx)
 
         if direction == "src2trg":
             pass
         elif direction == "trg2src":
-            s, t = t, s # swap
+            source, target = target, source # swap
         elif direction == "only_src": # disable teacher forcing
-            t = ''
+            target = ''
         elif direction == "only_trg": # disable teacher forcing
-            s, t = t, ''
+            source, target = target, ''
         else:
             raise Exception(f"Unexpected direction: {direction}")
 
         if not first_msg:
-            print(f"The next sentence (source) is expected to be {source_lang}: {s}")
+            print(f"The next sentence (source) is expected to be {source_lang}: {source}")
 
-            if t != '':
-                print(f"The next sentence (target) is expected to be {target_lang}: {t}")
+            if target != '':
+                print(f"The next sentence (target) is expected to be {target_lang}: {target}")
 
             first_msg = True
 
-        source_text.append(s)
-        target_text.append(t)
-        labels.append(float(l))
+        source_text.append(source)
+        target_text.append(target)
+        labels.append(label)
+        groups.append(group)
 
         if not fn_pickle_array_exists:
             input_tokens, output_tokens, r_ee, r_dd, r_de = \
-                example_translation_nllb.explainability(s, target_text=t, source_lang=source_lang, target_lang=target_lang, debug=False,
-                                                        apply_normalization=True, self_attention_remove_diagonal=False,
-                                                        explainability_normalization="none")
+                example_translation_nllb.explainability(source, target_text=target, source_lang=source_lang, target_lang=target_lang,
+                                                        debug=False, apply_normalization=True, self_attention_remove_diagonal=False,
+                                                        explainability_normalization="none", device=device, pretrained_model=pretrained_model)
 
             explainability_ee.append(r_ee)
             explainability_dd.append(r_dd)
@@ -226,6 +234,7 @@ def read(filename, direction, source_lang, target_lang, self_attention_remove_di
         "source_text": source_text,
         "target_text": target_text,
         "labels": labels,
+        "groups": groups,
         "explainability_encoder": explainability_ee,
         "explainability_decoder": explainability_dd,
         "explainability_cross": explainability_de,
@@ -258,9 +267,12 @@ def get_data(explainability_matrix, labels, loaded_samples, cnn_width, cnn_heigh
 
     return inputs, labels
 
-train_data = read(train_filename, direction, source_lang, target_lang, self_attention_remove_diagonal, explainability_normalization, focus=attention_matrix)
-dev_data = read(dev_filename, direction, source_lang, target_lang, self_attention_remove_diagonal, explainability_normalization, focus=attention_matrix)
-test_data = read(test_filename, direction, source_lang, target_lang, self_attention_remove_diagonal, explainability_normalization, focus=attention_matrix)
+train_data = read(train_filename, direction, source_lang, target_lang, self_attention_remove_diagonal, explainability_normalization,
+                  focus=attention_matrix, device=device, pretrained_model=pretrained_model)
+dev_data = read(dev_filename, direction, source_lang, target_lang, self_attention_remove_diagonal, explainability_normalization,
+                  focus=attention_matrix, device=device, pretrained_model=pretrained_model)
+test_data = read(test_filename, direction, source_lang, target_lang, self_attention_remove_diagonal, explainability_normalization,
+                  focus=attention_matrix, device=device, pretrained_model=pretrained_model)
 cnn_width = max(train_data["cnn_width"], dev_data["cnn_width"], test_data["cnn_width"])
 cnn_height = max(train_data["cnn_height"], dev_data["cnn_height"], test_data["cnn_height"])
 
@@ -273,35 +285,87 @@ for idx, _attention_matrix in enumerate(attention_matrix):
 print(f"CNN width and height: {cnn_width} {cnn_height}")
 
 class MyDataset(Dataset):
-    def __init__(self, data, attention_matrix):
+    def __init__(self, data, attention_matrix, create_groups=False, return_group=False):
+        self.create_groups = create_groups
+        self.return_group = return_group
         self.attention_matrix = attention_matrix
-        self.x = {_attention_matrix: data[f"inputs_{_attention_matrix}"] for _attention_matrix in self.attention_matrix}
-        self.y = data[f"labels"]
+        self.data = {}
+        self.uniq_groups = []
+
+        if create_groups:
+            self.groups = data["groups"]
+        else:
+            self.groups = list(range(len(data["labels"])))
 
         for i in range(len(self.attention_matrix) - 1):
             _attention_matrix1 = self.attention_matrix[i]
             _attention_matrix2 = self.attention_matrix[i + 1]
 
-            assert len(self.x[_attention_matrix1]) == len(self.x[_attention_matrix2])
-            assert len(self.x[_attention_matrix1]) == len(self.y)
+            assert len(data[f"inputs_{_attention_matrix1}"]) == len(data[f"inputs_{_attention_matrix2}"])
+            assert len(data[f"inputs_{_attention_matrix1}"]) == len(data["labels"])
+
+        assert len(data["labels"]) == len(self.groups)
+
+        for idx in range(len(self.groups)):
+            group = self.groups[idx]
+
+            if group not in self.data:
+                self.uniq_groups.append(group)
+                self.data[group] = {
+                    'x': {_attention_matrix: [] for _attention_matrix in self.attention_matrix},
+                    'y': [],
+                }
+
+            for _attention_matrix in self.attention_matrix:
+                self.data[group]['x'][_attention_matrix].append(data[f"inputs_{_attention_matrix}"][idx])
+
+            self.data[group]['y'].append(data["labels"][idx])
 
     def __len__(self):
-        return len(self.y)
+        return len(self.data)
 
     def __getitem__(self, idx):
-        x = {}
-        y = self.y[idx].clone().detach().type(torch.float32)
+        group = self.uniq_groups[idx]
+        x = {k: [v.clone().detach().type(torch.float32) for v in l] for k, l in self.data[group]['x'].items()}
+        y = [_y.clone().detach().type(torch.float32) for _y in self.data[group]['y']]
 
-        for _attention_matrix in self.attention_matrix:
-            _x = self.x[_attention_matrix][idx].clone().detach().type(torch.float32)
+        if not self.create_groups:
+            assert len(y) == 1
 
-            assert _attention_matrix not in x
+            y = y[0]
 
-            x[_attention_matrix] = _x
+            for _attention_matrix in self.attention_matrix:
+                assert len(x[_attention_matrix]) == 1
 
-        assert len(x) == len(self.attention_matrix)
+                x[_attention_matrix] = x[_attention_matrix][0]
+
+        if self.return_group:
+            return x, y, group
 
         return x, y
+
+def select_random_group_collate_fn(batch):
+    data, target = [], []
+
+    for idx in range(len(batch)):
+        x, y, group = batch[idx]
+
+        assert len(y) > 0
+
+        for _x in x.values():
+            assert len(_x) == len(y)
+
+        group_idx = np.random.randint(len(y))
+        output_x = {k: v[group_idx] for k, v in x.items()}
+        output_y = y[group_idx]
+
+        data.append(output_x)
+        target.append(output_y)
+
+    target = torch.stack(target, dim=0)
+    data = {k: torch.stack([v[k] for v in data], dim=0) for k in data[0].keys()}
+
+    return data, target
 
 class SimpleCNN(nn.Module):
     def __init__(self, c, w, h, num_classes, attention_matrix, pooling="max", only_conv=True):
@@ -474,8 +538,9 @@ def eval(model, dataloader, attention_matrix, device):
 
 # Load data
 num_workers = 0
-train_dataset = MyDataset(train_data, attention_matrix)
-train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+train_dataset = MyDataset(train_data, attention_matrix, create_groups=True, return_group=True)
+train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers,
+                              collate_fn=select_random_group_collate_fn)
 dev_dataset = MyDataset(dev_data, attention_matrix)
 dev_dataloader = DataLoader(dev_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
