@@ -141,8 +141,12 @@ def read(filename, direction, source_lang, target_lang, self_attention_remove_di
         l = l.rstrip("\r\n").split('\t')
         source = l[0]
         target = l[1]
-        label = float(l[2])
+        label = l[2]
         group = l[3] if len(l) > 3 else str(idx)
+
+        assert label in ('0', '1'), label # 0 is NMT; 1 is HT
+
+        label = float(label)
 
         if direction == "src2trg":
             pass
@@ -405,8 +409,14 @@ class SimpleCNN(nn.Module):
         self.kernel_size = 3
         self.padding = 1
         self.layer_size = 32
-        self.conv1 = nn.Conv2d(in_channels=c, out_channels=self.layer_size, kernel_size=self.kernel_size, stride=1, padding=self.padding, padding_mode="zeros")
-        self.conv2 = nn.Conv2d(in_channels=self.layer_size, out_channels=self.layer_size * 2, kernel_size=self.kernel_size, stride=1, padding=self.padding, padding_mode="zeros")
+        self.conv_layers = 2
+        self.in_channels = [c, *[self.layer_size * (2 ** i) for i in range(self.conv_layers - 1)]]
+        self.out_channels = self.in_channels[1:] + [self.layer_size * (2 ** len(self.in_channels[1:]))]
+        self.convs = nn.ModuleList([nn.Conv2d(in_channels=self.in_channels[i], out_channels=self.out_channels[i], kernel_size=self.kernel_size, stride=1, padding=self.padding, padding_mode="zeros") for i in range(self.conv_layers)])
+
+        assert len(self.in_channels) == self.conv_layers
+        assert len(self.out_channels) == self.conv_layers
+        assert len(self.convs) == self.conv_layers
 
         # Second convolutional layer
         if pooling == "max":
@@ -419,7 +429,7 @@ class SimpleCNN(nn.Module):
         self.pool = pool
 
         # Calculate the size of the feature map after the convolutional layers and pooling
-        self._to_linear = self._calculate_linear_input(c, w, h)
+        self._to_linear = self.linear(torch.rand(1, self.channels, *self.dimensions)).numel()
 
         # Fully connected layers
         self.fc1 = nn.Linear(self._to_linear, 128)
@@ -441,11 +451,11 @@ class SimpleCNN(nn.Module):
                 nn.init.xavier_normal_(m.weight)
                 nn.init.constant_(m.bias, 0)
 
-    def _calculate_linear_input(self, c, w, h):
-        x = torch.rand(1, c, w, h)
-        x = self.pool(F.relu(self.conv1(x)))
-        x = self.pool(F.relu(self.conv2(x)))
-        return x.numel()
+    def linear(self, x):
+        for conv in self.convs:
+            x = self.pool(F.relu(conv(x)))
+
+        return x
 
     def forward(self, x):
         if isinstance(x, dict):
@@ -453,8 +463,7 @@ class SimpleCNN(nn.Module):
 
             assert x.shape[1:] == (self.channels, *self.dimensions), x.shape
 
-        x = self.pool(F.relu(self.conv1(x)))
-        x = self.pool(F.relu(self.conv2(x)))
+        x = self.linear(x)
 
         if self.only_conv:
             return x
@@ -663,6 +672,8 @@ for epoch in range(epochs):
         scheduler.step()
 
     print(f"Loss: {epoch_loss}")
+
+    assert str(epoch_loss) != "nan", "Some values in the input data are NaN"
 
     sys.stdout.flush()
 
