@@ -148,7 +148,7 @@ def read(filename, direction, source_lang, target_lang, self_attention_remove_di
         groups.append(group)
 
         if not fn_pickle_array_exists:
-            input_tokens, output_tokens, r_ee, r_dd, r_de = \
+            input_tokens, output_tokens, output, r_ee, r_dd, r_de = \
                 example_translation_nllb.explainability(source, target_text=target, source_lang=source_lang, target_lang=target_lang,
                                                         debug=False, apply_normalization=True, self_attention_remove_diagonal=False,
                                                         explainability_normalization="none", device=device, pretrained_model=pretrained_model)

@@ -243,13 +243,18 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
     completed_beams = completed_beams[:beam_size]
     best_sequence, best_score = completed_beams[0]
     generated_tokens = best_sequence
+    generated_tokens_wo_last_token = generated_tokens[:-1] # [:-1]: we don't have the attention values for the last token because has not been processed autoregressively
 
     if beam_size > 1:
         # Re-cacalculate to properly obtain the attention
         torch.cuda.empty_cache()
 
-        decoder_input_ids = torch.tensor(generated_tokens).unsqueeze(0).to(device)
+        decoder_input_ids = torch.tensor(generated_tokens_wo_last_token).unsqueeze(0).to(device)
         model_output = model(**inputs, decoder_input_ids=decoder_input_ids, output_attentions=True)
+        log_probs = F.log_softmax(model_output.logits[:, -1, :], dim=-1).cpu()
+        token_ids = torch.topk(-log_probs, beam_size, largest=False, sorted=True).indices.squeeze(0).tolist()
+
+        assert generated_tokens[-1] in token_ids, f"{generated_tokens[-1]} not in {token_ids}"
 
     # Attention, and gradients hook
 
@@ -272,9 +277,7 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
             attentions[layer][component].retain_grad()
             attentions[layer][component].register_hook(capture_attention_grads(layer, component, attentions_grad_store))
 
-    generated_tokens_wo_last_token = generated_tokens[:-1] # [:-1]: we don't have the attention values for the last token because has not been processed autoregressively
     source_text_seq_len = len(inputs.input_ids[0])
-    target_text_seq_len = len(generated_tokens)
     target_text_seq_len_attention = len(generated_tokens_wo_last_token)
     attention_expected_shape = {
         "encoder": (batch_size, num_attention_heads, source_text_seq_len, source_text_seq_len),
@@ -449,7 +452,7 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
     else:
         raise Exception(f"Unexpected value for explainability_normalization: {explainability_normalization}")
 
-    return input_tokens, output_tokens, r_ee, r_dd, r_de
+    return input_tokens, output_tokens, output, r_ee, r_dd, r_de
 
 if __name__ == "__main__":
     debug = True # Change manually
@@ -498,11 +501,12 @@ if __name__ == "__main__":
             print(f"Source text: {_source_text}")
             print(f"Target text: {_target_text}")
 
-        input_tokens, output_tokens, r_ee, r_dd, r_de = explainability(_source_text, target_text=_target_text, source_lang=source_lang,
-                                                                       target_lang=target_lang, debug=debug, beam_size=beam_size, device=device,
-                                                                       self_attention_remove_diagonal=self_attention_remove_diagonal,
-                                                                       explainability_normalization=explainability_normalization,
-                                                                       pretrained_model=pretrained_model)
+        input_tokens, output_tokens, output, r_ee, r_dd, r_de = \
+            explainability(_source_text, target_text=_target_text, source_lang=source_lang,
+                           target_lang=target_lang, debug=debug, beam_size=beam_size, device=device,
+                           self_attention_remove_diagonal=self_attention_remove_diagonal,
+                           explainability_normalization=explainability_normalization,
+                           pretrained_model=pretrained_model)
 
         # Print results
 
@@ -517,6 +521,9 @@ if __name__ == "__main__":
             print("Decoder cross-attention:")
             print_attention(output_tokens, input_tokens, r_de)
         else:
+            for i, translation in enumerate(output, 1):
+                print(f"Translation #{i}: {translation}")
+
             if idx % 10 == 0:
                 print(f"pickle: {idx}/{len(source_text)} sentences finished")
 
