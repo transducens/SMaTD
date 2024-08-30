@@ -58,7 +58,9 @@ def normalize(r):
 
     assert self_attention[diag_idx, diag_idx].min() >= 0
 
-    self_attention = self_attention / self_attention.sum(axis=-1, keepdims=True)
+    div = self_attention.sum(axis=-1, keepdims=True)
+    div[np.isclose(div, 0.0)] = sys.float_info.epsilon # Avoid: RuntimeWarning: invalid value encountered in divide
+    self_attention = self_attention / div
     self_attention += np.eye(self_attention.shape[-1])
 
     return self_attention
