@@ -91,7 +91,7 @@ def extend_tensor_with_zeros(t, max_width, max_height, device):
 
 def read(filename, direction, source_lang, target_lang, self_attention_remove_diagonal, explainability_normalization,
          focus=["explainability_cross"], store_explainability_arrays=True, load_explainability_arrays=True,
-         device=None, pretrained_model=None):
+         device=None, pretrained_model=None, pickle_template=None, pickle_check_env=True):
     cnn_width = -np.inf
     cnn_height = -np.inf
     loaded_samples = 0
@@ -99,12 +99,33 @@ def read(filename, direction, source_lang, target_lang, self_attention_remove_di
     target_text = []
     labels = []
     groups = [] # If more than 1 entry belongs to the same group, they will be randomly selected dynamically
+    uniq_groups = set()
     explainability_ee = []
     explainability_dd = []
     explainability_de = []
     fd = open(filename)
     first_msg = False
-    fn_pickle_array = f"{filename}.{direction}.{source_lang}.{target_lang}.pickle"
+    fn_pickle_array = None
+
+    if pickle_check_env:
+        envvar_prefix = "MTDETECT_PICKLE_FN"
+        envvar = envvar_prefix
+
+        if pickle_template:
+            envvar = f"{envvar_prefix}_{pickle_template}"
+
+            if envvar not in os.environ:
+                envvar = envvar_prefix
+
+        if envvar in os.environ:
+            fn_pickle_array = os.environ[envvar]
+
+            if pickle_template and envvar == envvar_prefix:
+                fn_pickle_array = fn_pickle_array.replace("{template}", pickle_template)
+
+    if not fn_pickle_array or not os.path.isfile(fn_pickle_array):
+        fn_pickle_array = f"{filename}.{direction}.{source_lang}.{target_lang}.pickle"
+
     fn_pickle_array_exists = os.path.isfile(fn_pickle_array)
 
     if load_explainability_arrays and fn_pickle_array_exists:
@@ -146,6 +167,7 @@ def read(filename, direction, source_lang, target_lang, self_attention_remove_di
         target_text.append(target)
         labels.append(label)
         groups.append(group)
+        uniq_groups.add(group)
 
         if not fn_pickle_array_exists:
             input_tokens, output_tokens, output, r_ee, r_dd, r_de = \
@@ -227,6 +249,8 @@ def read(filename, direction, source_lang, target_lang, self_attention_remove_di
 
             pickle.dump(pickle_data, pickle_fd)
 
+    print(f"Samples: {len(groups)}; Groups: {len(uniq_groups)}")
+
     return {
         "cnn_width": cnn_width,
         "cnn_height": cnn_height,
@@ -268,11 +292,11 @@ def get_data(explainability_matrix, labels, loaded_samples, cnn_width, cnn_heigh
     return inputs, labels
 
 train_data = read(train_filename, direction, source_lang, target_lang, self_attention_remove_diagonal, explainability_normalization,
-                  focus=attention_matrix, device=device, pretrained_model=pretrained_model)
+                  focus=attention_matrix, device=device, pretrained_model=pretrained_model, pickle_template="train")
 dev_data = read(dev_filename, direction, source_lang, target_lang, self_attention_remove_diagonal, explainability_normalization,
-                  focus=attention_matrix, device=device, pretrained_model=pretrained_model)
+                  focus=attention_matrix, device=device, pretrained_model=pretrained_model, pickle_template="dev")
 test_data = read(test_filename, direction, source_lang, target_lang, self_attention_remove_diagonal, explainability_normalization,
-                  focus=attention_matrix, device=device, pretrained_model=pretrained_model)
+                  focus=attention_matrix, device=device, pretrained_model=pretrained_model, pickle_template="test")
 cnn_width = max(train_data["cnn_width"], dev_data["cnn_width"], test_data["cnn_width"])
 cnn_height = max(train_data["cnn_height"], dev_data["cnn_height"], test_data["cnn_height"])
 
@@ -495,7 +519,7 @@ def apply_inference(model, data, target=None, loss_function=None, threshold=0.5)
     outputs = outputs.squeeze(1)
     loss = None
 
-    if loss_function is not None:
+    if loss_function is not None and target is not None:
         loss = loss_function(outputs, target)
 
     outputs_classification = torch.sigmoid(outputs).cpu().detach().tolist()
