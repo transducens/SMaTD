@@ -7,7 +7,7 @@ import torch
 import transformers
 
 pretrained_model = sys.argv[1] # e.g., Helsinki-NLP/opus-mt-en-ha (check https://huggingface.co/Helsinki-NLP)
-batch_size = int(sys.argv[3]) if len(sys.argv) > 3 and len(sys.argv[3]) > 0 else 16
+batch_size = int(sys.argv[2]) if len(sys.argv) > 2 and len(sys.argv[2]) > 0 else 16
 
 assert batch_size > 0, batch_size
 
@@ -24,7 +24,7 @@ early_stopping = True if beam_size > 1 else False
 sys.stderr.write(f"Translating from {source_lang} to {target_lang} (pretrained_model={pretrained_model})\n")
 
 def translate(batch):
-    inputs = tokenizer(batch, return_tensors="pt", add_special_tokens=True, truncation=True).to(device)
+    inputs = tokenizer(batch, return_tensors="pt", add_special_tokens=True, truncation=True, padding=True).to(device)
     result = model.generate(**inputs, forced_bos_token_id=forced_bos_token_id, max_new_tokens=max_new_tokens, num_beams=beam_size, early_stopping=early_stopping)
     output = tokenizer.batch_decode(result, skip_special_tokens=True)
 

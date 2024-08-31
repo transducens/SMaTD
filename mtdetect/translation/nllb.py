@@ -31,7 +31,7 @@ tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model, src_lan
 target_lang_id = get_lang_token(tokenizer, target_lang)
 
 def translate(batch):
-    inputs = tokenizer(batch, return_tensors="pt", add_special_tokens=True, truncation=True).to(device)
+    inputs = tokenizer(batch, return_tensors="pt", add_special_tokens=True, truncation=True, padding=True).to(device)
     result = model.generate(**inputs, forced_bos_token_id=target_lang_id, max_new_tokens=model.generation_config.max_length, num_beams=beam_size)
     output = tokenizer.batch_decode(result, skip_special_tokens=True)
 
