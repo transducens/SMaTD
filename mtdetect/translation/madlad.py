@@ -20,17 +20,22 @@ sys.stderr.write(f"Translating from - to {target_lang} (pretrained_model={pretra
 model, device = util.load_model(pretrained_model, transformers.AutoModelForSeq2SeqLM)
 tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model)
 max_new_tokens = 1024 # not available: model.generation_config.max_length
-early_stopping = True if beam_size > 1 else False
 
-def translate(batch):
+def translate(batch, device):
+    _model = model
+
+    if _model.device != device:
+        _model = model.to(device)
+
     inputs = tokenizer(batch, return_tensors="pt", add_special_tokens=True, max_length=max_new_tokens, truncation=True, padding=True).to(device)
-    result = model.generate(**inputs, max_new_tokens=max_new_tokens, num_beams=beam_size, early_stopping=early_stopping)
+    result = _model.generate(**inputs, max_new_tokens=max_new_tokens, num_beams=beam_size)
     output = tokenizer.batch_decode(result, skip_special_tokens=True)
 
     return output
 
 batch = []
 original_text = []
+current_patience = 0
 
 for l in sys.stdin:
     l = l.rstrip("\r\n")
@@ -42,10 +47,10 @@ for l in sys.stdin:
     batch.append(l)
 
     if len(batch) >= batch_size:
-        translations = util.translate_oom_aware(batch, translate)
+        translations, current_patience = util.translate_oom_aware(batch, translate, device, current_patience=current_patience)
         original_text = util.print_translation(translations, original_text)
         batch = []
 
 if len(batch) > 0:
-    translations = util.translate_oom_aware(batch, translate)
+    translations, current_patience = util.translate_oom_aware(batch, translate, device, current_patience=current_patience)
     original_text = util.print_translation(translations, original_text)

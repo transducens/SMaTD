@@ -30,14 +30,20 @@ model = transformers.AutoModelForSeq2SeqLM.from_pretrained(pretrained_model).to(
 tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model, src_lang=source_lang, tgt_lang=target_lang)
 target_lang_id = get_lang_token(tokenizer, target_lang)
 
-def translate(batch):
+def translate(batch, device):
+    _model = model
+
+    if _model.device != device:
+        _model = model.to(device)
+
     inputs = tokenizer(batch, return_tensors="pt", add_special_tokens=True, truncation=True, padding=True).to(device)
-    result = model.generate(**inputs, forced_bos_token_id=target_lang_id, max_new_tokens=model.generation_config.max_length, num_beams=beam_size)
+    result = _model.generate(**inputs, forced_bos_token_id=target_lang_id, max_new_tokens=model.generation_config.max_length, num_beams=beam_size)
     output = tokenizer.batch_decode(result, skip_special_tokens=True)
 
     return output
 
 batch = []
+current_patience = 0
 
 for l in sys.stdin:
     l = l.rstrip("\r\n")
@@ -45,9 +51,9 @@ for l in sys.stdin:
     batch.append(l)
 
     if len(batch) >= batch_size:
-        translations = util.translate_oom_aware(batch, translate)
+        translations, current_patience = util.translate_oom_aware(batch, translate, device, current_patience=current_patience)
         batch = util.print_translation(translations, batch)
 
 if len(batch) > 0:
-    translations = util.translate_oom_aware(batch, translate)
+    translations, current_patience = util.translate_oom_aware(batch, translate, device, current_patience=current_patience)
     batch = util.print_translation(translations, batch)

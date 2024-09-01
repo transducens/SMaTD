@@ -3,18 +3,24 @@ import sys
 
 import torch
 
-def translate_oom_aware(batch, callback, reset_batch_size_after_oom=False):
+def translate_oom_aware(batch, callback, device, reset_batch_size_after_oom=False, current_patience=0, patience=8):
     output = []
     bs = len(batch)
     oom = False
+    _device = device
+
+    if current_patience >= patience:
+        current_patience = patience + 1
+
+        _device = "cpu"
 
     while True:
         _batch = batch[len(output):len(output) + bs]
 
         try:
-            _output = callback(_batch)
+            _output = callback(_batch, _device)
 
-            if oom and reset_batch_size_after_oom:
+            if oom and reset_batch_size_after_oom and bs != len(batch):
                 sys.stderr.write(f"Batch size: {bs} -> {len(batch)}\n")
 
                 bs = len(batch)
@@ -23,13 +29,31 @@ def translate_oom_aware(batch, callback, reset_batch_size_after_oom=False):
 
             output.extend(_output)
         except torch.OutOfMemoryError as e:
-            if len(_batch) == 1:
-                raise Exception("torch.OutOfMemoryError even using batch_size=1: you should using CPU device") from e
-
-            sys.stderr.write(f"torch.OutOfMemoryError error: current batch size is {len(_batch)}: using half batch_size\n")
-
-            bs = len(_batch) // 2
             oom = True
+
+            if len(_batch) == 1:
+                _device = "cpu"
+                bs = len(batch)
+                current_patience += 1
+
+                sys.stderr.write("torch.OutOfMemoryError error: current batch size is 1: "
+                                 f"using CPU device and using original batch size: {bs} (current_patience: {current_patience})\n")
+            else:
+                bs = len(_batch) // 2
+
+                sys.stderr.write(f"torch.OutOfMemoryError error: current batch size is {len(_batch)}: using smaller batch size: {bs}\n")
+
+        if not oom and _device == "cpu" and _device != device and current_patience < patience:
+            sys.stderr.write(f"Using original device: {_device} -> {device}\n")
+
+            _device = device
+        elif current_patience == patience:
+            assert _device == "cpu"
+
+            sys.stderr.write(f"torch.OutOfMemoryError error: patience exhausted ({patience}): previous device ({device}) permanently set to CPU\n")
+            torch.cuda.empty_cache()
+
+            current_patience += 1 # avoid enter here again
 
         if len(output) >= len(batch):
             assert not oom
@@ -37,7 +61,9 @@ def translate_oom_aware(batch, callback, reset_batch_size_after_oom=False):
 
             break
 
-    return output
+    sys.stderr.write(f"{len(batch)} translations finished!\n")
+
+    return output, current_patience
 
 def load_model(pretrained_model, transformers_class, device=None, from_pretrained_kwargs={}):
     if device is None:

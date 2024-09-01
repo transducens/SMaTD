@@ -22,14 +22,20 @@ beam_size = model.generation_config.num_beams
 max_new_tokens = model.generation_config.max_length
 early_stopping = True if beam_size > 1 else False
 
-def translate(batch):
+def translate(batch, device):
+    _model = model
+
+    if _model.device != device:
+        _model = model.to(device)
+
     inputs = tokenizer(batch, return_tensors="pt", add_special_tokens=True, truncation=True, padding=True).to(device)
-    result = model.generate(**inputs, forced_bos_token_id=target_lang_id, max_new_tokens=max_new_tokens, num_beams=beam_size, early_stopping=early_stopping)
+    result = _model.generate(**inputs, forced_bos_token_id=target_lang_id, max_new_tokens=max_new_tokens, num_beams=beam_size, early_stopping=early_stopping)
     output = tokenizer.batch_decode(result, skip_special_tokens=True)
 
     return output
 
 batch = []
+current_patience = 0
 
 for l in sys.stdin:
     l = l.rstrip("\r\n")
@@ -37,10 +43,10 @@ for l in sys.stdin:
     batch.append(l)
 
     if len(batch) >= batch_size:
-        translations = util.translate_oom_aware(batch, translate)
+        translations, current_patience = util.translate_oom_aware(batch, translate, device, current_patience=current_patience)
         batch = util.print_translation(translations, batch)
 
 if len(batch) > 0:
-    translations = util.translate_oom_aware(batch, translate)
+    translations, current_patience = util.translate_oom_aware(batch, translate, device, current_patience=current_patience)
     batch = util.print_translation(translations, batch)
 
