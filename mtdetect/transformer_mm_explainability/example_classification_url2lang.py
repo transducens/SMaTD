@@ -7,9 +7,60 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import nltk.tokenize
 import torch
 import numpy as np
+from PIL import Image, ImageFont, ImageDraw
+
+def colorize_background(segments, intensities, font_size=40, output_image="output.png"):
+    segments = [s.replace('▁', '_') for s in segments]
+
+    if len(segments) != len(intensities):
+        raise ValueError("Segments and intensities lists must have the same length")
+
+    # Initialize font and image parameters
+    font = ImageFont.load_default(font_size)
+    width, height = 0, 0
+
+    # Calculate total image width and maximum height
+    for segment in segments:
+        left, top, right, bottom = font.getbbox(segment)
+        text_width = right - left
+        text_height = bottom - top
+        width += text_width
+        height = max(height, text_height)
+
+    height = int(height * 1.3)
+
+    # Create an image with a white background
+    img = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(img)
+
+    # Start drawing text at the leftmost position
+    x_position = 0
+
+    for segment, intensity in zip(segments, intensities):
+        # Map the intensity to a red color (intensity 0 -> white, intensity 1 -> red)
+        green_blue_value = int(255 * (1 - intensity))
+        background_color = (255, green_blue_value, green_blue_value)
+
+        # Calculate the size of the text segment
+        left, top, right, bottom = font.getbbox(segment)
+        text_width = right - left
+        text_height = bottom - top
+
+        # Draw the background rectangle
+        draw.rectangle([x_position, 0, x_position + text_width, height], fill=background_color)
+
+        # Draw the text segment on top of the background
+        draw.text((x_position, 0), segment, font=font, fill="black")
+
+        # Update the x_position for the next segment
+        x_position += text_width
+
+    # Save the image
+    img.save(output_image)
 
 url = sys.argv[1] # e.g., https://es.wikipedia.org/wiki/Halo_3#Matchmaking
-target_class = None if len(sys.argv) < 3 else sys.argv[2]
+target_class = sys.argv[2] if len(sys.argv) > 2 and len(sys.argv[2]) > 0 else None # e.g., spa
+colorize_output = sys.argv[3] if len(sys.argv) > 3 and len(sys.argv[3]) > 0 else ''
 preprocess_tokenizer_regex = r'[^\W_0-9]+|[^\w\s]+|_+|\s+|[0-9]+' # Similar to wordpunct_tokenize
 preprocess_tokenizer = nltk.tokenize.RegexpTokenizer(preprocess_tokenizer_regex).tokenize
 
@@ -233,6 +284,11 @@ r_tt = (r_tt - r_tt.min()) / (r_tt.max() - r_tt.min()) # min-max normalization
 
 for priority, token in zip(r_tt, input_tensor_decoded):
     print(f"{token}\t{priority}")
+
+if colorize_output:
+    colorize_background(input_tensor_decoded, r_tt, output_image=colorize_output)
+
+    print(f"Image with tokens and intensities stored: {colorize_output}")
 
 ##########################################
 # Results for https://es.wikipedia.org/wiki/Halo_3#Matchmaking

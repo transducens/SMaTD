@@ -6,12 +6,92 @@ import torch
 import torch.nn.functional as F
 import transformers
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 
 # NLLB supported languages: https://github.com/facebookresearch/flores/blob/main/flores200/README.md#languages-in-flores-200
 
 # Use wrapper_example_translation_nllb.py to parallelize with parallel
 
 # Functions
+
+def visualize_heatmap_with_labels_and_values(rows, cols, intensity_matrix, text_color="black", font_size=40, output_image="heatmap_with_values.png", desc=None):
+    rows = [s.replace('▁', '_') for s in rows]
+    cols = [s.replace('▁', '_') for s in cols]
+
+    # Ensure the matrix dimensions match the length of the row and column arrays
+    if len(rows) != len(intensity_matrix) or any(len(row) != len(cols) for row in intensity_matrix):
+        raise ValueError("Intensity matrix dimensions must match the length of rows and columns")
+
+    # Initialize font
+    font = ImageFont.load_default(font_size)
+    font2 = ImageFont.load_default(font_size // 2)
+
+    # Calculate the size of each cell
+    cell_width = max(font.getbbox(col)[2] - font.getbbox(col)[0] for col in (cols + ([desc] if desc else []))) + 20  # Add padding
+    cell_height = max(font.getbbox(row)[3] - font.getbbox(row)[1] for row in (rows + ([desc] if desc else []))) + 20 * 2  # Add padding
+
+    # Calculate total image size
+    image_width = cell_width * len(cols) + cell_width  # Extra space for row labels
+    image_height = cell_height * len(rows) + cell_height  # Extra space for column labels
+
+    # Create an image with a white background
+    img = Image.new("RGB", (image_width, image_height), "white")
+    draw = ImageDraw.Draw(img)
+
+    if desc:
+        left, top, right, bottom = font.getbbox(desc)
+        text_width = right - left
+        text_height = bottom - top
+        text_x = 5.0
+        text_y = 5.0
+        draw.text((text_y, text_x), desc, font=font, fill=text_color)
+
+    # Draw row labels on the left side
+    for i, row in enumerate(rows):
+        left, top, right, bottom = font.getbbox(row)
+        text_width = right - left
+        text_height = bottom - top
+        text_x = (cell_width - text_width) / 2
+        text_y = cell_height * (i + 1) + (cell_height - text_height) / 2
+        draw.text((text_x, text_y), row, font=font, fill=text_color)
+
+    # Draw column labels on the top side
+    for j, col in enumerate(cols):
+        left, top, right, bottom = font.getbbox(col)
+        text_width = right - left
+        text_height = bottom - top
+        text_x = cell_width * (j + 1) + (cell_width - text_width) / 2
+        text_y = (cell_height - text_height) / 2
+        draw.text((text_x, text_y), col, font=font, fill=text_color)
+
+    # Iterate over each cell in the matrix
+    for i, row in enumerate(rows):
+        for j, col in enumerate(cols):
+            intensity = intensity_matrix[i][j]
+
+            # Calculate background color
+            red_value = 255
+            green_blue_value = int(255 * (1 - intensity))
+            background_color = (red_value, green_blue_value, green_blue_value)
+
+            # Calculate position for this cell
+            x_position = cell_width * (j + 1)
+            y_position = cell_height * (i + 1)
+
+            # Draw the background rectangle
+            draw.rectangle([x_position, y_position, x_position + cell_width, y_position + cell_height], fill=background_color)
+
+            # Draw the intensity value in the center of the cell
+            intensity_text = f"{intensity:.2f}"  # Format the intensity value to two decimal places
+            left, top, right, bottom = font.getbbox(intensity_text)
+            text_width = right - left
+            text_height = bottom - top
+            text_x = x_position + (cell_width - text_width) / 2
+            text_y = y_position + (cell_height - text_height) / 2
+            draw.text((text_x, text_y), intensity_text, font=font2, fill=text_color)
+
+    # Save the image
+    img.save(output_image)
 
 def get_lang_token(tokenizer, lang):
     token = tokenizer.convert_tokens_to_ids(lang)
@@ -88,7 +168,7 @@ tokenizer = None
 
 def explainability(source_text, target_text='', source_lang="eng_Latn", target_lang="spa_Latn", debug=False, apply_normalization=True,
                    self_attention_remove_diagonal=True, explainability_normalization="relative", device=None, beam_size=1,
-                   pretrained_model=None):
+                   pretrained_model=None, teacher_forcing=None, loss_target="generation", beam_search_early_stopping=True):
     # Load NLLB
     assert isinstance(source_text, str), type(source_text)
     assert isinstance(target_text, str), type(target_text)
@@ -99,6 +179,11 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
     global model, tokenizer, translator_pipeline
 
     batch_size = 1
+
+    assert loss_target in ("generation", "target"), loss_target
+
+    if loss_target == "target":
+        assert len(target_text) > 0, "Not supported loss_target=target and empty target_text"
 
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -156,7 +241,11 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
     # _from_model_config : https://github.com/huggingface/transformers/blob/52cb4034ada381fe1ffe8d428a1076e5411a8026/src/transformers/trainer_seq2seq.py#L315
     #  ... it handles the generation configuration override by the user, so we do not need to worry about it
 
-    teacher_forcing = bool(target_text)
+    if teacher_forcing is None:
+        teacher_forcing = bool(target_text)
+    else:
+        if teacher_forcing:
+            assert bool(target_text), "Teacher forcing is enabled but no target text is available"
 
     if teacher_forcing and beam_size != 1:
         print(f"warning: beam_size is going to be modified ({beam_size} -> 1) because teacher forcing is enabled")
@@ -223,6 +312,11 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
                     completed_beams.append((new_sequence, new_score / len(new_sequence)))
                 else:
                     new_beams.append((new_sequence, new_score))
+
+            if beam_search_early_stopping and len(completed_beams) >= beam_size:
+                new_beams = []
+
+                break
 
         # Sort and select top beams
         new_beams.sort(key=lambda x: x[1], reverse=True)
@@ -302,7 +396,19 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
 
     target = torch.zeros(logits_expected_shape)
 
-    for i, token in enumerate(generated_tokens_wo_last_token):
+    if loss_target == "generation":
+        target_tokens = generated_tokens_wo_last_token
+    elif loss_target == "target":
+        target_tokens = tokenizer(target_text, return_tensors="pt", add_special_tokens=False).input_ids[0].tolist()
+        target_tokens = [decoder_start_token_id, target_lang_id] + target_tokens
+        target_tokens = target_tokens[:len(generated_tokens_wo_last_token)]
+
+        while len(target_tokens) < len(generated_tokens_wo_last_token):
+            target_tokens.append(tokenizer.pad_token_id) # Workaround to avoid NaN values
+    else:
+        raise Exception(f"Unexpected loss_target: {loss_target}")
+
+    for i, token in enumerate(target_tokens):
         target[:, i, token] = 1.0
 
     target = target.to(device)
@@ -457,15 +563,20 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
     return input_tokens, output_tokens, output, r_ee, r_dd, r_de
 
 if __name__ == "__main__":
-    debug = True # Change manually
+    debug = False # Change manually
     source_text = sys.argv[1]
     target_text = sys.argv[2] if len(sys.argv) > 2 else '' # Teacher forcing
     source_lang = sys.argv[3] if (len(sys.argv) > 3 and len(sys.argv[3]) > 0) else "eng_Latn" # e.g., eng_Latn
     target_lang = sys.argv[4] if (len(sys.argv) > 4 and len(sys.argv[4]) > 0) else "spa_Latn" # e.g., spa_Latn
-    beam_size = int(sys.argv[5]) if len(sys.argv) > 5 else 1
+    beam_size = int(sys.argv[5]) if len(sys.argv) > 5 else 4
     device = sys.argv[6] if (len(sys.argv) > 6 and len(sys.argv[6]) > 0) else None
     pickle_prefix_filename = sys.argv[7] if (len(sys.argv) > 7 and len(sys.argv[7]) > 0) else ''
     pretrained_model = sys.argv[8] if (len(sys.argv) > 8 and len(sys.argv[8]) > 0) else None
+    teacher_forcing = sys.argv[9] if (len(sys.argv) > 9 and len(sys.argv[9]) > 0) else None # None -> automatic
+    loss_target = sys.argv[10] if (len(sys.argv) > 10 and len(sys.argv[10]) > 0) else "generation"
+    colorize_output_prefix = sys.argv[11] if len(sys.argv) > 11 and len(sys.argv[11]) > 0 else ''
+
+    assert loss_target in ("generation", "target"), loss_target
 
     if pickle_prefix_filename:
         debug = False
@@ -488,14 +599,27 @@ if __name__ == "__main__":
         source_text = [source_text]
         target_text = [target_text]
 
-    print(f"Translating from {source_lang} to {target_lang}")
+    if teacher_forcing is None:
+        teacher_forcing = bool(target_text[0])
+    else:
+        if teacher_forcing in ("yes", "no"):
+            teacher_forcing = True if teacher_forcing == "yes" else False
+        else:
+            teacher_forcing = bool(int(teacher_forcing))
+
+    if not teacher_forcing and len(target_text[0]) > 0 and loss_target == "generation":
+        print("warning: teacher forcing is disabled, the loss is focusing the generation, but target text was provided: target text is going to be ignored")
+
+    teacher_forcing_str = "yes" if teacher_forcing else "no"
+
+    print(f"Translating from {source_lang} to {target_lang} (teacher forcing: {teacher_forcing_str} ; loss target: {loss_target})")
 
     pickle_data = {
                 "explainability_encoder": [],
                 "explainability_decoder": [],
                 "explainability_cross": [],
             }
-    fn_pickle_array = f"{pickle_prefix_filename}.{source_lang}.{target_lang}.pickle"
+    fn_pickle_array = f"{pickle_prefix_filename}.{source_lang}.{target_lang}.teacher_forcing_{teacher_forcing_str}.loss_target_{loss_target}.pickle"
 
     for idx, (_source_text, _target_text) in enumerate(zip(source_text, target_text), 1):
         if not pickle_prefix_filename:
@@ -508,7 +632,8 @@ if __name__ == "__main__":
                            target_lang=target_lang, debug=debug, beam_size=beam_size, device=device,
                            self_attention_remove_diagonal=self_attention_remove_diagonal,
                            explainability_normalization=explainability_normalization,
-                           pretrained_model=pretrained_model)
+                           pretrained_model=pretrained_model, teacher_forcing=teacher_forcing,
+                           loss_target=loss_target)
 
         # Print results
 
@@ -534,6 +659,17 @@ if __name__ == "__main__":
             pickle_data["explainability_encoder"].append(r_ee)
             pickle_data["explainability_decoder"].append(r_dd)
             pickle_data["explainability_cross"].append(r_de)
+
+        if colorize_output_prefix:
+            # r_ee, r_dd, r_de
+
+            for rows, cols, matrix, desc in ((input_tokens, input_tokens, r_ee, "encoder"),
+                                             (output_tokens, output_tokens, r_dd, "decoder"),
+                                             (output_tokens, input_tokens, r_de, "cross")):
+                colorize_output_fn = f"{colorize_output_prefix}.{idx}.{desc}.png"
+
+                visualize_heatmap_with_labels_and_values(rows, cols, matrix, output_image=colorize_output_fn, desc=desc)
+                print(f"Image with tokens and intensities stored: {colorize_output_fn}")
 
     if pickle_prefix_filename:
         with open(fn_pickle_array, "wb") as pickle_fd:

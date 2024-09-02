@@ -42,6 +42,7 @@ save_model_path = default_sys_argv(14, '')
 learning_rate = default_sys_argv(15, 5e-3, f=float)
 multichannel = default_sys_argv(16, True, f=lambda q: bool(int(q)))
 pretrained_model = default_sys_argv(17, '')
+teacher_forcing = default_sys_argv(18, None, f=lambda q: None if q == '' else bool(int(q)))
 
 for _attention_matrix in attention_matrix:
     assert _attention_matrix in ("encoder", "decoder", "cross"), attention_matrix
@@ -91,7 +92,7 @@ def extend_tensor_with_zeros(t, max_width, max_height, device):
 
 def read(filename, direction, source_lang, target_lang, self_attention_remove_diagonal, explainability_normalization,
          focus=["explainability_cross"], store_explainability_arrays=True, load_explainability_arrays=True,
-         device=None, pretrained_model=None, pickle_template=None, pickle_check_env=True):
+         device=None, pretrained_model=None, pickle_template=None, pickle_check_env=True, teacher_forcing=None):
     cnn_width = -np.inf
     cnn_height = -np.inf
     loaded_samples = 0
@@ -177,7 +178,8 @@ def read(filename, direction, source_lang, target_lang, self_attention_remove_di
             input_tokens, output_tokens, output, r_ee, r_dd, r_de = \
                 example_translation_nllb.explainability(source, target_text=target, source_lang=source_lang, target_lang=target_lang,
                                                         debug=False, apply_normalization=True, self_attention_remove_diagonal=False,
-                                                        explainability_normalization="none", device=device, pretrained_model=pretrained_model)
+                                                        explainability_normalization="none", device=device, pretrained_model=pretrained_model,
+                                                        teacher_forcing=teacher_forcing)
 
             explainability_ee.append(r_ee)
             explainability_dd.append(r_dd)
@@ -296,11 +298,14 @@ def get_data(explainability_matrix, labels, loaded_samples, cnn_width, cnn_heigh
     return inputs, labels
 
 train_data = read(train_filename, direction, source_lang, target_lang, self_attention_remove_diagonal, explainability_normalization,
-                  focus=attention_matrix, device=device, pretrained_model=pretrained_model, pickle_template="train")
+                  focus=attention_matrix, device=device, pretrained_model=pretrained_model, pickle_template="train",
+                  teacher_forcing=teacher_forcing)
 dev_data = read(dev_filename, direction, source_lang, target_lang, self_attention_remove_diagonal, explainability_normalization,
-                  focus=attention_matrix, device=device, pretrained_model=pretrained_model, pickle_template="dev")
+                  focus=attention_matrix, device=device, pretrained_model=pretrained_model, pickle_template="dev",
+                  teacher_forcing=teacher_forcing)
 test_data = read(test_filename, direction, source_lang, target_lang, self_attention_remove_diagonal, explainability_normalization,
-                  focus=attention_matrix, device=device, pretrained_model=pretrained_model, pickle_template="test")
+                  focus=attention_matrix, device=device, pretrained_model=pretrained_model, pickle_template="test",
+                  teacher_forcing=teacher_forcing)
 cnn_width = max(train_data["cnn_width"], dev_data["cnn_width"], test_data["cnn_width"])
 cnn_height = max(train_data["cnn_height"], dev_data["cnn_height"], test_data["cnn_height"])
 
