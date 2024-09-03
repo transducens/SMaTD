@@ -198,9 +198,7 @@ def load_dataset(filename_dataset, set_desc, **kwargs):
     logger.debug("Allocated memory after tokenization (%s): %d", set_desc, utils.get_current_allocated_memory_size())
 
     # Datasets
-    dataset_instance = dataset.SmartBatchingURLsDataset(input_data, output_data, kwargs["tokenizer"],
-                                                        kwargs["max_length_tokens"], set_desc=set_desc,
-                                                        remove_instead_of_truncate=kwargs["remove_instead_of_truncate"])
+    dataset_instance = dataset.SmartBatchingURLsDataset(input_data, output_data, kwargs["tokenizer"], kwargs["max_length_tokens"], set_desc=set_desc)
 
     logger.debug("Allocated memory after encoding the data: %d", utils.get_current_allocated_memory_size())
     logger.debug("Total tokens (%s): %d", set_desc, dataset_instance.total_tokens)
@@ -267,7 +265,6 @@ def main(args):
     learning_rate = args.learning_rate
     scheduler_str = args.lr_scheduler
     lr_scheduler_args = args.lr_scheduler_args # Content might vary depending on the value of scheduler_str
-    remove_instead_of_truncate = args.remove_instead_of_truncate
     optimizer_str = args.optimizer
     optimizer_args = args.optimizer_args # Content might vary depending on the value of optimizer_str
     dataset_workers = args.dataset_workers
@@ -322,21 +319,49 @@ def main(args):
     else:
         logger.warning("Deterministic values disable (you set a negative seed)")
 
+    if max_length_tokens <= 0:
+        max_length_tokens = tokenizer.model_max_length
     if max_length_tokens > tokenizer.model_max_length:
         logger.warning("%s can handle a max. of %d tokens at once but you set %d: changing value to %d", pretrained_model, tokenizer.model_max_length, max_length_tokens, tokenizer.model_max_length)
 
         max_length_tokens = tokenizer.model_max_length
+
+    max_length_tokens_max_value = 1000000000000000019884624838656 # https://discuss.huggingface.co/t/tokenizers-what-this-max-length-number/28484
+
+    if max_length_tokens == max_length_tokens_max_value:
+        alt1 = getattr(model.config, "max_length", -1)
+        alt2 = getattr(model.config, "max_position_embeddings", -1)
+
+        if alt1 > 0 or alt2 > 2:
+            if alt1 > 0 and alt2 > 0:
+                if alt1 == alt2:
+                    max_length_tokens = alt1
+                else:
+                    max_length_tokens = min(alt1, alt2)
+
+                    logger.warning("Max tokens length (%d) has two alternatives, but they are different (%d vs %d): %d", max_length_tokens_max_value, alt1, alt2, max_length_tokens)
+            elif alt1 > 0:
+                max_length_tokens = alt1
+            elif alt2 > 0:
+                max_length_tokens = alt2
+            else:
+                raise Exception("Unexpected...")
+
+    logger.info("Max token length: %d", max_length_tokens)
 
     if not apply_inference:
         logger.debug("Train data file/s: %s", filename_dataset_train)
         logger.debug("Dev data file: %s", filename_dataset_dev)
         logger.debug("Test data file: %s", filename_dataset_test)
 
-    model_embeddings_size = model.base_model.embeddings.word_embeddings.weight.shape[0]
+    try:
+        model_embeddings_size = model.base_model.embeddings.word_embeddings.weight.shape[0]
 
-    if model_embeddings_size != len(tokenizer):
-        # microsoft/deberta-v3-large -> 128100 vs 128001 (why 99 unknown tokens in the model?)
-        logger.error("Embedding layer size does not match with the tokenizer size: %d vs %d", model_embeddings_size, len(tokenizer))
+        if model_embeddings_size != len(tokenizer):
+            # microsoft/deberta-v3-large -> 128100 vs 128001 (why 99 unknown tokens in the model?)
+            logger.error("Embedding layer size does not match with the tokenizer size: %d vs %d", model_embeddings_size, len(tokenizer))
+    except AttributeError:
+        logger.warning("Could not get the embedding size...")
 
     loss_function = nn.BCEWithLogitsLoss(reduction="mean") # Regression: raw input, not normalized
                                                            #  (i.e. sigmoid is applied in the loss function)
@@ -362,7 +387,6 @@ def main(args):
 
     # Load data
     dataset_static_args = {
-        "remove_instead_of_truncate": remove_instead_of_truncate,
         "batch_size": batch_size,
         "device": device,
         "dataset_workers": dataset_workers,
@@ -564,8 +588,8 @@ def main(args):
             for i, v in duplicated_data.items():
                 total_duplicated += v - 1
 
-            assert total_duplicated < batch_size, f"{total_duplicated} >= {batch_size}"
-            assert abs(len(duplicated_data) - batch_size * training_steps_per_epoch // num_processes) < batch_size, f"abs({len(duplicated_data)} - {batch_size} * {training_steps_per_epoch} // {num_processes}) >= {batch_size}"
+            #assert total_duplicated < batch_size, f"{total_duplicated} >= {batch_size}" # True when there are no duplicates in the data...
+            #assert abs(len(duplicated_data) - batch_size * training_steps_per_epoch // num_processes) < batch_size, f"abs({len(duplicated_data)} - {batch_size} * {training_steps_per_epoch} // {num_processes}) >= {batch_size}" # True when there are no duplicates in the data...
 
         epoch += 1
 
@@ -714,9 +738,6 @@ def initialization():
     parser.add_argument('--lr-scheduler-args', **lr_scheduler_conf["options"],
                         help="Args. for LR scheduler (in order to see the specific configuration for a LR scheduler, "
                              "use -h and set --lr-scheduler)")
-    parser.add_argument('--remove-instead-of-truncate', action="store_true",
-                        help="Remove pairs which would need to be truncated (if not enabled, truncation will be applied). "
-                             "This option will be only applied to the training set")
     parser.add_argument('--monolingual', action="store_true",
                         help="Only the MT or HT will be processed instead of OT+MT|HT. This does not change the expected format in the data: OT+MT|HT+label")
     parser.add_argument('--threshold', type=float, default=0.5,

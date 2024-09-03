@@ -58,8 +58,7 @@ def pad_sequence(sequence_batch, pad_token_id, max_length=0):
 class SmartBatchingURLsDataset(Dataset):
     # Code based on https://www.kaggle.com/code/rhtsingh/speeding-up-transformer-w-optimization-strategies?scriptVersionId=67176227&cellId=2
 
-    def __init__(self, input_data, output_data, tokenizer, max_length, sampler_better_randomness=True,
-                 remove_instead_of_truncate=False, set_desc=''):
+    def __init__(self, input_data, output_data, tokenizer, max_length, sampler_better_randomness=True, set_desc=''):
         super(SmartBatchingURLsDataset, self).__init__()
 
         self.max_length = max_length
@@ -72,26 +71,8 @@ class SmartBatchingURLsDataset(Dataset):
         }
 
         # Tokenize data (we need to tokenize one by one because the length of all the provided URLs will not be the same)
-        self.tokens = utils.encode(tokenizer, input_data, max_length=max_length, return_tensors=None, truncation=False)["input_ids"]
-
-        # Truncate or remove
-        if remove_instead_of_truncate:
-            initial_pairs = len(self.token)
-
-            self.tokens = list(filter(lambda pair: len(pair) <= max_length, self.tokens))
-
-            after_remove_pairs = len(self.token)
-
-            logger.debug("%d pairs of URLs have been removed%s: from %d to %d pairs", initial_pairs - after_remove_pairs,
-                                                                                      f" ({self.set_desc})" if self.set_desc else '',
-                                                                                      initial_pairs, after_remove_pairs)
-        else:
-            needs_truncation = sum([1 if len(pair) > max_length else 0 for pair in self.tokens])
-
-            logger.debug("%d pairs of URLs need truncation of %d pairs%s", needs_truncation, len(self.tokens),
-                                                                           f" ({self.set_desc})" if self.set_desc else '')
-
-            self.tokens = [pair[:max_length] for pair in self.tokens]
+        # We let the tokenizer do the truncation because manual truncation may remove special tokens...
+        self.tokens = utils.encode(tokenizer, input_data, max_length=max_length, return_tensors=None, truncation=True)["input_ids"]
 
         self._total_tokens = sum([len(t) for t in self.tokens])
         disable_balance = False
