@@ -168,7 +168,7 @@ tokenizer = None
 
 def explainability(source_text, target_text='', source_lang="eng_Latn", target_lang="spa_Latn", debug=False, apply_normalization=True,
                    self_attention_remove_diagonal=True, explainability_normalization="relative", device=None, beam_size=1,
-                   pretrained_model=None, teacher_forcing=None, loss_target="generation", beam_search_early_stopping=True):
+                   pretrained_model=None, teacher_forcing=None, beam_search_early_stopping=True, ignore_attention=False):
     # Load NLLB
     assert isinstance(source_text, str), type(source_text)
     assert isinstance(target_text, str), type(target_text)
@@ -179,11 +179,6 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
     global model, tokenizer, translator_pipeline
 
     batch_size = 1
-
-    assert loss_target in ("generation", "target"), loss_target
-
-    if loss_target == "target":
-        assert len(target_text) > 0, "Not supported loss_target=target and empty target_text"
 
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -252,8 +247,13 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
 
         beam_size = 1
 
-    outputs = tokenizer(target_text, return_tensors="pt", add_special_tokens=False).input_ids[0].tolist() if teacher_forcing else []
-    generated_tokens = [decoder_start_token_id, target_lang_id] + outputs # NLLB starts with these two tokens
+    if not teacher_forcing:
+        assert len(target_text) > 0, "If teacher forcing is disabled, reference text is not optional. If teacher forcing is enabled, the reference text is the translated text itself"
+
+    initial_provided_target_text_tokens = tokenizer(target_text, return_tensors="pt", add_special_tokens=False).input_ids[0].tolist()
+    initial_provided_target_text_tokens = [decoder_start_token_id, target_lang_id] + initial_provided_target_text_tokens
+    outputs = list(initial_provided_target_text_tokens) if teacher_forcing else [decoder_start_token_id, target_lang_id] # NLLB starts with these two tokens
+    generated_tokens = outputs
     initial_tokens = len(generated_tokens)
 
     assert batch_size == 1, batch_size
@@ -339,9 +339,24 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
     completed_beams = completed_beams[:beam_size]
     best_sequence, best_score = completed_beams[0]
     generated_tokens = best_sequence
+    recalculate_attention = True if beam_size > 1 else False
+    padding_tokens = 0
+
+    # Add padding to the generated tokens if necessary to match the shape of the reference
+    if len(generated_tokens) - 1 < len(initial_provided_target_text_tokens):
+        recalculate_attention = True
+
+        while len(generated_tokens) - 1 < len(initial_provided_target_text_tokens):
+            generated_tokens.append(tokenizer.pad_token_id)
+
+            padding_tokens += 1
+    elif len(generated_tokens) - 1 > len(initial_provided_target_text_tokens):
+        recalculate_attention = True
+        generated_tokens = generated_tokens[:len(initial_provided_target_text_tokens) + 1]
+
     generated_tokens_wo_last_token = generated_tokens[:-1] # [:-1]: we don't have the attention values for the last token because has not been processed autoregressively
 
-    if beam_size > 1:
+    if recalculate_attention:
         # Re-cacalculate to properly obtain the attention
         torch.cuda.empty_cache()
 
@@ -350,7 +365,8 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
         log_probs = F.log_softmax(model_output.logits[:, -1, :], dim=-1).cpu()
         token_ids = torch.topk(-log_probs, beam_size, largest=False, sorted=True).indices.squeeze(0).tolist()
 
-        assert generated_tokens[-1] in token_ids, f"{generated_tokens[-1]} not in {token_ids}"
+        if padding_tokens == 0:
+            assert generated_tokens[-1] in token_ids, f"{generated_tokens[-1]} not in {token_ids}"
 
     # Attention, and gradients hook
 
@@ -396,20 +412,13 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
 
     target = torch.zeros(logits_expected_shape)
 
-    if loss_target == "generation":
+    if teacher_forcing:
         target_tokens = generated_tokens_wo_last_token
-    elif loss_target == "target":
-        target_tokens = tokenizer(target_text, return_tensors="pt", add_special_tokens=False).input_ids[0].tolist()
-        target_tokens = [decoder_start_token_id, target_lang_id] + target_tokens
-        target_tokens = target_tokens[:len(generated_tokens_wo_last_token)]
-
-        while len(target_tokens) < len(generated_tokens_wo_last_token):
-            target_tokens.append(tokenizer.pad_token_id) # Workaround to avoid NaN values
     else:
-        raise Exception(f"Unexpected loss_target: {loss_target}")
+        target_tokens = initial_provided_target_text_tokens
 
     for i, token in enumerate(target_tokens):
-        target[:, i, token] = 1.0
+        target[0, i, token] = 1.0
 
     target = target.to(device)
     loss = torch.sum(logits * target)
@@ -466,6 +475,9 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
 
             gradient = attentions_grad_store[layer][component]
             attention = attentions[layer][component]
+
+            if ignore_attention:
+                attention = np.ones_like(attention)
 
             assert gradient.shape == attention.shape, f"{gradient.shape} != {attention.shape}"
 
@@ -573,10 +585,8 @@ if __name__ == "__main__":
     pickle_prefix_filename = sys.argv[7] if (len(sys.argv) > 7 and len(sys.argv[7]) > 0) else ''
     pretrained_model = sys.argv[8] if (len(sys.argv) > 8 and len(sys.argv[8]) > 0) else None
     teacher_forcing = sys.argv[9] if (len(sys.argv) > 9 and len(sys.argv[9]) > 0) else None # None -> automatic
-    loss_target = sys.argv[10] if (len(sys.argv) > 10 and len(sys.argv[10]) > 0) else "generation"
+    ignore_attention = bool(int(sys.argv[10])) if len(sys.argv) > 10 and len(sys.argv[10]) > 0 else ''
     colorize_output_prefix = sys.argv[11] if len(sys.argv) > 11 and len(sys.argv[11]) > 0 else ''
-
-    assert loss_target in ("generation", "target"), loss_target
 
     if pickle_prefix_filename:
         debug = False
@@ -607,19 +617,19 @@ if __name__ == "__main__":
         else:
             teacher_forcing = bool(int(teacher_forcing))
 
-    if not teacher_forcing and len(target_text[0]) > 0 and loss_target == "generation":
-        print("warning: teacher forcing is disabled, the loss is focusing the generation, but target text was provided: target text is going to be ignored")
+    if teacher_forcing and ignore_attention:
+        print(f"warning: ignore_attention=True is intended to work when teacher_forcing=False, but teacher_forcing is True")
 
     teacher_forcing_str = "yes" if teacher_forcing else "no"
 
-    print(f"Translating from {source_lang} to {target_lang} (teacher forcing: {teacher_forcing_str} ; loss target: {loss_target})")
+    print(f"Translating from {source_lang} to {target_lang} (teacher forcing: {teacher_forcing_str} : ignore attention: {ignore_attention})")
 
     pickle_data = {
                 "explainability_encoder": [],
                 "explainability_decoder": [],
                 "explainability_cross": [],
             }
-    fn_pickle_array = f"{pickle_prefix_filename}.{source_lang}.{target_lang}.teacher_forcing_{teacher_forcing_str}.loss_target_{loss_target}.pickle"
+    fn_pickle_array = f"{pickle_prefix_filename}.{source_lang}.{target_lang}.teacher_forcing_{teacher_forcing_str}.pickle"
 
     for idx, (_source_text, _target_text) in enumerate(zip(source_text, target_text), 1):
         if not pickle_prefix_filename:
@@ -633,7 +643,7 @@ if __name__ == "__main__":
                            self_attention_remove_diagonal=self_attention_remove_diagonal,
                            explainability_normalization=explainability_normalization,
                            pretrained_model=pretrained_model, teacher_forcing=teacher_forcing,
-                           loss_target=loss_target)
+                           ignore_attention=ignore_attention)
 
         # Print results
 
