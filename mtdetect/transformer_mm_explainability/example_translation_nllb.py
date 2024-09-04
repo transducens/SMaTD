@@ -344,6 +344,7 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
 
     # Add padding to the generated tokens if necessary to match the shape of the reference
     if len(generated_tokens) - 1 < len(initial_provided_target_text_tokens):
+        # Not harmful for the generation, and the decoder and cross-attention values of the non-padded tokens is quite similar, but the values of the padding tokens might affect the generated explainability values
         recalculate_attention = True
 
         while len(generated_tokens) - 1 < len(initial_provided_target_text_tokens):
@@ -351,6 +352,7 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
 
             padding_tokens += 1
     elif len(generated_tokens) - 1 > len(initial_provided_target_text_tokens):
+        # Truncation affects the decoder and cross-attention shape, but the sub-matrix (compared to do not truncate) values are quite similar
         recalculate_attention = True
         generated_tokens = generated_tokens[:len(initial_provided_target_text_tokens) + 1]
 
@@ -619,6 +621,11 @@ if __name__ == "__main__":
 
     if teacher_forcing and ignore_attention:
         print(f"warning: ignore_attention=True is intended to work when teacher_forcing=False, but teacher_forcing is True")
+
+    if not teacher_forcing:
+        print("warning: teacher_forcing is disabled: padding/truncation is applied to the generated text to match the shape of the reference tokens (decoder and cross-attention shape will be affected): "
+              "if reference > generation -> padding (should not be harmful), but attention shape will be longer due to padding tokens (these will affect slightly or none to the attention values of the non-padding tokens); "
+              "if regerence < generation -> truncation (should not be harmful), but lost tokens will not have attention values (although available values will be quite similar to the result without truncation)")
 
     teacher_forcing_str = "yes" if teacher_forcing else "no"
 
