@@ -42,7 +42,8 @@ save_model_path = default_sys_argv(14, '')
 learning_rate = default_sys_argv(15, 5e-3, f=float)
 multichannel = default_sys_argv(16, True, f=lambda q: bool(int(q)))
 pretrained_model = default_sys_argv(17, '')
-teacher_forcing = default_sys_argv(18, None, f=lambda q: None if q == '' else bool(int(q)))
+teacher_forcing = default_sys_argv(18, False, f=lambda q: None if q == '' else bool(int(q)))
+ignore_attention = default_sys_argv(19, False, f=lambda q: False if q == '' else bool(int(q)))
 
 for _attention_matrix in attention_matrix:
     assert _attention_matrix in ("encoder", "decoder", "cross"), attention_matrix
@@ -60,7 +61,7 @@ if multichannel and len(cnn_pooling) < len(attention_matrix):
 if not multichannel:
     assert len(cnn_pooling) == 1, cnn_pooling
 
-assert direction in ("src2trg", "trg2src", "only_src", "only_trg"), direction
+assert direction in ("src2trg", "trg2src"), direction
 assert explainability_normalization in ("none", "absolute", "relative"), explainability_normalization
 assert cnn_max_width > 0, cnn_max_width
 assert cnn_max_height > 0, cnn_max_height
@@ -92,7 +93,8 @@ def extend_tensor_with_zeros(t, max_width, max_height, device):
 
 def read(filename, direction, source_lang, target_lang, self_attention_remove_diagonal, explainability_normalization,
          focus=["explainability_cross"], store_explainability_arrays=True, load_explainability_arrays=True,
-         device=None, pretrained_model=None, pickle_template=None, pickle_check_env=True, teacher_forcing=None):
+         device=None, pretrained_model=None, pickle_template=None, pickle_check_env=True, teacher_forcing=False,
+         ignore_attention=False):
     cnn_width = -np.inf
     cnn_height = -np.inf
     loaded_samples = 0
@@ -105,7 +107,6 @@ def read(filename, direction, source_lang, target_lang, self_attention_remove_di
     explainability_dd = []
     explainability_de = []
     fd = open(filename)
-    first_msg = False
     fn_pickle_array = None
 
     if pickle_check_env:
@@ -125,7 +126,9 @@ def read(filename, direction, source_lang, target_lang, self_attention_remove_di
                 fn_pickle_array = fn_pickle_array.replace("{template}", pickle_template)
 
     if not fn_pickle_array or not os.path.isfile(fn_pickle_array):
-        fn_pickle_array = f"{filename}.{direction}.{source_lang}.{target_lang}.pickle"
+        teacher_forcing_str = "yes" if teacher_forcing else "no"
+        ignore_attention_str = "yes" if ignore_attention else "no"
+        fn_pickle_array = f"{filename}.{direction}.{source_lang}.{target_lang}.teacher_forcing_{teacher_forcing_str}.ignore_attention_{ignore_attention_str}.pickle"
 
     fn_pickle_array_exists = os.path.isfile(fn_pickle_array)
 
@@ -149,25 +152,6 @@ def read(filename, direction, source_lang, target_lang, self_attention_remove_di
 
         label = float(label)
 
-        if direction == "src2trg":
-            pass
-        elif direction == "trg2src":
-            source, target = target, source # swap
-        elif direction == "only_src": # disable teacher forcing
-            target = ''
-        elif direction == "only_trg": # disable teacher forcing
-            source, target = target, ''
-        else:
-            raise Exception(f"Unexpected direction: {direction}")
-
-        if not first_msg:
-            print(f"The next sentence (source) is expected to be {source_lang}: {source}")
-
-            if target != '':
-                print(f"The next sentence (target) is expected to be {target_lang}: {target}")
-
-            first_msg = True
-
         source_text.append(source)
         target_text.append(target)
         labels.append(label)
@@ -179,7 +163,9 @@ def read(filename, direction, source_lang, target_lang, self_attention_remove_di
                 example_translation_nllb.explainability(source, target_text=target, source_lang=source_lang, target_lang=target_lang,
                                                         debug=False, apply_normalization=True, self_attention_remove_diagonal=False,
                                                         explainability_normalization="none", device=device, pretrained_model=pretrained_model,
-                                                        teacher_forcing=teacher_forcing)
+                                                        teacher_forcing=teacher_forcing, ignore_attention=ignore_attention, direction=direction,
+                                                        print_sentences_info=first_msg)
+            first_msg = False
 
             explainability_ee.append(r_ee)
             explainability_dd.append(r_dd)
@@ -299,13 +285,13 @@ def get_data(explainability_matrix, labels, loaded_samples, cnn_width, cnn_heigh
 
 train_data = read(train_filename, direction, source_lang, target_lang, self_attention_remove_diagonal, explainability_normalization,
                   focus=attention_matrix, device=device, pretrained_model=pretrained_model, pickle_template="train",
-                  teacher_forcing=teacher_forcing)
+                  teacher_forcing=teacher_forcing, ignore_attention=ignore_attention)
 dev_data = read(dev_filename, direction, source_lang, target_lang, self_attention_remove_diagonal, explainability_normalization,
                   focus=attention_matrix, device=device, pretrained_model=pretrained_model, pickle_template="dev",
-                  teacher_forcing=teacher_forcing)
+                  teacher_forcing=teacher_forcing, ignore_attention=ignore_attention)
 test_data = read(test_filename, direction, source_lang, target_lang, self_attention_remove_diagonal, explainability_normalization,
                   focus=attention_matrix, device=device, pretrained_model=pretrained_model, pickle_template="test",
-                  teacher_forcing=teacher_forcing)
+                  teacher_forcing=teacher_forcing, ignore_attention=ignore_attention)
 cnn_width = max(train_data["cnn_width"], dev_data["cnn_width"], test_data["cnn_width"])
 cnn_height = max(train_data["cnn_height"], dev_data["cnn_height"], test_data["cnn_height"])
 

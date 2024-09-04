@@ -166,17 +166,40 @@ translator_pipeline = None
 model = None
 tokenizer = None
 
-def explainability(source_text, target_text='', source_lang="eng_Latn", target_lang="spa_Latn", debug=False, apply_normalization=True,
+def explainability(source_text, target_text, source_lang="eng_Latn", target_lang="spa_Latn", debug=False, apply_normalization=True,
                    self_attention_remove_diagonal=True, explainability_normalization="relative", device=None, beam_size=1,
-                   pretrained_model=None, teacher_forcing=None, beam_search_early_stopping=True, ignore_attention=False):
+                   pretrained_model=None, teacher_forcing=False, beam_search_early_stopping=True, ignore_attention=False,
+                   direction="src2trg", print_sentences_info=False):
     # Load NLLB
     assert isinstance(source_text, str), type(source_text)
     assert isinstance(target_text, str), type(target_text)
+    assert len(source_text) > 0
+    assert len(target_text) > 0
+    assert direction in ("src2trg", "trg2src"), direction
 
     if not pretrained_model:
         pretrained_model = "facebook/nllb-200-distilled-600M"
 
     global model, tokenizer, translator_pipeline
+
+    if direction == "src2trg":
+        pass
+    elif direction == "trg2src":
+        source_text, target_text = target_text, source_text
+        source_lang, target_lang = target_lang, source_lang
+    else:
+        raise Exception(f"Unknown direction: {direction}")
+
+    if print_sentences_info:
+        print(f"The next sentence (source) is expected to be {source_lang}: {source_text}")
+        print(f"The next sentence (target) is expected to be {target_lang}: {target_text}")
+
+        if direction == "src2trg":
+            pass
+        elif direction == "trg2src":
+            print(f"The previous sentences are reversed from their original column order because direction={direction} (langs also have been reversed)")
+        else:
+            raise Exception(f"Unknown direction: {direction}")
 
     batch_size = 1
 
@@ -236,19 +259,10 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
     # _from_model_config : https://github.com/huggingface/transformers/blob/52cb4034ada381fe1ffe8d428a1076e5411a8026/src/transformers/trainer_seq2seq.py#L315
     #  ... it handles the generation configuration override by the user, so we do not need to worry about it
 
-    if teacher_forcing is None:
-        teacher_forcing = bool(target_text)
-    else:
-        if teacher_forcing:
-            assert bool(target_text), "Teacher forcing is enabled but no target text is available"
-
     if teacher_forcing and beam_size != 1:
         print(f"warning: beam_size is going to be modified ({beam_size} -> 1) because teacher forcing is enabled")
 
         beam_size = 1
-
-    if not teacher_forcing:
-        assert len(target_text) > 0, "If teacher forcing is disabled, reference text is not optional. If teacher forcing is enabled, the reference text is the translated text itself"
 
     initial_provided_target_text_tokens = tokenizer(target_text, return_tensors="pt", add_special_tokens=False).input_ids[0].tolist()
     initial_provided_target_text_tokens = [decoder_start_token_id, target_lang_id] + initial_provided_target_text_tokens
@@ -373,6 +387,7 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
     # Attention, and gradients hook
 
     attentions_grad_store = {}
+    attentions_grad_store_handlers = {}
 
     assert len(model_output.encoder_attentions) == num_hidden_layers, f"{len(model_output.encoder_attentions)} != {num_hidden_layers}"
     assert len(model_output.decoder_attentions) == num_hidden_layers, f"{len(model_output.decoder_attentions)} != {num_hidden_layers}"
@@ -385,11 +400,14 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
         } for l in range(num_hidden_layers)}
 
     for layer in range(num_hidden_layers):
+        attentions_grad_store_handlers[layer] = {}
+
         for component in ("encoder", "decoder", "cross"):
             attentions[layer][component].requires_grad
 
             attentions[layer][component].retain_grad()
-            attentions[layer][component].register_hook(capture_attention_grads(layer, component, attentions_grad_store))
+            handler = attentions[layer][component].register_hook(capture_attention_grads(layer, component, attentions_grad_store))
+            attentions_grad_store_handlers[layer][component] = handler # handler.remove(): https://pytorch.org/docs/stable/generated/torch.Tensor.register_hook.html
 
     source_text_seq_len = len(inputs.input_ids[0])
     target_text_seq_len_attention = len(generated_tokens_wo_last_token)
@@ -479,7 +497,7 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
             attention = attentions[layer][component]
 
             if ignore_attention:
-                attention = np.ones_like(attention)
+                attention = torch.ones_like(attention)
 
             assert gradient.shape == attention.shape, f"{gradient.shape} != {attention.shape}"
 
@@ -579,16 +597,19 @@ def explainability(source_text, target_text='', source_lang="eng_Latn", target_l
 if __name__ == "__main__":
     debug = False # Change manually
     source_text = sys.argv[1]
-    target_text = sys.argv[2] if len(sys.argv) > 2 else '' # Teacher forcing
+    target_text = sys.argv[2]
     source_lang = sys.argv[3] if (len(sys.argv) > 3 and len(sys.argv[3]) > 0) else "eng_Latn" # e.g., eng_Latn
     target_lang = sys.argv[4] if (len(sys.argv) > 4 and len(sys.argv[4]) > 0) else "spa_Latn" # e.g., spa_Latn
     beam_size = int(sys.argv[5]) if len(sys.argv) > 5 else 4
     device = sys.argv[6] if (len(sys.argv) > 6 and len(sys.argv[6]) > 0) else None
     pickle_prefix_filename = sys.argv[7] if (len(sys.argv) > 7 and len(sys.argv[7]) > 0) else ''
     pretrained_model = sys.argv[8] if (len(sys.argv) > 8 and len(sys.argv[8]) > 0) else None
-    teacher_forcing = sys.argv[9] if (len(sys.argv) > 9 and len(sys.argv[9]) > 0) else None # None -> automatic
-    ignore_attention = bool(int(sys.argv[10])) if len(sys.argv) > 10 and len(sys.argv[10]) > 0 else ''
-    colorize_output_prefix = sys.argv[11] if len(sys.argv) > 11 and len(sys.argv[11]) > 0 else ''
+    teacher_forcing = bool(int(sys.argv[9])) if len(sys.argv) > 9 and len(sys.argv[9]) > 0 else False
+    ignore_attention = bool(int(sys.argv[10])) if len(sys.argv) > 10 and len(sys.argv[10]) > 0 else False
+    direction = sys.argv[11] if len(sys.argv) > 11 and len(sys.argv[11]) > 0 else "src2trg"
+    colorize_output_prefix = sys.argv[12] if len(sys.argv) > 12 and len(sys.argv[12]) > 0 else ''
+
+    assert direction in ("src2trg", "trg2src"), direction
 
     if pickle_prefix_filename:
         debug = False
@@ -611,14 +632,6 @@ if __name__ == "__main__":
         source_text = [source_text]
         target_text = [target_text]
 
-    if teacher_forcing is None:
-        teacher_forcing = bool(target_text[0])
-    else:
-        if teacher_forcing in ("yes", "no"):
-            teacher_forcing = True if teacher_forcing == "yes" else False
-        else:
-            teacher_forcing = bool(int(teacher_forcing))
-
     if teacher_forcing and ignore_attention:
         print(f"warning: ignore_attention=True is intended to work when teacher_forcing=False, but teacher_forcing is True")
 
@@ -628,15 +641,16 @@ if __name__ == "__main__":
               "if regerence < generation -> truncation (should not be harmful), but lost tokens will not have attention values (although available values will be quite similar to the result without truncation)")
 
     teacher_forcing_str = "yes" if teacher_forcing else "no"
+    ignore_attention_str = "yes" if ignore_attention else "no"
 
-    print(f"Translating from {source_lang} to {target_lang} (teacher forcing: {teacher_forcing_str} : ignore attention: {ignore_attention})")
+    print(f"Translating from {source_lang} to {target_lang} (teacher forcing: {teacher_forcing_str} : ignore attention: {ignore_attention_str})")
 
     pickle_data = {
                 "explainability_encoder": [],
                 "explainability_decoder": [],
                 "explainability_cross": [],
             }
-    fn_pickle_array = f"{pickle_prefix_filename}.{source_lang}.{target_lang}.teacher_forcing_{teacher_forcing_str}.pickle"
+    fn_pickle_array = f"{pickle_prefix_filename}.{direction}.{source_lang}.{target_lang}.teacher_forcing_{teacher_forcing_str}.ignore_attention_{ignore_attention_str}.pickle"
 
     for idx, (_source_text, _target_text) in enumerate(zip(source_text, target_text), 1):
         if not pickle_prefix_filename:
@@ -645,12 +659,12 @@ if __name__ == "__main__":
             print(f"Target text: {_target_text}")
 
         input_tokens, output_tokens, output, r_ee, r_dd, r_de = \
-            explainability(_source_text, target_text=_target_text, source_lang=source_lang,
-                           target_lang=target_lang, debug=debug, beam_size=beam_size, device=device,
+            explainability(_source_text, _target_text, source_lang=source_lang, target_lang=target_lang,
+                           debug=debug, beam_size=beam_size, device=device,
                            self_attention_remove_diagonal=self_attention_remove_diagonal,
                            explainability_normalization=explainability_normalization,
                            pretrained_model=pretrained_model, teacher_forcing=teacher_forcing,
-                           ignore_attention=ignore_attention)
+                           ignore_attention=ignore_attention, direction=direction)
 
         # Print results
 
