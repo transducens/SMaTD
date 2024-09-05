@@ -9,7 +9,7 @@ import transformers
 source_lang = sys.argv[1] # e.g., eng_Latn (check https://github.com/facebookresearch/flores/blob/main/flores200/README.md#languages-in-flores-200)
 target_lang = sys.argv[2]
 batch_size = int(sys.argv[3]) if len(sys.argv) > 3 and len(sys.argv[3]) > 0 else 16
-pretrained_model = sys.argv[4] if len(sys.argv) > 4 else "facebook/nllb-200-600M"
+pretrained_model = sys.argv[4] if len(sys.argv) > 4 and len(sys.argv[4]) > 0 else "facebook/nllb-200-distilled-600M"
 beam_size = int(sys.argv[5]) if len(sys.argv) > 5 and len(sys.argv[5]) > 0 else 4 # 4 is the value used in the paper to train the destilled models
 
 assert batch_size > 0, batch_size

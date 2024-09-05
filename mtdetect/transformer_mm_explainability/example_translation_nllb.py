@@ -173,8 +173,8 @@ def explainability(source_text, target_text, source_lang="eng_Latn", target_lang
     # Load NLLB
     assert isinstance(source_text, str), type(source_text)
     assert isinstance(target_text, str), type(target_text)
-    assert len(source_text) > 0
-    assert len(target_text) > 0
+    #assert len(source_text) > 0 # empty sentences are also allowed
+    #assert len(target_text) > 0 # empty sentences are also allowed
     assert direction in ("src2trg", "trg2src"), direction
 
     if not pretrained_model:

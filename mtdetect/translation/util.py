@@ -99,6 +99,13 @@ def print_translation(translations, batch):
 
         print(f"{sentence}\t{translation}")
 
+        diff_perc = 100. - len(translation) * 100. / len(sentence)
+
+        if len(translation) == 0:
+            sys.stderr.write(f"Empty translation for the following sentence: {sentence}\n")
+        if abs(diff_perc) > 20.:
+            sys.stderr.write(f"Translated sentence length is {'greater' if diff_perc < 0. else 'less'} than 20% compared to the source ({abs(diff_perc)}%): {sentence}\t{translation}\n")
+
     sys.stdout.flush()
 
     return []
