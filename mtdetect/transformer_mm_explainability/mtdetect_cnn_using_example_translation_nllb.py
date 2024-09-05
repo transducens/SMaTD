@@ -31,7 +31,7 @@ source_lang = default_sys_argv(7, "eng_Latn")
 source_lang = source_lang if source_lang != '' else "eng_Latn"
 target_lang = default_sys_argv(8, "spa_Latn")
 target_lang = target_lang if target_lang != '' else "spa_Latn"
-direction = default_sys_argv(9, "src2trg")
+direction = default_sys_argv(9, ["src2trg"], f=lambda q: ["src2trg"] if q == '' else [_q for _q in q.split('+')])
 attention_matrix = default_sys_argv(10, "encoder+decoder+cross")
 attention_matrix = attention_matrix.split('+') # The order is not important (i.e., cross+decoder should be equivalent to decoder+cross) -> sorted
 explainability_normalization = default_sys_argv(11, "none")
@@ -42,8 +42,13 @@ save_model_path = default_sys_argv(14, '')
 learning_rate = default_sys_argv(15, 5e-3, f=float)
 multichannel = default_sys_argv(16, True, f=lambda q: bool(int(q)))
 pretrained_model = default_sys_argv(17, '')
-teacher_forcing = default_sys_argv(18, False, f=lambda q: None if q == '' else bool(int(q)))
-ignore_attention = default_sys_argv(19, False, f=lambda q: False if q == '' else bool(int(q)))
+teacher_forcing = default_sys_argv(18, [False], f=lambda q: [False] if q == '' else [bool(int(_q)) for _q in q.split('+')])
+ignore_attention = default_sys_argv(19, [False], f=lambda q: [False] if q == '' else [bool(int(_q)) for _q in q.split('+')])
+force_pickle_file = True # Change manually
+skip_test = False # Change manually
+
+if skip_test:
+    print(f"warning: test set evaluation is disabled")
 
 for _attention_matrix in attention_matrix:
     assert _attention_matrix in ("encoder", "decoder", "cross"), attention_matrix
@@ -61,7 +66,6 @@ if multichannel and len(cnn_pooling) < len(attention_matrix):
 if not multichannel:
     assert len(cnn_pooling) == 1, cnn_pooling
 
-assert direction in ("src2trg", "trg2src"), direction
 assert explainability_normalization in ("none", "absolute", "relative"), explainability_normalization
 assert cnn_max_width > 0, cnn_max_width
 assert cnn_max_height > 0, cnn_max_height
@@ -74,16 +78,17 @@ translation_model_conf = {
     "attention_matrix": attention_matrix,
     "explainability_normalization": explainability_normalization,
     "self_attention_remove_diagonal": self_attention_remove_diagonal,
+    "teacher_forcing": teacher_forcing,
+    "ignore_attention": ignore_attention,
 }
 translation_model_conf = json.dumps(translation_model_conf, indent=4)
 
 print(f"NLLB conf:\n{translation_model_conf}")
 
-channels = 1 if multichannel else len(attention_matrix)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 patience = 100
 
-def extend_tensor_with_zeros(t, max_width, max_height, device):
+def extend_tensor_with_zeros_and_truncate(t, max_width, max_height, device):
     assert len(t.shape) == 2
 
     result = torch.zeros((max_width, max_height)).to(device)
@@ -94,7 +99,7 @@ def extend_tensor_with_zeros(t, max_width, max_height, device):
 def read(filename, direction, source_lang, target_lang, self_attention_remove_diagonal, explainability_normalization,
          focus=["explainability_cross"], store_explainability_arrays=True, load_explainability_arrays=True,
          device=None, pretrained_model=None, pickle_template=None, pickle_check_env=True, teacher_forcing=False,
-         ignore_attention=False):
+         ignore_attention=False, force_pickle_file=False):
     cnn_width = -np.inf
     cnn_height = -np.inf
     loaded_samples = 0
@@ -109,6 +114,9 @@ def read(filename, direction, source_lang, target_lang, self_attention_remove_di
     fd = open(filename)
     fn_pickle_array = None
 
+    if force_pickle_file:
+        assert load_explainability_arrays
+
     if pickle_check_env:
         envvar_prefix = "MTDETECT_PICKLE_FN"
         envvar = envvar_prefix
@@ -122,15 +130,27 @@ def read(filename, direction, source_lang, target_lang, self_attention_remove_di
         if envvar in os.environ:
             fn_pickle_array = os.environ[envvar]
 
-            if pickle_template and envvar == envvar_prefix:
-                fn_pickle_array = fn_pickle_array.replace("{template}", pickle_template)
+            if envvar == envvar_prefix:
+                if pickle_template:
+                    fn_pickle_array = fn_pickle_array.replace("{template}", pickle_template)
 
-    if not fn_pickle_array or not os.path.isfile(fn_pickle_array):
+                fn_pickle_array = fn_pickle_array.replace("{direction}", direction)
+                fn_pickle_array = fn_pickle_array.replace("{teacher_forcing}", "yes" if teacher_forcing else "no")
+                fn_pickle_array = fn_pickle_array.replace("{ignore_attention}", "yes" if ignore_attention else "no")
+
+    fn_pickle_array_exists = os.path.isfile(fn_pickle_array)
+
+    if not fn_pickle_array or not fn_pickle_array_exists:
+        if fn_pickle_array:
+            print(f"warning: provided envvar pickle path, but we could not find it: {fn_pickle_array}")
+
         teacher_forcing_str = "yes" if teacher_forcing else "no"
         ignore_attention_str = "yes" if ignore_attention else "no"
         fn_pickle_array = f"{filename}.{direction}.{source_lang}.{target_lang}.teacher_forcing_{teacher_forcing_str}.ignore_attention_{ignore_attention_str}.pickle"
 
     fn_pickle_array_exists = os.path.isfile(fn_pickle_array)
+
+    assert fn_pickle_array_exists if force_pickle_file else True, f"Pickle file not found: {fn_pickle_array}"
 
     if load_explainability_arrays and fn_pickle_array_exists:
         print(f"Loading explainability arrays: {fn_pickle_array}")
@@ -264,7 +284,7 @@ def get_data(explainability_matrix, labels, loaded_samples, cnn_width, cnn_heigh
 
         assert len(_input.shape) == 2
 
-        _input = extend_tensor_with_zeros(_input, cnn_width, cnn_height, device)
+        _input = extend_tensor_with_zeros_and_truncate(_input, cnn_width, cnn_height, device)
         _input = _input.tolist()
 
         inputs.append(_input)
@@ -283,45 +303,105 @@ def get_data(explainability_matrix, labels, loaded_samples, cnn_width, cnn_heigh
 
     return inputs, labels
 
-train_data = read(train_filename, direction, source_lang, target_lang, self_attention_remove_diagonal, explainability_normalization,
-                  focus=attention_matrix, device=device, pretrained_model=pretrained_model, pickle_template="train",
-                  teacher_forcing=teacher_forcing, ignore_attention=ignore_attention)
-dev_data = read(dev_filename, direction, source_lang, target_lang, self_attention_remove_diagonal, explainability_normalization,
-                  focus=attention_matrix, device=device, pretrained_model=pretrained_model, pickle_template="dev",
-                  teacher_forcing=teacher_forcing, ignore_attention=ignore_attention)
-test_data = read(test_filename, direction, source_lang, target_lang, self_attention_remove_diagonal, explainability_normalization,
-                  focus=attention_matrix, device=device, pretrained_model=pretrained_model, pickle_template="test",
-                  teacher_forcing=teacher_forcing, ignore_attention=ignore_attention)
-cnn_width = max(train_data["cnn_width"], dev_data["cnn_width"], test_data["cnn_width"])
-cnn_height = max(train_data["cnn_height"], dev_data["cnn_height"], test_data["cnn_height"])
+for d in direction:
+    assert d in ("src2trg", "trg2src"), d
 
-for idx, _attention_matrix in enumerate(attention_matrix):
-    inputs = f"inputs_{_attention_matrix}"
-    train_data[inputs], train_data["labels"] = get_data(train_data[_attention_matrix], train_data["labels"], train_data["loaded_samples"], cnn_width, cnn_height, device, convert_labels_to_tensor=not bool(idx))
-    dev_data[inputs], dev_data["labels"] = get_data(dev_data[_attention_matrix], dev_data["labels"], dev_data["loaded_samples"], cnn_width, cnn_height, device, convert_labels_to_tensor=not bool(idx))
-    test_data[inputs], test_data["labels"] = get_data(test_data[_attention_matrix], test_data["labels"], test_data["loaded_samples"], cnn_width, cnn_height, device, convert_labels_to_tensor=not bool(idx))
+channels_factor_len_set = set([len(direction), len(teacher_forcing), len(ignore_attention)])
+
+assert len(channels_factor_len_set) in (1, 2), channels_factor_len_set
+
+if len(channels_factor_len_set) == 2:
+    assert 1 in channels_factor_len_set, channels_factor_len_set
+
+if multichannel:
+    channels = 1
+    channels_factor = 1
+else:
+    # Expected: for each value provided to direction, teacher_forcing, and ignore_attention, we will have an extra set of len(attention_matrix) channels
+    # Example: {direction: src2trg+trg2src, teacher_forcing: True+False, ignore_attention: False} -> [(src2trg, True, False), (trg2src, False, False)] # ignore_attention is expanded
+    # Example: {direction: src2trg+src2trg+trg2src+trg2src, teacher_forcing: True+False+True+False, ignore_attention: False+True+False+True} -> [(src2trg, True, False), (src2trg, False, True), (trg2src, True, False), (trg2src, False, True)]
+    channels = len(attention_matrix)
+
+    channels_factor = max(channels_factor_len_set)
+    direction *= 1 if len(direction) else channels_factor
+    teacher_forcing *= 1 if len(teacher_forcing) else channels_factor
+    ignore_attention *= 1 if len(ignore_attention) else channels_factor
+
+channels *= channels_factor
+
+print(f"Total channels: {channels} (factor: {channels_factor})")
+
+if channels_factor > 1 and not force_pickle_file:
+    print(f"warning: channels_factor={channels_factor} > 1, and force_pickle_file=False: it may be very slow to create all the pickle files if they do not exist (they may exist)")
+
+cnn_width = -np.inf
+cnn_height = -np.inf
+data_input_all_keys = []
+first_time = True
+
+for _direction, _teacher_forcing, _ignore_attention in zip(direction, teacher_forcing, ignore_attention):
+    # TODO we are reading the files several times...
+
+    train_data = read(train_filename, _direction, source_lang, target_lang, self_attention_remove_diagonal, explainability_normalization,
+                      focus=attention_matrix, device=device, pretrained_model=pretrained_model, pickle_template="train",
+                      teacher_forcing=_teacher_forcing, ignore_attention=_ignore_attention, force_pickle_file=force_pickle_file)
+    dev_data = read(dev_filename, _direction, source_lang, target_lang, self_attention_remove_diagonal, explainability_normalization,
+                    focus=attention_matrix, device=device, pretrained_model=pretrained_model, pickle_template="dev",
+                    teacher_forcing=_teacher_forcing, ignore_attention=_ignore_attention, force_pickle_file=force_pickle_file)
+
+    if skip_test:
+        test_data = {"cnn_width": -np.inf, "cnn_height": -np.inf}
+    else:
+        test_data = read(test_filename, _direction, source_lang, target_lang, self_attention_remove_diagonal, explainability_normalization,
+                         focus=attention_matrix, device=device, pretrained_model=pretrained_model, pickle_template="test",
+                         teacher_forcing=_teacher_forcing, ignore_attention=_ignore_attention, force_pickle_file=force_pickle_file)
+
+    cnn_width = max(train_data["cnn_width"], dev_data["cnn_width"], test_data["cnn_width"], cnn_width)
+    cnn_height = max(train_data["cnn_height"], dev_data["cnn_height"], test_data["cnn_height"], cnn_height)
+
+    for _attention_matrix in attention_matrix:
+        inputs = f"{_attention_matrix}_{_direction}_{_teacher_forcing}_{_ignore_attention}"
+        train_data[f"inputs_{inputs}"], train_data["labels"] = get_data(train_data[_attention_matrix], train_data["labels"], train_data["loaded_samples"], cnn_width, cnn_height, device, convert_labels_to_tensor=first_time)
+        dev_data[f"inputs_{inputs}"], dev_data["labels"] = get_data(dev_data[_attention_matrix], dev_data["labels"], dev_data["loaded_samples"], cnn_width, cnn_height, device, convert_labels_to_tensor=first_time)
+
+        if not skip_test:
+            test_data[f"inputs_{inputs}"], test_data["labels"] = get_data(test_data[_attention_matrix], test_data["labels"], test_data["loaded_samples"], cnn_width, cnn_height, device, convert_labels_to_tensor=first_time)
+
+        first_time = False
+
+        data_input_all_keys.append(inputs)
+
+data_input_all_keys = sorted(data_input_all_keys)
 
 print(f"CNN width and height: {cnn_width} {cnn_height}")
 
 class MyDataset(Dataset):
-    def __init__(self, data, attention_matrix, create_groups=False, return_group=False):
+    def __init__(self, data, all_keys, create_groups=False, return_group=False):
         self.create_groups = create_groups
         self.return_group = return_group
-        self.attention_matrix = attention_matrix
         self.data = {}
         self.uniq_groups = []
+        self.all_keys = all_keys
 
         if create_groups:
             self.groups = data["groups"]
         else:
             self.groups = list(range(len(data["labels"])))
 
-        for i in range(len(self.attention_matrix) - 1):
-            _attention_matrix1 = self.attention_matrix[i]
-            _attention_matrix2 = self.attention_matrix[i + 1]
+            if "groups" in data:
+                assert len(data["groups"]) == len(self.groups)
 
-            assert len(data[f"inputs_{_attention_matrix1}"]) == len(data[f"inputs_{_attention_matrix2}"])
-            assert len(data[f"inputs_{_attention_matrix1}"]) == len(data["labels"])
+                _set_groups = set(data["groups"])
+
+                if len(_set_groups) < len(self.groups):
+                    print("warning: create_groups=False, but groups were provided, and there are groups with >1 element: {len(self.groups) - len(_set_groups)} groups with >1 element")
+
+        for i in range(len(self.all_keys) - 1):
+            k1 = self.all_keys[i]
+            k2 = self.all_keys[i + 1]
+
+            assert len(data[f"inputs_{k1}"]) == len(data[f"inputs_{k2}"])
+            assert len(data[f"inputs_{k1}"]) == len(data["labels"])
 
         assert len(data["labels"]) == len(self.groups)
 
@@ -331,12 +411,12 @@ class MyDataset(Dataset):
             if group not in self.data:
                 self.uniq_groups.append(group)
                 self.data[group] = {
-                    'x': {_attention_matrix: [] for _attention_matrix in self.attention_matrix},
+                    'x': {k: [] for k in self.all_keys},
                     'y': [],
                 }
 
-            for _attention_matrix in self.attention_matrix:
-                self.data[group]['x'][_attention_matrix].append(data[f"inputs_{_attention_matrix}"][idx])
+            for k in self.all_keys:
+                self.data[group]['x'][k].append(data[f"inputs_{k}"][idx])
 
             self.data[group]['y'].append(data["labels"][idx])
 
@@ -353,10 +433,10 @@ class MyDataset(Dataset):
 
             y = y[0]
 
-            for _attention_matrix in self.attention_matrix:
-                assert len(x[_attention_matrix]) == 1
+            for k in self.all_keys:
+                assert len(x[k]) == 1
 
-                x[_attention_matrix] = x[_attention_matrix][0]
+                x[k] = x[k][0]
 
         if self.return_group:
             return x, y, group
@@ -387,12 +467,11 @@ def select_random_group_collate_fn(batch):
     return data, target
 
 class SimpleCNN(nn.Module):
-    def __init__(self, c, w, h, num_classes, attention_matrix, pooling="max", only_conv=True):
+    def __init__(self, c, w, h, num_classes, all_keys, pooling="max", only_conv=True):
         super(SimpleCNN, self).__init__()
 
         self.only_conv = only_conv
-        self.attention_matrix = attention_matrix
-        self._attention_matrix = sorted(self.attention_matrix)
+        self.all_keys = all_keys
         self.channels = c
         self.dimensions = (w, h)
 
@@ -450,7 +529,7 @@ class SimpleCNN(nn.Module):
 
     def forward(self, x):
         if isinstance(x, dict):
-            x = torch.cat([x[k] for k in self._attention_matrix], dim=1)
+            x = torch.cat([x[k] for k in self.all_keys], dim=1)
 
             assert x.shape[1:] == (self.channels, *self.dimensions), x.shape
 
@@ -466,17 +545,16 @@ class SimpleCNN(nn.Module):
         return x
 
 class MultiChannelCNN(nn.Module):
-    def __init__(self, num_classes, simple_cnns, attention_matrix):
+    def __init__(self, num_classes, simple_cnns, all_keys):
         super(MultiChannelCNN, self).__init__()
 
-        self.attention_matrix = attention_matrix
-        self._attention_matrix = sorted(self.attention_matrix)
+        self.all_keys = all_keys
 
         for k, simple_cnn in simple_cnns.items():
-            assert k in attention_matrix
+            assert k in self.all_keys
             assert isinstance(simple_cnn, SimpleCNN), type(simple_cnn)
 
-        assert len(self.attention_matrix) == len(simple_cnns)
+        assert len(self.all_keys) == len(simple_cnns)
 
         self.simple_cnns = nn.ModuleDict({k: v for k, v in simple_cnns.items()})
         self._to_linear = {k: simple_cnns[k]._to_linear for k in simple_cnns.keys()}
@@ -504,8 +582,8 @@ class MultiChannelCNN(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
-        x = [self.simple_cnns[k](x[k]) for k in self._attention_matrix]
-        x = [_x.view(-1, self._to_linear[k]) for _x, k in zip(x, self._attention_matrix)]
+        x = [self.simple_cnns[k](x[k]) for k in self.all_keys]
+        x = [_x.view(-1, self._to_linear[k]) for _x, k in zip(x, self.all_keys)]
         x = torch.cat(x, dim=1)
         x = F.relu(self.fc1(x))
         x = self.dropout(x)
@@ -533,7 +611,7 @@ def apply_inference(model, data, target=None, loss_function=None, threshold=0.5)
 
     return results
 
-def eval(model, dataloader, attention_matrix, device):
+def eval(model, dataloader, all_keys, device):
     training = model.training
 
     model.eval()
@@ -542,7 +620,7 @@ def eval(model, dataloader, attention_matrix, device):
     all_labels = []
 
     for data, target in dataloader:
-        data = {k: data[k].to(device) for k in attention_matrix}
+        data = {k: data[k].to(device) for k in all_keys}
         results = apply_inference(model, data, target=None, loss_function=None)
         outputs_classification = results["outputs_classification_detach_list"]
         labels = target.cpu()
@@ -562,10 +640,10 @@ def eval(model, dataloader, attention_matrix, device):
 
 # Load data
 num_workers = 0
-train_dataset = MyDataset(train_data, attention_matrix, create_groups=True, return_group=True)
+train_dataset = MyDataset(train_data, data_input_all_keys, create_groups=True, return_group=True)
 train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers,
                               collate_fn=select_random_group_collate_fn)
-dev_dataset = MyDataset(dev_data, attention_matrix)
+dev_dataset = MyDataset(dev_data, data_input_all_keys)
 dev_dataloader = DataLoader(dev_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
 # Model
@@ -573,10 +651,10 @@ num_classes = 1
 epochs = 500
 
 if multichannel:
-    simple_cnns = {k: SimpleCNN(channels, cnn_width, cnn_height, num_classes, attention_matrix, pooling=pooling, only_conv=True) for k, pooling in zip(attention_matrix, cnn_pooling)}
-    model = MultiChannelCNN(num_classes, simple_cnns, attention_matrix)
+    simple_cnns = {k: SimpleCNN(channels, cnn_width, cnn_height, num_classes, data_input_all_keys, pooling=pooling, only_conv=True) for k, pooling in zip(data_input_all_keys, cnn_pooling)}
+    model = MultiChannelCNN(num_classes, simple_cnns, data_input_all_keys)
 else:
-    model = SimpleCNN(channels, cnn_width, cnn_height, num_classes, attention_matrix, pooling=cnn_pooling[0], only_conv=False)
+    model = SimpleCNN(channels, cnn_width, cnn_height, num_classes, data_input_all_keys, pooling=cnn_pooling[0], only_conv=False)
 
 model = model.to(device)
 
@@ -599,8 +677,8 @@ sys.stdout.flush()
 for epoch in range(epochs):
     print(f"Epoch {epoch}")
 
-    train_results = eval(model, train_dataloader, attention_matrix, device)
-    dev_results = eval(model, dev_dataloader, attention_matrix, device)
+    train_results = eval(model, train_dataloader, data_input_all_keys, device)
+    dev_results = eval(model, dev_dataloader, data_input_all_keys, device)
     better_loss_result = False
 
     if epoch_loss is not None and epoch_loss < early_stopping_best_loss:
@@ -647,7 +725,7 @@ for epoch in range(epochs):
         break
 
     for batch_idx, (data, target) in enumerate(train_dataloader, 1):
-        data = {k: data[k].to(device) for k in attention_matrix}
+        data = {k: data[k].to(device) for k in data_input_all_keys}
         target = target.to(device)
 
         model.zero_grad()
@@ -673,7 +751,7 @@ if save_model_path:
 
     model = torch.load(save_model_path, weights_only=False, map_location=device)
 
-train_results = eval(model, train_dataloader, attention_matrix, device)
+train_results = eval(model, train_dataloader, data_input_all_keys, device)
 
 print(f"Final train eval: {train_results}")
 
@@ -682,18 +760,19 @@ del train_dataloader
 
 torch.cuda.empty_cache()
 
-dev_results = eval(model, dev_dataloader, attention_matrix, device)
+dev_results = eval(model, dev_dataloader, data_input_all_keys, device)
 
 print(f"Final dev eval: {dev_results}")
 
-del dev_dataset
-del dev_dataloader
+if not skip_test:
+    del dev_dataset
+    del dev_dataloader
 
-torch.cuda.empty_cache()
+    torch.cuda.empty_cache()
 
-test_dataset = MyDataset(test_data, attention_matrix)
-test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    test_dataset = MyDataset(test_data, data_input_all_keys)
+    test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
-test_results = eval(model, test_dataloader, attention_matrix, device)
+    test_results = eval(model, test_dataloader, data_input_all_keys, device)
 
-print(f"Final test eval: {test_results}")
+    print(f"Final test eval: {test_results}")
