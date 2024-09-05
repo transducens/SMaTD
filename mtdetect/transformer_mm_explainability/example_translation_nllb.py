@@ -621,6 +621,15 @@ if __name__ == "__main__":
 
     print(f"Provided args: {sys.argv}")
 
+    if teacher_forcing and ignore_attention:
+        print(f"warning: ignore_attention=True is intended to work when teacher_forcing=False, but teacher_forcing is True")
+
+    if not teacher_forcing:
+        print("warning: teacher_forcing is disabled: padding/truncation is applied to the generated text to match the shape of the reference tokens (decoder and cross-attention shape will be affected): "
+              "if reference > generation -> padding (should not be harmful), but attention shape will be longer due to padding tokens (these will affect slightly or none to the attention values of the non-padding tokens); "
+              "if regerence < generation -> truncation (should not be harmful), but lost tokens will not have attention values (although available values will be quite similar to the result without truncation)")
+        print(f"warning: teacher_forcing is disabled: the provided reference will be used to obtain the gradients: {target_text} (if '-', sentences read from stdin)")
+
     if source_text == '-' or target_text == '-':
         source_text, target_text = [], []
         for l in sys.stdin:
@@ -631,14 +640,6 @@ if __name__ == "__main__":
     else:
         source_text = [source_text]
         target_text = [target_text]
-
-    if teacher_forcing and ignore_attention:
-        print(f"warning: ignore_attention=True is intended to work when teacher_forcing=False, but teacher_forcing is True")
-
-    if not teacher_forcing:
-        print("warning: teacher_forcing is disabled: padding/truncation is applied to the generated text to match the shape of the reference tokens (decoder and cross-attention shape will be affected): "
-              "if reference > generation -> padding (should not be harmful), but attention shape will be longer due to padding tokens (these will affect slightly or none to the attention values of the non-padding tokens); "
-              "if regerence < generation -> truncation (should not be harmful), but lost tokens will not have attention values (although available values will be quite similar to the result without truncation)")
 
     teacher_forcing_str = "yes" if teacher_forcing else "no"
     ignore_attention_str = "yes" if ignore_attention else "no"
