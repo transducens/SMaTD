@@ -56,16 +56,10 @@ for _attention_matrix in attention_matrix:
 for _cnn_pooling in cnn_pooling:
     assert _cnn_pooling in ("max", "avg"), cnn_pooling
 
-assert len(cnn_pooling) <= len(attention_matrix)
+for _direction in direction:
+    assert _direction in ("src2trg", "trg2src"), _direction
 
-if multichannel and len(cnn_pooling) < len(attention_matrix):
-    assert len(cnn_pooling) == 1, cnn_pooling
-
-    cnn_pooling = [cnn_pooling[0]] * len(attention_matrix)
-
-if not multichannel:
-    assert len(cnn_pooling) == 1, cnn_pooling
-
+assert len(cnn_pooling) in (1, len(attention_matrix)), cnn_pooling
 assert explainability_normalization in ("none", "absolute", "relative"), explainability_normalization
 assert cnn_max_width > 0, cnn_max_width
 assert cnn_max_height > 0, cnn_max_height
@@ -284,7 +278,7 @@ def get_data(explainability_matrix, labels, loaded_samples, cnn_width, cnn_heigh
 
         assert len(_input.shape) == 2
 
-        _input = extend_tensor_with_zeros_and_truncate(_input, cnn_width, cnn_height, device)
+        _input = extend_tensor_with_zeros_and_truncate(_input, cnn_width, cnn_height, None)
         _input = _input.tolist()
 
         inputs.append(_input)
@@ -303,9 +297,6 @@ def get_data(explainability_matrix, labels, loaded_samples, cnn_width, cnn_heigh
 
     return inputs, labels
 
-for d in direction:
-    assert d in ("src2trg", "trg2src"), d
-
 channels_factor_len_set = set([len(direction), len(teacher_forcing), len(ignore_attention)])
 
 assert len(channels_factor_len_set) in (1, 2), channels_factor_len_set
@@ -316,17 +307,20 @@ if len(channels_factor_len_set) == 2:
 if multichannel:
     channels = 1
     channels_factor = 1
+    cnn_pooling *= 1 if len(cnn_pooling) > 1 else len(attention_matrix)
+    cnn_pooling *= max(channels_factor_len_set)
 else:
     # Expected: for each value provided to direction, teacher_forcing, and ignore_attention, we will have an extra set of len(attention_matrix) channels
     # Example: {direction: src2trg+trg2src, teacher_forcing: True+False, ignore_attention: False} -> [(src2trg, True, False), (trg2src, False, False)] # ignore_attention is expanded
     # Example: {direction: src2trg+src2trg+trg2src+trg2src, teacher_forcing: True+False+True+False, ignore_attention: False+True+False+True} -> [(src2trg, True, False), (src2trg, False, True), (trg2src, True, False), (trg2src, False, True)]
     channels = len(attention_matrix)
-
     channels_factor = max(channels_factor_len_set)
-    direction *= 1 if len(direction) else channels_factor
-    teacher_forcing *= 1 if len(teacher_forcing) else channels_factor
-    ignore_attention *= 1 if len(ignore_attention) else channels_factor
 
+    assert len(cnn_pooling) == 1, cnn_pooling
+
+direction *= 1 if len(direction) > 1 else max(channels_factor_len_set)
+teacher_forcing *= 1 if len(teacher_forcing) > 1 else max(channels_factor_len_set)
+ignore_attention *= 1 if len(ignore_attention) > 1 else max(channels_factor_len_set)
 channels *= channels_factor
 
 print(f"Total channels: {channels} (factor: {channels_factor})")
@@ -337,30 +331,41 @@ if channels_factor > 1 and not force_pickle_file:
 cnn_width = -np.inf
 cnn_height = -np.inf
 data_input_all_keys = []
-first_time = True
+train_data = {}
+dev_data = {}
+test_data = {}
+
+assert len(direction) == len(teacher_forcing) == len(ignore_attention)
 
 for _direction, _teacher_forcing, _ignore_attention in zip(direction, teacher_forcing, ignore_attention):
     # TODO we are reading the files several times...
 
-    train_data = read(train_filename, _direction, source_lang, target_lang, self_attention_remove_diagonal, explainability_normalization,
+    _train_data = read(train_filename, _direction, source_lang, target_lang, self_attention_remove_diagonal, explainability_normalization,
                       focus=attention_matrix, device=device, pretrained_model=pretrained_model, pickle_template="train",
                       teacher_forcing=_teacher_forcing, ignore_attention=_ignore_attention, force_pickle_file=force_pickle_file)
-    dev_data = read(dev_filename, _direction, source_lang, target_lang, self_attention_remove_diagonal, explainability_normalization,
-                    focus=attention_matrix, device=device, pretrained_model=pretrained_model, pickle_template="dev",
-                    teacher_forcing=_teacher_forcing, ignore_attention=_ignore_attention, force_pickle_file=force_pickle_file)
+    _dev_data = read(dev_filename, _direction, source_lang, target_lang, self_attention_remove_diagonal, explainability_normalization,
+                     focus=attention_matrix, device=device, pretrained_model=pretrained_model, pickle_template="dev",
+                     teacher_forcing=_teacher_forcing, ignore_attention=_ignore_attention, force_pickle_file=force_pickle_file)
 
     if skip_test:
-        test_data = {"cnn_width": -np.inf, "cnn_height": -np.inf}
+        _test_data = {"cnn_width": -np.inf, "cnn_height": -np.inf}
     else:
-        test_data = read(test_filename, _direction, source_lang, target_lang, self_attention_remove_diagonal, explainability_normalization,
-                         focus=attention_matrix, device=device, pretrained_model=pretrained_model, pickle_template="test",
-                         teacher_forcing=_teacher_forcing, ignore_attention=_ignore_attention, force_pickle_file=force_pickle_file)
+        _test_data = read(test_filename, _direction, source_lang, target_lang, self_attention_remove_diagonal, explainability_normalization,
+                          focus=attention_matrix, device=device, pretrained_model=pretrained_model, pickle_template="test",
+                          teacher_forcing=_teacher_forcing, ignore_attention=_ignore_attention, force_pickle_file=force_pickle_file)
+
+    train_data.update(_train_data)
+    dev_data.update(_dev_data)
+    test_data.update(_test_data)
 
     cnn_width = max(train_data["cnn_width"], dev_data["cnn_width"], test_data["cnn_width"], cnn_width)
     cnn_height = max(train_data["cnn_height"], dev_data["cnn_height"], test_data["cnn_height"], cnn_height)
+    first_time = True
+    _teacher_forcing_str = "yes" if _teacher_forcing else "no"
+    _ignore_attention_str = "yes" if _ignore_attention else "no"
 
     for _attention_matrix in attention_matrix:
-        inputs = f"{_attention_matrix}_{_direction}_{_teacher_forcing}_{_ignore_attention}"
+        inputs = f"{_attention_matrix}_{_direction}_{_teacher_forcing_str}_{_ignore_attention_str}"
         train_data[f"inputs_{inputs}"], train_data["labels"] = get_data(train_data[_attention_matrix], train_data["labels"], train_data["loaded_samples"], cnn_width, cnn_height, device, convert_labels_to_tensor=first_time)
         dev_data[f"inputs_{inputs}"], dev_data["labels"] = get_data(dev_data[_attention_matrix], dev_data["labels"], dev_data["loaded_samples"], cnn_width, cnn_height, device, convert_labels_to_tensor=first_time)
 
@@ -369,11 +374,20 @@ for _direction, _teacher_forcing, _ignore_attention in zip(direction, teacher_fo
 
         first_time = False
 
+        assert inputs not in data_input_all_keys
+
         data_input_all_keys.append(inputs)
 
-data_input_all_keys = sorted(data_input_all_keys)
+data_input_all_keys = sorted(data_input_all_keys) # We sort to get the same results when the order is different
 
 print(f"CNN width and height: {cnn_width} {cnn_height}")
+print(f"All channels (keys): {' '.join(data_input_all_keys)}")
+
+assert len(set([k[7:] for k in train_data.keys() if k.startswith("inputs_")]).intersection(set(data_input_all_keys))) == len(data_input_all_keys), f"{[k for k in train_data.keys() if k.startswith('inputs_')]} vs keys"
+assert len(set([k[7:] for k in dev_data.keys() if k.startswith("inputs_")]).intersection(set(data_input_all_keys))) == len(data_input_all_keys), f"{[k for k in dev_data.keys() if k.startswith('inputs_')]} vs keys"
+
+if not skip_test:
+    assert len(set([k[7:] for k in test_data.keys() if k.startswith("inputs_")]).intersection(set(data_input_all_keys))) == len(data_input_all_keys), f"{[k for k in test_data.keys() if k.startswith('inputs_')]} vs keys"
 
 class MyDataset(Dataset):
     def __init__(self, data, all_keys, create_groups=False, return_group=False):
@@ -651,6 +665,8 @@ num_classes = 1
 epochs = 500
 
 if multichannel:
+    assert len(data_input_all_keys) == len(cnn_pooling), f"{data_input_all_keys} vs {cnn_pooling}"
+
     simple_cnns = {k: SimpleCNN(channels, cnn_width, cnn_height, num_classes, data_input_all_keys, pooling=pooling, only_conv=True) for k, pooling in zip(data_input_all_keys, cnn_pooling)}
     model = MultiChannelCNN(num_classes, simple_cnns, data_input_all_keys)
 else:
