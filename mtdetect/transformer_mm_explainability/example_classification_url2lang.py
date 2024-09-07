@@ -36,8 +36,15 @@ def colorize_background(segments, intensities, font_size=40, output_image="outpu
     # Start drawing text at the leftmost position
     x_position = 0
 
+    # Saturation?
+    satured = (intensities < 0.0).any() or (intensities > 1.0).any()
+
+    if satured:
+        print(f"warning: intensity values are not in [0, 1] and color will be saturated: {output_image}")
+
     for segment, intensity in zip(segments, intensities):
         # Map the intensity to a red color (intensity 0 -> white, intensity 1 -> red)
+        intensity = min(max(intensity, 0.0), 1.0)
         green_blue_value = int(255 * (1 - intensity))
         background_color = (255, green_blue_value, green_blue_value)
 

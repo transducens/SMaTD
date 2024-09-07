@@ -64,10 +64,16 @@ def visualize_heatmap_with_labels_and_values(rows, cols, intensity_matrix, text_
         text_y = (cell_height - text_height) / 2
         draw.text((text_x, text_y), col, font=font, fill=text_color)
 
+    satured = (intensity_matrix < 0.0).any() or (intensity_matrix > 1.0).any()
+
+    if satured:
+        print(f"warning: intensity values are not in [0, 1] and color will be saturated: {output_image}")
+
     # Iterate over each cell in the matrix
     for i, row in enumerate(rows):
         for j, col in enumerate(cols):
-            intensity = intensity_matrix[i][j]
+            value = intensity_matrix[i][j]
+            intensity = min(max(value, 0.0), 1.0)
 
             # Calculate background color
             red_value = 255
@@ -82,7 +88,7 @@ def visualize_heatmap_with_labels_and_values(rows, cols, intensity_matrix, text_
             draw.rectangle([x_position, y_position, x_position + cell_width, y_position + cell_height], fill=background_color)
 
             # Draw the intensity value in the center of the cell
-            intensity_text = f"{intensity:.2f}"  # Format the intensity value to two decimal places
+            intensity_text = f"{value:.2f}"  # Format the intensity value to two decimal places
             left, top, right, bottom = font.getbbox(intensity_text)
             text_width = right - left
             text_height = bottom - top
@@ -113,7 +119,7 @@ def translate_from_generate(tokenizer, model, inputs, target_lang_id, max_length
     return translation
 
 def translate_from_pipeline(translator_pipeline, source_text, beam_size=1):
-    output = translator_pipeline(source_text, num_beams=beam_size)
+    output = translator_pipeline(source_text, num_beams=beam_size, clean_up_tokenization_spaces=True) # clean_up_tokenization_spaces: https://github.com/huggingface/transformers/issues/33172
     translation = [_output["translation_text"] for _output in output]
 
     return translation
