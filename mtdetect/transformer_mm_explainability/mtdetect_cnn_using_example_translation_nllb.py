@@ -108,7 +108,7 @@ def read(filename, direction, source_lang, target_lang, self_attention_remove_di
     fd = open(filename)
     fn_pickle_array = None
     limit_data = np.inf if "MTDETECT_LIMIT_DATA" not in os.environ else int(os.environ["MTDETECT_LIMIT_DATA"])
-    limit_data = np.inf if limit_data <= 0 else limit_data # TODO
+    limit_data = np.inf if limit_data <= 0 else limit_data
 
     if force_pickle_file:
         assert load_explainability_arrays
@@ -153,9 +153,9 @@ def read(filename, direction, source_lang, target_lang, self_attention_remove_di
 
         with open(fn_pickle_array, "rb") as pickle_fd:
             pickle_data = pickle.load(pickle_fd)
-            explainability_ee = pickle_data["explainability_encoder"]
-            explainability_dd = pickle_data["explainability_decoder"]
-            explainability_de = pickle_data["explainability_cross"]
+            explainability_ee = pickle_data["explainability_encoder"][:None if limit_data == np.inf else limit_data]
+            explainability_dd = pickle_data["explainability_decoder"][:None if limit_data == np.inf else limit_data]
+            explainability_de = pickle_data["explainability_cross"][:None if limit_data == np.inf else limit_data]
 
     for idx, l in enumerate(fd):
         l = l.rstrip("\r\n").split('\t')
