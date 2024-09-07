@@ -6,12 +6,14 @@ import pickle
 
 import mtdetect.transformer_mm_explainability.example_translation_nllb as example_translation_nllb
 import mtdetect.inference as inference
+import mtdetect.utils.utils as utils
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+import transformers
 
 print(f"Provided args: {sys.argv}")
 
@@ -44,8 +46,30 @@ multichannel = default_sys_argv(16, True, f=lambda q: bool(int(q)))
 pretrained_model = default_sys_argv(17, '')
 teacher_forcing = default_sys_argv(18, [False], f=lambda q: [False] if q == '' else [True if _q == "yes" else (False if _q == "no" else bool(int(_q))) for _q in q.split('+')])
 ignore_attention = default_sys_argv(19, [False], f=lambda q: [False] if q == '' else [True if _q == "yes" else (False if _q == "no" else bool(int(_q))) for _q in q.split('+')])
+lm_pretrained_model = default_sys_argv(20, None)
+lm_model_input = default_sys_argv(21, None, f=lambda q: None if q == '' else q)
+lm_frozen_params = default_sys_argv(22, True, f=lambda q: bool(int(q)))
 force_pickle_file = True # Change manually
 skip_test = False # Change manually
+
+if lm_pretrained_model:
+    print(f"LM is going to be used: {lm_pretrained_model} (local file: {lm_model_input})")
+
+def load_model(model_input, pretrained_model, device, name=None):
+    local_model = model_input is not None
+    model = transformers.AutoModel.from_pretrained(pretrained_model)
+    tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model)
+
+    if local_model:
+        _model_input = f"{model_input}/{name}.pt" if name is not None else model_input
+        state_dict = torch.load(_model_input, weights_only=True, map_location=device) # weights_only: https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models
+                                                                                      # map_location: avoid creating a new process and using additional and useless memory
+
+        model.load_state_dict(state_dict)
+
+    model = model.to(device)
+
+    return model, tokenizer
 
 if skip_test:
     print(f"warning: test set evaluation is disabled")
@@ -81,6 +105,7 @@ print(f"NLLB conf:\n{translation_model_conf}")
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 patience = 100
+lang_model, tokenizer = load_model(lm_model_input, lm_pretrained_model, device) if lm_pretrained_model else (None, None)
 
 def extend_tensor_with_zeros_and_truncate(t, max_width, max_height, device):
     assert len(t.shape) == 2
@@ -315,14 +340,15 @@ if multichannel:
     channels_factor = 1
     cnn_pooling *= 1 if len(cnn_pooling) > 1 else len(attention_matrix)
     cnn_pooling *= max(channels_factor_len_set)
+
+    if lang_model:
+        cnn_pooling.append(cnn_pooling[0]) # fake value (it will be ignored) -> easier for further processing
 else:
     # Expected: for each value provided to direction, teacher_forcing, and ignore_attention, we will have an extra set of len(attention_matrix) channels
     # Example: {direction: src2trg+trg2src, teacher_forcing: True+False, ignore_attention: False} -> [(src2trg, True, False), (trg2src, False, False)] # ignore_attention is expanded
     # Example: {direction: src2trg+src2trg+trg2src+trg2src, teacher_forcing: True+False+True+False, ignore_attention: False+True+False+True} -> [(src2trg, True, False), (src2trg, False, True), (trg2src, True, False), (trg2src, False, True)]
     channels = len(attention_matrix)
     channels_factor = max(channels_factor_len_set)
-
-    assert len(cnn_pooling) == 1, cnn_pooling
 
 direction *= 1 if len(direction) > 1 else max(channels_factor_len_set)
 teacher_forcing *= 1 if len(teacher_forcing) > 1 else max(channels_factor_len_set)
@@ -372,11 +398,11 @@ for _direction, _teacher_forcing, _ignore_attention in zip(direction, teacher_fo
 
     for _attention_matrix in attention_matrix:
         inputs = f"{_attention_matrix}_{_direction}_{_teacher_forcing_str}_{_ignore_attention_str}"
-        train_data[f"inputs_{inputs}"], train_data["labels"] = get_data(train_data[_attention_matrix], train_data["labels"], train_data["loaded_samples"], cnn_width, cnn_height, device, convert_labels_to_tensor=first_time)
-        dev_data[f"inputs_{inputs}"], dev_data["labels"] = get_data(dev_data[_attention_matrix], dev_data["labels"], dev_data["loaded_samples"], cnn_width, cnn_height, device, convert_labels_to_tensor=first_time)
+        train_data[f"inputs_{inputs}"], train_data["labels"] = get_data(train_data[_attention_matrix], train_data["labels"], train_data["loaded_samples"], cnn_width, cnn_height, None, convert_labels_to_tensor=first_time)
+        dev_data[f"inputs_{inputs}"], dev_data["labels"] = get_data(dev_data[_attention_matrix], dev_data["labels"], dev_data["loaded_samples"], cnn_width, cnn_height, None, convert_labels_to_tensor=first_time)
 
         if not skip_test:
-            test_data[f"inputs_{inputs}"], test_data["labels"] = get_data(test_data[_attention_matrix], test_data["labels"], test_data["loaded_samples"], cnn_width, cnn_height, device, convert_labels_to_tensor=first_time)
+            test_data[f"inputs_{inputs}"], test_data["labels"] = get_data(test_data[_attention_matrix], test_data["labels"], test_data["loaded_samples"], cnn_width, cnn_height, None, convert_labels_to_tensor=first_time)
 
         first_time = False
 
@@ -384,7 +410,51 @@ for _direction, _teacher_forcing, _ignore_attention in zip(direction, teacher_fo
 
         data_input_all_keys.append(inputs)
 
-data_input_all_keys = sorted(data_input_all_keys) # We sort to get the same results when the order is different
+if lang_model:
+    # Add LM data to inputs
+
+    max_length_encoder = utils.get_encoder_max_length(lang_model, tokenizer)
+    max_length_encoder = min(max_length_encoder, 512) # TODO add user argument?
+    data_input_all_keys.append("lm_inputs")
+
+    for d, desc in ((train_data, "train"), (dev_data, "dev"), (test_data, "test")):
+        if desc == "test" and skip_test:
+            continue
+
+        d["inputs_lm_inputs"] = []
+        all_texts = []
+
+        for source_text, target_text in zip(d["source_text"], d["target_text"]):
+            # TODO randomize source_text|target_text and target_text|source_text ?
+
+            all_texts.append(f"{source_text}{tokenizer.sep_token}{target_text}")
+
+        inputs = tokenizer.batch_encode_plus(all_texts, return_tensors=None, add_special_tokens=True, max_length=max_length_encoder,
+                                             return_attention_mask=False, truncation=True, padding="longest")
+        d["inputs_lm_inputs"] = (inputs["input_ids"])
+        inputs = torch.tensor(d["inputs_lm_inputs"])
+
+        assert inputs.shape == (len(d["source_text"]), min(max_length_encoder, inputs.shape[1])), inputs.shape
+
+        d["inputs_lm_inputs"] = inputs
+
+if not multichannel:
+    assert len(cnn_pooling) == 1, cnn_pooling
+
+    cnn_pooling *= len(data_input_all_keys)
+
+len_data = len(data_input_all_keys)
+
+assert len(data_input_all_keys) == len_data, f"{data_input_all_keys} len is not {len_data}"
+assert len(cnn_pooling) == len_data, f"{cnn_pooling} len is not {len_data}"
+
+data_input_all_keys, cnn_pooling = \
+    zip(*map(lambda s: s.split('|'), sorted([f"{d}|{c}" for d, c in zip(data_input_all_keys, cnn_pooling)]))) # We sort to get the same results when the order is different
+data_input_all_keys = list(data_input_all_keys)
+cnn_pooling = list(cnn_pooling)
+
+assert len(data_input_all_keys) == len_data, f"{data_input_all_keys} len is not {len_data}"
+assert len(cnn_pooling) == len_data, f"{cnn_pooling} len is not {len_data}"
 
 print(f"CNN width and height: {cnn_width} {cnn_height}")
 print(f"All channels (keys): {' '.join(data_input_all_keys)}")
@@ -445,7 +515,7 @@ class MyDataset(Dataset):
 
     def __getitem__(self, idx):
         group = self.uniq_groups[idx]
-        x = {k: [v.clone().detach().type(torch.float32) for v in l] for k, l in self.data[group]['x'].items()}
+        x = {k: [v.clone().detach().type(torch.float32) if k != "lm_inputs" else v.clone().detach() for v in l] for k, l in self.data[group]['x'].items()}
         y = [_y.clone().detach().type(torch.float32) for _y in self.data[group]['y']]
 
         if not self.create_groups:
@@ -487,13 +557,26 @@ def select_random_group_collate_fn(batch):
     return data, target
 
 class SimpleCNN(nn.Module):
-    def __init__(self, c, w, h, num_classes, all_keys, pooling="max", only_conv=True):
+    def __init__(self, c, w, h, num_classes, all_keys, pooling="max", only_conv=True, lang_model=None):
         super(SimpleCNN, self).__init__()
 
         self.only_conv = only_conv
-        self.all_keys = all_keys
+        self.all_keys = list(all_keys)
         self.channels = c
         self.dimensions = (w, h)
+        self.lang_model = lang_model
+        self.lang_model_hidden_size = 0
+
+        if self.lang_model is not None:
+            assert "lm_inputs" in self.all_keys
+
+            self.lang_model_hidden_size = self.lang_model.config.hidden_size
+
+        if "lm_inputs" in self.all_keys:
+            assert lang_model is not None
+
+        if lang_model:
+            self.all_keys.remove("lm_inputs")
 
         # First convolutional layer
         self.kernel_size = 3
@@ -502,7 +585,9 @@ class SimpleCNN(nn.Module):
         self.conv_layers = 2
         self.in_channels = [c, *[self.layer_size * (2 ** i) for i in range(self.conv_layers - 1)]]
         self.out_channels = self.in_channels[1:] + [self.layer_size * (2 ** len(self.in_channels[1:]))]
-        self.convs = nn.ModuleList([nn.Conv2d(in_channels=self.in_channels[i], out_channels=self.out_channels[i], kernel_size=self.kernel_size, stride=1, padding=self.padding, padding_mode="zeros") for i in range(self.conv_layers)])
+        self.convs = nn.ModuleList([nn.Conv2d(in_channels=self.in_channels[i], out_channels=self.out_channels[i],
+                                              kernel_size=self.kernel_size, stride=1, padding=self.padding,
+                                              padding_mode="zeros") for i in range(self.conv_layers)])
 
         assert len(self.in_channels) == self.conv_layers
         assert len(self.out_channels) == self.conv_layers
@@ -520,10 +605,12 @@ class SimpleCNN(nn.Module):
 
         # Calculate the size of the feature map after the convolutional layers and pooling
         self._to_linear = self.linear(torch.rand(1, self.channels, *self.dimensions)).numel()
+        self._to_linear += self.lang_model_hidden_size
 
         # Fully connected layers
-        self.fc1 = nn.Linear(self._to_linear, 128)
-        self.fc2 = nn.Linear(128, num_classes)
+        self.hidden = 128
+        self.fc1 = nn.Linear(self._to_linear, self.hidden)
+        self.fc2 = nn.Linear(self.hidden, num_classes)
 
         self.dropout = nn.Dropout(p=0.5)
 
@@ -548,7 +635,12 @@ class SimpleCNN(nn.Module):
         return x
 
     def forward(self, x):
+        lm_input_ids = None
+
         if isinstance(x, dict):
+            if self.lang_model:
+                lm_input_ids = x["lm_inputs"]
+
             x = torch.cat([x[k] for k in self.all_keys], dim=1)
 
             assert x.shape[1:] == (self.channels, *self.dimensions), x.shape
@@ -558,17 +650,44 @@ class SimpleCNN(nn.Module):
         if self.only_conv:
             return x
 
-        x = x.view(-1, self._to_linear)
+        bs = x.shape[0]
+        x = x.view(bs, self._to_linear - self.lang_model_hidden_size)
+
+        if self.lang_model:
+            lm_attention_mask = utils.get_attention_mask(tokenizer, lm_input_ids)
+            output = self.lang_model(input_ids=lm_input_ids, attention_mask=lm_attention_mask)
+            last_hidden_state = output["last_hidden_state"]
+            classifier_token = last_hidden_state[:,0,:]
+
+            assert classifier_token.shape == (x.shape[0], self.lang_model_hidden_size)
+
+            x = torch.cat([x, classifier_token], dim=1)
+
+        assert x.shape == (bs, self._to_linear)
+
         x = F.relu(self.fc1(x))
         x = self.dropout(x)
         x = self.fc2(x)
         return x
 
 class MultiChannelCNN(nn.Module):
-    def __init__(self, num_classes, simple_cnns, all_keys):
+    def __init__(self, num_classes, simple_cnns, all_keys, lang_model=None):
         super(MultiChannelCNN, self).__init__()
 
-        self.all_keys = all_keys
+        self.all_keys = list(all_keys)
+        self.lang_model = lang_model
+        self.lang_model_hidden_size = 0
+
+        if self.lang_model is not None:
+            assert "lm_inputs" in self.all_keys
+
+            self.lang_model_hidden_size = self.lang_model.config.hidden_size
+
+        if "lm_inputs" in self.all_keys:
+            assert lang_model is not None
+
+        if lang_model:
+            self.all_keys.remove("lm_inputs")
 
         for k, simple_cnn in simple_cnns.items():
             assert k in self.all_keys
@@ -579,6 +698,7 @@ class MultiChannelCNN(nn.Module):
         self.simple_cnns = nn.ModuleDict({k: v for k, v in simple_cnns.items()})
         self._to_linear = {k: simple_cnns[k]._to_linear for k in simple_cnns.keys()}
         self._to_linear_sum = sum([self._to_linear[k] for k in self._to_linear.keys()])
+        self._to_linear_sum += self.lang_model_hidden_size
 
         # Fully connected layers
         self.hidden = 128
@@ -602,9 +722,26 @@ class MultiChannelCNN(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
+        assert isinstance(x, dict), type(x)
+
+        lm_input_ids = x["lm_inputs"] if self.lang_model else None
         x = [self.simple_cnns[k](x[k]) for k in self.all_keys]
         x = [_x.view(-1, self._to_linear[k]) for _x, k in zip(x, self.all_keys)]
         x = torch.cat(x, dim=1)
+        bs = x.shape[0]
+
+        if self.lang_model:
+            lm_attention_mask = utils.get_attention_mask(tokenizer, lm_input_ids)
+            output = self.lang_model(input_ids=lm_input_ids, attention_mask=lm_attention_mask)
+            last_hidden_state = output["last_hidden_state"]
+            classifier_token = last_hidden_state[:,0,:]
+
+            assert classifier_token.shape == (x.shape[0], self.lang_model_hidden_size)
+
+            x = torch.cat([x, classifier_token], dim=1)
+
+        assert x.shape == (bs, self._to_linear_sum)
+
         x = F.relu(self.fc1(x))
         x = self.dropout(x)
         x = self.fc2(x)
@@ -633,8 +770,12 @@ def apply_inference(model, data, target=None, loss_function=None, threshold=0.5,
 
 def eval(model, dataloader, all_keys, device):
     training = model.training
+    training_lm = False if not model.lang_model else model.lang_model.training
 
     model.eval()
+
+    if model.lang_model:
+        model.lang_model.eval()
 
     all_outputs = []
     all_labels = []
@@ -656,6 +797,13 @@ def eval(model, dataloader, all_keys, device):
     if training:
         model.train()
 
+        if not training_lm and model.lang_model:
+            # Previous .train() might have enabled the language model training...
+            model.lang_model.eval()
+
+    if training_lm:
+        model.lang_model.train()
+
     return results
 
 # Load data
@@ -671,20 +819,39 @@ num_classes = 1
 epochs = 500
 
 if multichannel:
-    assert len(data_input_all_keys) == len(cnn_pooling), f"{data_input_all_keys} vs {cnn_pooling}"
+    _data_input_all_keys = list(data_input_all_keys)
+    _cnn_pooling = list(cnn_pooling)
 
-    simple_cnns = {k: SimpleCNN(channels, cnn_width, cnn_height, num_classes, data_input_all_keys, pooling=pooling, only_conv=True) for k, pooling in zip(data_input_all_keys, cnn_pooling)}
-    model = MultiChannelCNN(num_classes, simple_cnns, data_input_all_keys)
+    if lang_model:
+        i = _data_input_all_keys.index("lm_inputs")
+
+        del _cnn_pooling[i]
+        del _data_input_all_keys[i]
+
+    simple_cnns = {k: SimpleCNN(channels, cnn_width, cnn_height, num_classes, _data_input_all_keys, pooling=pooling, only_conv=True) for k, pooling in zip(_data_input_all_keys, _cnn_pooling)}
+    model = MultiChannelCNN(num_classes, simple_cnns, data_input_all_keys, lang_model=lang_model)
 else:
-    model = SimpleCNN(channels, cnn_width, cnn_height, num_classes, data_input_all_keys, pooling=cnn_pooling[0], only_conv=False)
+    model = SimpleCNN(channels, cnn_width, cnn_height, num_classes, data_input_all_keys, pooling=cnn_pooling[0], only_conv=False, lang_model=lang_model)
 
 model = model.to(device)
 
 model.train()
 
+if lang_model:
+    if lm_frozen_params:
+        lang_model.eval()
+
+        for p in lang_model.parameters():
+            p.requires_grad_(False)
+    else:
+        lang_model.train()
+
 loss_function = nn.BCELoss(reduction="mean") # BCELoss vs BCEWithLogitsLoss: check https://github.com/pytorch/pytorch/issues/49844
 loss_apply_sigmoid = True # https://pytorch.org/docs/stable/generated/torch.nn.BCELoss.html
-model_parameters = filter(lambda p: p.requires_grad, model.parameters())
+model_parameters = list(filter(lambda p: p.requires_grad, model.parameters()))
+
+print(f"Parameters with requires_grad=True: {len(model_parameters)}")
+
 optimizer = torch.optim.AdamW(model_parameters, lr=learning_rate)
 scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=learning_rate * 1, steps_per_epoch=len(train_dataloader), epochs=epochs)
 early_stopping_best_result_dev = -np.inf # accuracy

@@ -75,7 +75,6 @@ class SmartBatchingURLsDataset(Dataset):
         self.tokens = utils.encode(tokenizer, input_data, max_length=max_length, return_tensors=None, truncation=True)["input_ids"]
 
         self._total_tokens = sum([len(t) for t in self.tokens])
-        disable_balance = False
 
         if len(self.labels["urls_classification"]) != len(self.tokens):
             raise Exception("Number of input entries from the main task is different of the labels len: "

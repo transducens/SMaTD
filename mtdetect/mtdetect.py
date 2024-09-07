@@ -319,33 +319,7 @@ def main(args):
     else:
         logger.warning("Deterministic values disable (you set a negative seed)")
 
-    if max_length_tokens <= 0:
-        max_length_tokens = tokenizer.model_max_length
-    if max_length_tokens > tokenizer.model_max_length:
-        logger.warning("%s can handle a max. of %d tokens at once but you set %d: changing value to %d", pretrained_model, tokenizer.model_max_length, max_length_tokens, tokenizer.model_max_length)
-
-        max_length_tokens = tokenizer.model_max_length
-
-    max_length_tokens_max_value = 1000000000000000019884624838656 # https://discuss.huggingface.co/t/tokenizers-what-this-max-length-number/28484
-
-    if max_length_tokens == max_length_tokens_max_value:
-        alt1 = getattr(model.config, "max_length", -1)
-        alt2 = getattr(model.config, "max_position_embeddings", -1)
-
-        if alt1 > 0 or alt2 > 2:
-            if alt1 > 0 and alt2 > 0:
-                if alt1 == alt2:
-                    max_length_tokens = alt1
-                else:
-                    max_length_tokens = min(alt1, alt2)
-
-                    logger.warning("Max tokens length (%d) has two alternatives, but they are different (%d vs %d): %d", max_length_tokens_max_value, alt1, alt2, max_length_tokens)
-            elif alt1 > 0:
-                max_length_tokens = alt1
-            elif alt2 > 0:
-                max_length_tokens = alt2
-            else:
-                raise Exception("Unexpected...")
+    max_length_tokens = utils.get_encoder_max_length(model, tokenizer, max_length_tokens=max_length_tokens, pretrained_model=pretrained_model, logger=logger)
 
     logger.info("Max token length: %d", max_length_tokens)
 
