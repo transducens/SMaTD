@@ -42,8 +42,8 @@ save_model_path = default_sys_argv(14, '')
 learning_rate = default_sys_argv(15, 5e-3, f=float)
 multichannel = default_sys_argv(16, True, f=lambda q: bool(int(q)))
 pretrained_model = default_sys_argv(17, '')
-teacher_forcing = default_sys_argv(18, [False], f=lambda q: [False] if q == '' else [bool(int(_q)) for _q in q.split('+')])
-ignore_attention = default_sys_argv(19, [False], f=lambda q: [False] if q == '' else [bool(int(_q)) for _q in q.split('+')])
+teacher_forcing = default_sys_argv(18, [False], f=lambda q: [False] if q == '' else [True if _q == "yes" else (False if _q == "no" else bool(int(_q))) for _q in q.split('+')])
+ignore_attention = default_sys_argv(19, [False], f=lambda q: [False] if q == '' else [True if _q == "yes" else (False if _q == "no" else bool(int(_q))) for _q in q.split('+')])
 force_pickle_file = True # Change manually
 skip_test = False # Change manually
 
@@ -107,6 +107,8 @@ def read(filename, direction, source_lang, target_lang, self_attention_remove_di
     explainability_de = []
     fd = open(filename)
     fn_pickle_array = None
+    limit_data = np.inf if "MTDETECT_LIMIT_DATA" not in os.environ else int(os.environ["MTDETECT_LIMIT_DATA"])
+    limit_data = np.inf if limit_data <= 0 else limit_data # TODO
 
     if force_pickle_file:
         assert load_explainability_arrays
@@ -234,14 +236,18 @@ def read(filename, direction, source_lang, target_lang, self_attention_remove_di
 
             sys.stdout.flush()
 
+        if idx + 1 >= limit_data:
+            break
+
     fd.close()
 
     if load_explainability_arrays and fn_pickle_array_exists:
         # Explainability arrays were loaded
+        expected_len = min(len(source_text), limit_data)
 
-        assert len(source_text) == len(explainability_ee), f"{len(source_text)} != {len(explainability_ee)}"
-        assert len(source_text) == len(explainability_dd), f"{len(source_text)} != {len(explainability_dd)}"
-        assert len(source_text) == len(explainability_de), f"{len(source_text)} != {len(explainability_de)}"
+        assert expected_len == len(explainability_ee), f"{expected_len} != {len(explainability_ee)}"
+        assert expected_len == len(explainability_dd), f"{expected_len} != {len(explainability_dd)}"
+        assert expected_len == len(explainability_de), f"{expected_len} != {len(explainability_de)}"
 
     if store_explainability_arrays and not fn_pickle_array_exists:
         print(f"Storing explainability arrays: {fn_pickle_array}")
@@ -255,7 +261,7 @@ def read(filename, direction, source_lang, target_lang, self_attention_remove_di
 
             pickle.dump(pickle_data, pickle_fd)
 
-    print(f"Samples: {len(groups)}; Groups: {len(uniq_groups)}")
+    print(f"Samples: {len(groups)} (limit: {limit_data}); Groups: {len(uniq_groups)}")
 
     return {
         "cnn_width": cnn_width,
@@ -605,14 +611,14 @@ class MultiChannelCNN(nn.Module):
 
         return x
 
-def apply_inference(model, data, target=None, loss_function=None, threshold=0.5):
+def apply_inference(model, data, target=None, loss_function=None, threshold=0.5, loss_apply_sigmoid=False):
     model_outputs = model(data)
     outputs = model_outputs
     outputs = outputs.squeeze(1)
     loss = None
 
     if loss_function is not None and target is not None:
-        loss = loss_function(outputs, target)
+        loss = loss_function(torch.sigmoid(outputs) if loss_apply_sigmoid else outputs, target)
 
     outputs_classification = torch.sigmoid(outputs).cpu().detach().tolist()
     outputs_classification = list(map(lambda n: int(n >= threshold), outputs_classification))
@@ -635,7 +641,7 @@ def eval(model, dataloader, all_keys, device):
 
     for data, target in dataloader:
         data = {k: data[k].to(device) for k in all_keys}
-        results = apply_inference(model, data, target=None, loss_function=None)
+        results = apply_inference(model, data, target=None, loss_function=None, loss_apply_sigmoid=False)
         outputs_classification = results["outputs_classification_detach_list"]
         labels = target.cpu()
         labels = torch.round(labels).type(torch.long)
@@ -676,9 +682,10 @@ model = model.to(device)
 
 model.train()
 
-loss_function = nn.BCEWithLogitsLoss(reduction="mean")
+loss_function = nn.BCELoss(reduction="mean") # BCELoss vs BCEWithLogitsLoss: check https://github.com/pytorch/pytorch/issues/49844
+loss_apply_sigmoid = True # https://pytorch.org/docs/stable/generated/torch.nn.BCELoss.html
 model_parameters = filter(lambda p: p.requires_grad, model.parameters())
-optimizer = torch.optim.SGD(model_parameters, lr=learning_rate, momentum=0.9)
+optimizer = torch.optim.AdamW(model_parameters, lr=learning_rate)
 scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=learning_rate * 1, steps_per_epoch=len(train_dataloader), epochs=epochs)
 early_stopping_best_result_dev = -np.inf # accuracy
 early_stopping_best_result_train = -np.inf # accuracy
@@ -746,7 +753,7 @@ for epoch in range(epochs):
 
         model.zero_grad()
 
-        result = apply_inference(model, data, target=target, loss_function=loss_function)
+        result = apply_inference(model, data, target=target, loss_function=loss_function, loss_apply_sigmoid=loss_apply_sigmoid)
         loss = result["loss"]
 
         epoch_loss += loss
