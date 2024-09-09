@@ -818,8 +818,8 @@ dev_dataloader = DataLoader(dev_dataset, batch_size=batch_size, shuffle=False, n
 
 # Model
 num_classes = 1
-epochs = 500 if not lang_model else 10
-patience = 100 if not lang_model else 3
+epochs = 500 if not lang_model or lm_frozen_params else 10
+patience = 100 if not lang_model or lm_frozen_params else 3
 
 if multichannel:
     _data_input_all_keys = list(data_input_all_keys)
@@ -856,7 +856,7 @@ model_parameters = list(filter(lambda p: p.requires_grad, model.parameters()))
 print(f"Parameters with requires_grad=True: {len(model_parameters)}")
 
 optimizer = torch.optim.AdamW(model_parameters, lr=learning_rate)
-lr_scheduler_str = "linear" if lang_model else "OneCycleLR"
+lr_scheduler_str = "OneCycleLR" if not lang_model or lm_frozen_params else "linear"
 warmup_steps = 400
 
 print(f"Info: {epochs} epochs, {patience} patience, {lr_scheduler_str} LR scheduler ({warmup_steps} warmup, if applicable)")
