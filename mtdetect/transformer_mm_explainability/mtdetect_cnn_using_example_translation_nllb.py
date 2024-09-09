@@ -49,6 +49,7 @@ ignore_attention = default_sys_argv(19, [False], f=lambda q: [False] if q == '' 
 lm_pretrained_model = default_sys_argv(20, None)
 lm_model_input = default_sys_argv(21, None, f=lambda q: None if q == '' else q)
 lm_frozen_params = default_sys_argv(22, True, f=lambda q: True if q == '' else bool(int(q)))
+lm_learning_rate = default_sys_argv(23, 1e-5, f=float)
 force_pickle_file = True # Change manually
 skip_test = False # Change manually
 
@@ -818,8 +819,8 @@ dev_dataloader = DataLoader(dev_dataset, batch_size=batch_size, shuffle=False, n
 
 # Model
 num_classes = 1
-epochs = 500 if not lang_model or lm_frozen_params else 10
-patience = 100 if not lang_model or lm_frozen_params else 3
+epochs = 100
+patience = 20
 
 if multichannel:
     _data_input_all_keys = list(data_input_all_keys)
@@ -851,15 +852,20 @@ if lang_model:
 
 loss_function = nn.BCELoss(reduction="mean") # BCELoss vs BCEWithLogitsLoss: check https://github.com/pytorch/pytorch/issues/49844
 loss_apply_sigmoid = True # https://pytorch.org/docs/stable/generated/torch.nn.BCELoss.html
-model_parameters = list(filter(lambda p: p.requires_grad, model.parameters()))
+lm_model_parameters = list(list(filter(lambda p: p.requires_grad, lang_model.parameters()))) if lang_model else []
+model_parameters = list(filter(lambda p: p.requires_grad, [p for k, p in model.named_parameters() if not k.startswith("lang_model.")]))
+optimizer_args = [{"params": model_parameters}]
 
-print(f"Parameters with requires_grad=True: {len(model_parameters)}")
+if lm_model_parameters:
+    optimizer_args.append({"params": lm_model_parameters, "lr": lm_learning_rate})
 
-optimizer = torch.optim.AdamW(model_parameters, lr=learning_rate)
-lr_scheduler_str = "OneCycleLR" if not lang_model or lm_frozen_params else "linear"
+print(f"Parameters with requires_grad=True: {len(model_parameters)} (LM: {len(lm_model_parameters)})")
+
+optimizer = torch.optim.AdamW(optimizer_args, lr=learning_rate)
+lr_scheduler_str = "linear"
 warmup_steps = 400
 
-print(f"Info: {epochs} epochs, {patience} patience, {lr_scheduler_str} LR scheduler ({warmup_steps} warmup, if applicable)")
+print(f"Info: {epochs} epochs, {patience} patience, {lr_scheduler_str} LR scheduler ({warmup_steps} warmup, if applicable), {learning_rate} learning rate, {lm_learning_rate} LM learning rate")
 
 if lr_scheduler_str == "linear":
     scheduler = transformers.get_linear_schedule_with_warmup(optimizer, 400, len(train_dataloader) * epochs)
