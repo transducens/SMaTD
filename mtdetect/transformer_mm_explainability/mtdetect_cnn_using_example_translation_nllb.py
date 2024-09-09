@@ -48,12 +48,15 @@ teacher_forcing = default_sys_argv(18, [False], f=lambda q: [False] if q == '' e
 ignore_attention = default_sys_argv(19, [False], f=lambda q: [False] if q == '' else [True if _q == "yes" else (False if _q == "no" else bool(int(_q))) for _q in q.split('+')])
 lm_pretrained_model = default_sys_argv(20, None)
 lm_model_input = default_sys_argv(21, None, f=lambda q: None if q == '' else q)
-lm_frozen_params = default_sys_argv(22, True, f=lambda q: bool(int(q)))
+lm_frozen_params = default_sys_argv(22, True, f=lambda q: True if q == '' else bool(int(q)))
 force_pickle_file = True # Change manually
 skip_test = False # Change manually
 
 if lm_pretrained_model:
     print(f"LM is going to be used: {lm_pretrained_model} (local file: {lm_model_input})")
+
+if lm_pretrained_model and not lm_model_input and lm_frozen_params:
+    print(f"warning: LM provided but it is not a fine-tuned model and its parameters are frozen: the format is src<sep>trg, and the output is the first output token, which might not be the expected behaviour for the model")
 
 def load_model(model_input, pretrained_model, device, name=None):
     local_model = model_input is not None
@@ -104,8 +107,7 @@ translation_model_conf = json.dumps(translation_model_conf, indent=4)
 print(f"NLLB conf:\n{translation_model_conf}")
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-patience = 100
-lang_model, tokenizer = load_model(lm_model_input, lm_pretrained_model, device) if lm_pretrained_model else (None, None)
+lang_model, tokenizer = load_model(lm_model_input, lm_pretrained_model, None) if lm_pretrained_model else (None, None)
 
 def extend_tensor_with_zeros_and_truncate(t, max_width, max_height, device):
     assert len(t.shape) == 2
@@ -816,7 +818,8 @@ dev_dataloader = DataLoader(dev_dataset, batch_size=batch_size, shuffle=False, n
 
 # Model
 num_classes = 1
-epochs = 500
+epochs = 500 if not lang_model else 10
+patience = 100 if not lang_model else 3
 
 if multichannel:
     _data_input_all_keys = list(data_input_all_keys)
@@ -853,7 +856,18 @@ model_parameters = list(filter(lambda p: p.requires_grad, model.parameters()))
 print(f"Parameters with requires_grad=True: {len(model_parameters)}")
 
 optimizer = torch.optim.AdamW(model_parameters, lr=learning_rate)
-scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=learning_rate * 1, steps_per_epoch=len(train_dataloader), epochs=epochs)
+lr_scheduler_str = "linear" if lang_model else "OneCycleLR"
+warmup_steps = 400
+
+print(f"Info: {epochs} epochs, {patience} patience, {lr_scheduler_str} LR scheduler ({warmup_steps} warmup, if applicable)")
+
+if lr_scheduler_str == "linear":
+    scheduler = transformers.get_linear_schedule_with_warmup(optimizer, 400, len(train_dataloader) * epochs)
+elif lr_scheduler_str == "OneCycleLR":
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=learning_rate * 1, steps_per_epoch=len(train_dataloader), epochs=epochs)
+else:
+    raise Exception(f"Unexpected LR scheduler: {lr_scheduler_str}")
+
 early_stopping_best_result_dev = -np.inf # accuracy
 early_stopping_best_result_train = -np.inf # accuracy
 early_stopping_best_loss = np.inf
@@ -886,7 +900,6 @@ for epoch in range(epochs):
     better_train_result = False
     patience_dev_equal = np.isclose(early_stopping_metric_dev, early_stopping_best_result_dev)
     patience_train_equal = np.isclose(early_stopping_metric_train, early_stopping_best_result_train)
-
 
     if early_stopping_metric_train > early_stopping_best_result_train:
         print(f"Better train result: {early_stopping_best_result_train} -> {early_stopping_metric_train}")
