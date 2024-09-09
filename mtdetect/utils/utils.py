@@ -7,8 +7,10 @@ import gzip
 import lzma
 from contextlib import contextmanager
 import argparse
+import warnings
 
 import torch
+import transformers
 
 logger = logging.getLogger("mtdetect")
 
@@ -265,3 +267,21 @@ def get_encoder_max_length(model, tokenizer, max_length_tokens=0, pretrained_mod
 
 def get_attention_mask(tokenizer, input_ids):
     return torch.ones_like(input_ids) * (input_ids != tokenizer.pad_token_id)
+
+def get_tokenizer(pretrained_model, logger=None):
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+
+        tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model, use_fast=True)
+
+        for warning in w:
+            if "The sentencepiece tokenizer that you are converting to a fast tokenizer uses the byte fallback option" in str(warning.message):
+                if logger:
+                    logger.warning("Loading slow tokenizer")
+
+                tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model, use_fast=False)
+            else:
+                if logger:
+                    logger.warning("Tokenizer warning: %s", str(warning.message))
+
+    return tokenizer

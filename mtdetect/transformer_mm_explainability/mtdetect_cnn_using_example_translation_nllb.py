@@ -61,8 +61,8 @@ if lm_pretrained_model and not lm_model_input and lm_frozen_params:
 
 def load_model(model_input, pretrained_model, device, name=None):
     local_model = model_input is not None
-    model = transformers.AutoModel.from_pretrained(pretrained_model)
-    tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model)
+    model = transformers.AutoModelForSequenceClassification.from_pretrained(pretrained_model, num_labels=1)
+    tokenizer = utils.get_tokenizer(pretrained_model)
 
     if local_model:
         _model_input = f"{model_input}/{name}.pt" if name is not None else model_input
@@ -658,8 +658,8 @@ class SimpleCNN(nn.Module):
 
         if self.lang_model:
             lm_attention_mask = utils.get_attention_mask(tokenizer, lm_input_ids)
-            output = self.lang_model(input_ids=lm_input_ids, attention_mask=lm_attention_mask)
-            last_hidden_state = output["last_hidden_state"]
+            output = self.lang_model(input_ids=lm_input_ids, attention_mask=lm_attention_mask, output_hidden_states=True)
+            last_hidden_state = output["hidden_states"][-1]
             classifier_token = last_hidden_state[:,0,:]
 
             assert classifier_token.shape == (x.shape[0], self.lang_model_hidden_size)
@@ -735,8 +735,8 @@ class MultiChannelCNN(nn.Module):
 
         if self.lang_model:
             lm_attention_mask = utils.get_attention_mask(tokenizer, lm_input_ids)
-            output = self.lang_model(input_ids=lm_input_ids, attention_mask=lm_attention_mask)
-            last_hidden_state = output["last_hidden_state"]
+            output = self.lang_model(input_ids=lm_input_ids, attention_mask=lm_attention_mask, output_hidden_states=True)
+            last_hidden_state = output["hidden_states"][-1]
             classifier_token = last_hidden_state[:,0,:]
 
             assert classifier_token.shape == (x.shape[0], self.lang_model_hidden_size)

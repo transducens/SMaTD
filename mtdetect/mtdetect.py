@@ -73,22 +73,6 @@ _optimizer_args = {
     }
 }
 
-def get_tokenizer(pretrained_model):
-    with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter("always")
-
-        tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model, use_fast=True)
-
-        for warning in w:
-            if "The sentencepiece tokenizer that you are converting to a fast tokenizer uses the byte fallback option" in str(warning.message):
-                logger.warning("Loading slow tokenizer")
-
-                tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model, use_fast=False)
-            else:
-                logger.warning("Tokenizer warning: %s", str(warning.message))
-
-    return tokenizer
-
 def get_lr_scheduler(scheduler, optimizer, *args, **kwargs):
     scheduler_instance = None
     mandatory_args = ""
@@ -286,7 +270,7 @@ def main(args):
 
     # Model
     device = accelerator.device
-    tokenizer = get_tokenizer(pretrained_model)
+    tokenizer = utils.get_tokenizer(pretrained_model, logger=logger)
     model = load_model(model_input, pretrained_model, device, name=None, classifier_dropout=classifier_dropout)
     num_processes = accelerator.num_processes
     save_model_prefix = f"mtd_{eval_strategy}"
