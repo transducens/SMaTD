@@ -589,7 +589,7 @@ class SimpleCNN(nn.Module):
         if lang_model is not None:
             assert "lm_inputs" in self.all_keys
 
-            self.lang_model_hidden_size = self.lang_model.config.hidden_size
+            self.lang_model_hidden_size = lang_model.config.hidden_size
 
         if "lm_inputs" in self.all_keys:
             assert lang_model is not None
@@ -707,7 +707,7 @@ class MultiChannelCNN(nn.Module):
         if lang_model is not None:
             assert "lm_inputs" in self.all_keys
 
-            self.lang_model_hidden_size = self.lang_model.config.hidden_size
+            self.lang_model_hidden_size = lang_model.config.hidden_size
 
         if "lm_inputs" in self.all_keys:
             assert lang_model is not None
