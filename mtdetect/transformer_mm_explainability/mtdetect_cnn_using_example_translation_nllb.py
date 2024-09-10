@@ -2,6 +2,7 @@
 import os
 import sys
 import json
+import copy
 import pickle
 
 import mtdetect.transformer_mm_explainability.example_translation_nllb as example_translation_nllb
@@ -50,8 +51,10 @@ lm_pretrained_model = default_sys_argv(20, None)
 lm_model_input = default_sys_argv(21, None, f=lambda q: None if q == '' else q)
 lm_frozen_params = default_sys_argv(22, True, f=lambda q: True if q == '' else bool(int(q)))
 lm_learning_rate = default_sys_argv(23, 1e-5, f=float)
+cnn_model_input = default_sys_argv(24, '')
 force_pickle_file = True # Change manually
 skip_test = False # Change manually
+disable_cnn = "MTDETECT_DISABLE_CNN" in os.environ and bool(int(os.environ["MTDETECT_DISABLE_CNN"]))
 
 if lm_pretrained_model:
     print(f"LM is going to be used: {lm_pretrained_model} (local file: {lm_model_input})")
@@ -338,6 +341,12 @@ assert len(channels_factor_len_set) in (1, 2), channels_factor_len_set
 if len(channels_factor_len_set) == 2:
     assert 1 in channels_factor_len_set, channels_factor_len_set
 
+if disable_cnn:
+    assert lang_model, "disable_cnn does not support not providing lang_model"
+    assert not cnn_model_input
+
+    print("CNN disabled")
+
 if multichannel:
     channels = 1
     channels_factor = 1
@@ -416,25 +425,28 @@ for _direction, _teacher_forcing, _ignore_attention in zip(direction, teacher_fo
 if lang_model:
     # Add LM data to inputs
 
-    max_length_encoder = utils.get_encoder_max_length(lang_model, tokenizer)
-    max_length_encoder = min(max_length_encoder, 512) # TODO add user argument?
+    _max_length_encoder = 512 # TODO add user argument?
+    max_length_encoder = utils.get_encoder_max_length(lang_model, tokenizer, max_length_tokens=_max_length_encoder)
+    max_length_encoder = min(max_length_encoder, _max_length_encoder)
     data_input_all_keys.append("lm_inputs")
+
+    print(f"Max length: {max_length_encoder}")
 
     for d, desc in ((train_data, "train"), (dev_data, "dev"), (test_data, "test")):
         if desc == "test" and skip_test:
             continue
 
+        assert "inputs_lm_inputs" not in d, desc
+
         d["inputs_lm_inputs"] = []
         all_texts = []
 
         for source_text, target_text in zip(d["source_text"], d["target_text"]):
-            # TODO randomize source_text|target_text and target_text|source_text ?
-
             all_texts.append(f"{source_text}{tokenizer.sep_token}{target_text}")
 
         inputs = tokenizer.batch_encode_plus(all_texts, return_tensors=None, add_special_tokens=True, max_length=max_length_encoder,
                                              return_attention_mask=False, truncation=True, padding="longest")
-        d["inputs_lm_inputs"] = (inputs["input_ids"])
+        d["inputs_lm_inputs"] = inputs["input_ids"]
         inputs = torch.tensor(d["inputs_lm_inputs"])
 
         assert inputs.shape == (len(d["source_text"]), min(max_length_encoder, inputs.shape[1])), inputs.shape
@@ -560,17 +572,21 @@ def select_random_group_collate_fn(batch):
     return data, target
 
 class SimpleCNN(nn.Module):
-    def __init__(self, c, w, h, num_classes, all_keys, pooling="max", only_conv=True, lang_model=None):
+    def __init__(self, c, w, h, num_classes, all_keys, pooling="max", only_conv=True, lang_model=None, disable_cnn=False):
         super(SimpleCNN, self).__init__()
+
+        if disable_cnn:
+            self.channels = 1
+        else:
+            self.channels = c
 
         self.only_conv = only_conv
         self.all_keys = list(all_keys)
-        self.channels = c
         self.dimensions = (w, h)
-        self.lang_model = lang_model
         self.lang_model_hidden_size = 0
+        self.disable_cnn = disable_cnn
 
-        if self.lang_model is not None:
+        if lang_model is not None:
             assert "lm_inputs" in self.all_keys
 
             self.lang_model_hidden_size = self.lang_model.config.hidden_size
@@ -586,7 +602,7 @@ class SimpleCNN(nn.Module):
         self.padding = 1
         self.layer_size = 32
         self.conv_layers = 2
-        self.in_channels = [c, *[self.layer_size * (2 ** i) for i in range(self.conv_layers - 1)]]
+        self.in_channels = [self.channels, *[self.layer_size * (2 ** i) for i in range(self.conv_layers - 1)]]
         self.out_channels = self.in_channels[1:] + [self.layer_size * (2 ** len(self.in_channels[1:]))]
         self.convs = nn.ModuleList([nn.Conv2d(in_channels=self.in_channels[i], out_channels=self.out_channels[i],
                                               kernel_size=self.kernel_size, stride=1, padding=self.padding,
@@ -607,7 +623,11 @@ class SimpleCNN(nn.Module):
         self.pool = pool
 
         # Calculate the size of the feature map after the convolutional layers and pooling
-        self._to_linear = self.linear(torch.rand(1, self.channels, *self.dimensions)).numel()
+        if self.disable_cnn:
+            self._to_linear = 0
+        else:
+            self._to_linear = self.linear(torch.rand(1, self.channels, *self.dimensions)).numel()
+
         self._to_linear += self.lang_model_hidden_size
 
         # Fully connected layers
@@ -618,6 +638,9 @@ class SimpleCNN(nn.Module):
         self.dropout = nn.Dropout(p=0.5)
 
         self._initialize_weights()
+
+        # Store lang model after weights initialization to avoid problems......
+        self.lang_model = lang_model
 
     def _initialize_weights(self):
         for m in self.modules():
@@ -662,7 +685,7 @@ class SimpleCNN(nn.Module):
             last_hidden_state = output["hidden_states"][-1]
             classifier_token = last_hidden_state[:,0,:]
 
-            assert classifier_token.shape == (x.shape[0], self.lang_model_hidden_size)
+            assert classifier_token.shape == (bs, self.lang_model_hidden_size)
 
             x = torch.cat([x, classifier_token], dim=1)
 
@@ -674,14 +697,14 @@ class SimpleCNN(nn.Module):
         return x
 
 class MultiChannelCNN(nn.Module):
-    def __init__(self, num_classes, simple_cnns, all_keys, lang_model=None):
+    def __init__(self, num_classes, simple_cnns, all_keys, lang_model=None, disable_cnn=False):
         super(MultiChannelCNN, self).__init__()
 
         self.all_keys = list(all_keys)
-        self.lang_model = lang_model
         self.lang_model_hidden_size = 0
+        self.disable_cnn = disable_cnn
 
-        if self.lang_model is not None:
+        if lang_model is not None:
             assert "lm_inputs" in self.all_keys
 
             self.lang_model_hidden_size = self.lang_model.config.hidden_size
@@ -698,8 +721,13 @@ class MultiChannelCNN(nn.Module):
 
         assert len(self.all_keys) == len(simple_cnns)
 
-        self.simple_cnns = nn.ModuleDict({k: v for k, v in simple_cnns.items()})
-        self._to_linear = {k: simple_cnns[k]._to_linear for k in simple_cnns.keys()}
+        if self.disable_cnn:
+            self.simple_cnns = None
+            self._to_linear = {k: 0 for k in simple_cnns.keys()}
+        else:
+            self.simple_cnns = nn.ModuleDict({k: v for k, v in simple_cnns.items()})
+            self._to_linear = {k: simple_cnns[k]._to_linear for k in simple_cnns.keys()}
+
         self._to_linear_sum = sum([self._to_linear[k] for k in self._to_linear.keys()])
         self._to_linear_sum += self.lang_model_hidden_size
 
@@ -711,6 +739,9 @@ class MultiChannelCNN(nn.Module):
         self.dropout = nn.Dropout(p=0.5)
 
         self._initialize_weights()
+
+        # Store lang model after weights initialization to avoid problems......
+        self.lang_model = lang_model
 
     def _initialize_weights(self):
         for m in self.modules():
@@ -728,10 +759,12 @@ class MultiChannelCNN(nn.Module):
         assert isinstance(x, dict), type(x)
 
         lm_input_ids = x["lm_inputs"] if self.lang_model else None
-        x = [self.simple_cnns[k](x[k]) for k in self.all_keys]
-        x = [_x.view(-1, self._to_linear[k]) for _x, k in zip(x, self.all_keys)]
-        x = torch.cat(x, dim=1)
-        bs = x.shape[0]
+
+        if not self.disable_cnn:
+            x = [self.simple_cnns[k](x[k]) for k in self.all_keys]
+            x = [_x.view(-1, self._to_linear[k]) for _x, k in zip(x, self.all_keys)]
+            x = torch.cat(x, dim=1)
+            bs = x.shape[0]
 
         if self.lang_model:
             lm_attention_mask = utils.get_attention_mask(tokenizer, lm_input_ids)
@@ -739,9 +772,13 @@ class MultiChannelCNN(nn.Module):
             last_hidden_state = output["hidden_states"][-1]
             classifier_token = last_hidden_state[:,0,:]
 
-            assert classifier_token.shape == (x.shape[0], self.lang_model_hidden_size)
+            if not self.disable_cnn:
+                assert classifier_token.shape == (bs, self.lang_model_hidden_size)
 
-            x = torch.cat([x, classifier_token], dim=1)
+                x = torch.cat([x, classifier_token], dim=1)
+            else:
+                x = classifier_token
+                bs = x.shape[0]
 
         assert x.shape == (bs, self._to_linear_sum)
 
@@ -832,10 +869,42 @@ if multichannel:
         del _cnn_pooling[i]
         del _data_input_all_keys[i]
 
-    simple_cnns = {k: SimpleCNN(channels, cnn_width, cnn_height, num_classes, _data_input_all_keys, pooling=pooling, only_conv=True) for k, pooling in zip(_data_input_all_keys, _cnn_pooling)}
-    model = MultiChannelCNN(num_classes, simple_cnns, data_input_all_keys, lang_model=lang_model)
+    simple_cnns = {k: SimpleCNN(channels, cnn_width, cnn_height, num_classes, _data_input_all_keys, pooling=pooling, only_conv=True, disable_cnn=False) for k, pooling in zip(_data_input_all_keys, _cnn_pooling)}
+    model = MultiChannelCNN(num_classes, simple_cnns, data_input_all_keys, lang_model=lang_model, disable_cnn=disable_cnn)
 else:
-    model = SimpleCNN(channels, cnn_width, cnn_height, num_classes, data_input_all_keys, pooling=cnn_pooling[0], only_conv=False, lang_model=lang_model)
+    model = SimpleCNN(channels, cnn_width, cnn_height, num_classes, data_input_all_keys, pooling=cnn_pooling[0], only_conv=False, lang_model=lang_model, disable_cnn=disable_cnn)
+
+if cnn_model_input:
+    assert not disable_cnn
+
+    old_model_state_dict_keys = set(model.state_dict().keys())
+    cnn_state_dict = torch.load(cnn_model_input, weights_only=True)
+
+    if lang_model and model.state_dict()["fc1.weight"].shape[1] - cnn_state_dict["fc1.weight"].shape[1] == lang_model.config.hidden_size:
+        # Our model has a longer feed-forward layer because of lang_model
+        fc1_weight = copy.deepcopy(cnn_state_dict["fc1.weight"])
+        fc1_bias = copy.deepcopy(cnn_state_dict["fc1.bias"])
+
+        assert model.hidden == fc1_weight.shape[0] == fc1_bias.shape[0]
+
+        cnn_state_dict["fc1.weight"] = nn.Parameter(torch.rand(model.hidden, model.state_dict()["fc1.weight"].shape[1]), requires_grad=False)
+
+        nn.init.xavier_normal_(cnn_state_dict["fc1.weight"])
+
+        cnn_state_dict["fc1.bias"] = nn.Parameter(fc1_bias, requires_grad=True)
+        cnn_state_dict["fc1.weight"][:,:fc1_weight.shape[1]] = fc1_weight.clone().detach()
+
+        cnn_state_dict["fc1.weight"].requires_grad_(True)
+
+    new_model_state_dict_keys = set(cnn_state_dict.keys())
+
+    model_state_dict_keys_intersection = set.intersection(old_model_state_dict_keys, new_model_state_dict_keys)
+    model_state_dict_keys_new_old_diff = set.difference(new_model_state_dict_keys, old_model_state_dict_keys)
+    model_state_dict_keys_old_new_diff = set.difference(old_model_state_dict_keys, new_model_state_dict_keys)
+
+    print(f"CNN model keys (old: {len(old_model_state_dict_keys)}; new: {len(new_model_state_dict_keys)}; intersection: {len(model_state_dict_keys_intersection)}): new - old: {model_state_dict_keys_new_old_diff}: old - new: {model_state_dict_keys_old_new_diff}")
+
+    model.load_state_dict(cnn_state_dict, strict=False)
 
 model = model.to(device)
 
@@ -852,14 +921,19 @@ if lang_model:
 
 loss_function = nn.BCELoss(reduction="mean") # BCELoss vs BCEWithLogitsLoss: check https://github.com/pytorch/pytorch/issues/49844
 loss_apply_sigmoid = True # https://pytorch.org/docs/stable/generated/torch.nn.BCELoss.html
-lm_model_parameters = list(list(filter(lambda p: p.requires_grad, lang_model.parameters()))) if lang_model else []
-model_parameters = list(filter(lambda p: p.requires_grad, [p for k, p in model.named_parameters() if not k.startswith("lang_model.")]))
-optimizer_args = [{"params": model_parameters}]
+lm_model_parameters = list(filter(lambda p: p.requires_grad, lang_model.parameters())) if lang_model else []
+model_parameters_data = list(filter(lambda d: d[1].requires_grad, [(k, p) for k, p in model.named_parameters() if not k.startswith("lang_model.")]))
+model_parameters = [d[1] for d in model_parameters_data]
+model_parameters_names = [d[0] for d in model_parameters_data]
+optimizer_args = [{"params": model_parameters, "lr": learning_rate}]
+
+assert len(model_parameters_data) == len(model_parameters) == len(model_parameters_names)
 
 if lm_model_parameters:
     optimizer_args.append({"params": lm_model_parameters, "lr": lm_learning_rate})
 
 print(f"Parameters with requires_grad=True: {len(model_parameters)} (LM: {len(lm_model_parameters)})")
+#print(f"CNN parameters with requires_grad=True: {' '.join(model_parameters_names)}")
 
 optimizer = torch.optim.AdamW(optimizer_args, lr=learning_rate)
 lr_scheduler_str = "linear"
@@ -878,7 +952,8 @@ early_stopping_best_result_dev = -np.inf # accuracy
 early_stopping_best_result_train = -np.inf # accuracy
 early_stopping_best_loss = np.inf
 current_patience = 0
-epoch_loss = None
+epoch_loss = []
+sum_epoch_loss = np.inf
 
 print("Training...")
 
@@ -891,16 +966,16 @@ for epoch in range(epochs):
     dev_results = eval(model, dev_dataloader, data_input_all_keys, device)
     better_loss_result = False
 
-    if epoch_loss is not None and epoch_loss < early_stopping_best_loss:
-        print(f"Better loss result: {early_stopping_best_loss} -> {epoch_loss}")
+    if len(epoch_loss) > 0 and sum_epoch_loss < early_stopping_best_loss:
+        print(f"Better loss result: {early_stopping_best_loss} -> {sum_epoch_loss}")
 
         better_loss_result = True
-        early_stopping_best_loss = epoch_loss
+        early_stopping_best_loss = sum_epoch_loss
 
     print(f"Train eval: {train_results}")
     print(f"Dev eval: {dev_results}")
 
-    epoch_loss = 0.0
+    epoch_loss = []
     early_stopping_metric_train = train_results["acc"]
     early_stopping_metric_dev = dev_results["acc"]
     better_train_result = False
@@ -922,7 +997,7 @@ for epoch in range(epochs):
         if save_model_path:
             print(f"Saving best model: {save_model_path}")
 
-            torch.save(model, save_model_path)
+            torch.save(model.state_dict(), save_model_path)
     else:
         current_patience += 1
 
@@ -942,23 +1017,36 @@ for epoch in range(epochs):
         result = apply_inference(model, data, target=target, loss_function=loss_function, loss_apply_sigmoid=loss_apply_sigmoid)
         loss = result["loss"]
 
-        epoch_loss += loss
+        epoch_loss.append(loss.cpu().detach().item())
 
         loss.backward()
 
         optimizer.step()
         scheduler.step()
 
-    print(f"Loss: {epoch_loss}")
+        if (batch_idx + 1) % 100 == 0:
+            sum_partial_loss = sum(epoch_loss[-100:])
 
-    assert str(epoch_loss) != "nan", "Some values in the input data are NaN"
+            print(f"Epoch loss (sum last 100 steps): step {batch_idx + 1}: {sum_partial_loss}")
+
+    sum_epoch_loss = sum(epoch_loss)
+
+    print(f"Epoch loss: {sum_epoch_loss}")
+
+    assert str(sum_epoch_loss) != "nan", "Some values in the input data are NaN"
 
     sys.stdout.flush()
 
 if save_model_path:
     print(f"Loading best model: {save_model_path}")
 
-    model = torch.load(save_model_path, weights_only=False, map_location=device)
+    model_state_dict = torch.load(save_model_path, weights_only=True, map_location=device)
+
+    assert model.state_dict().keys() == model_state_dict.keys()
+
+    model.load_state_dict(model_state_dict)
+
+    model = model.to(device)
 
 train_results = eval(model, train_dataloader, data_input_all_keys, device)
 

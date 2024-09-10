@@ -30,6 +30,9 @@ def inference(model, inputs_and_outputs, loss_function=None, device=None, thresh
     # Inference
     model_outputs = model(urls, attention_mask)
     outputs = model_outputs.logits
+    bs = outputs.shape[0]
+
+    assert outputs.shape == (bs, 1), outputs.shape
 
     # Calcule loss
     outputs = outputs.squeeze(1) # (batch_size, 1) -> (batch_size,)
@@ -131,7 +134,7 @@ def inference_from_stdin(model, tokenizer, batch_size, loss_function=None, devic
         output_data.append(label) # might be a fake value
 
     _dataset = dataset.SmartBatchingURLsDataset(input_data, output_data, tokenizer, max_length_tokens,
-                                                set_desc="stdin_inference", remove_instead_of_truncate=False)
+                                                set_desc="stdin_inference")
     dataloader = _dataset.get_dataloader(batch_size, device, dataset_workers)
 
     for batch in dataloader:

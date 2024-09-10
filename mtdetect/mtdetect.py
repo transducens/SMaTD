@@ -507,7 +507,7 @@ def main(args):
                 if global_step % 100 == 0:
                     _loss = sum(all_loss[-100:])
 
-                    logger.debug("[global_step:%d] Training loss (average last 100 steps): %s", global_step, _loss)
+                    logger.debug("[global_step:%d] Training loss (sum last 100 steps): %s", global_step, _loss)
 
             if eval_strategy == "steps" and global_step % eval_steps == 0:
                 # Patience
