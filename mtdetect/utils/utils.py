@@ -9,8 +9,10 @@ from contextlib import contextmanager
 import argparse
 import warnings
 
+import random
 import torch
 import transformers
+import numpy as np
 
 logger = logging.getLogger("mtdetect")
 
@@ -285,3 +287,9 @@ def get_tokenizer(pretrained_model, logger=None):
                     logger.warning("Tokenizer warning: %s", str(warning.message))
 
     return tokenizer
+
+def init_random_with_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)

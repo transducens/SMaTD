@@ -294,10 +294,7 @@ def main(args):
         logger.warning("Flag --model-input is recommended when --inference is provided")
 
     if seed >= 0:
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
+        utils.init_random_with_seed(seed)
 
         logger.debug("Deterministic values enabled (not fully-guaranteed): seed %d", seed)
     else:

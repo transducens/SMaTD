@@ -18,6 +18,12 @@ import transformers
 
 print(f"Provided args: {sys.argv}")
 
+seed = int(os.environ["MTDETECT_RANDOM_SEED"]) if "MTDETECT_RANDOM_SEED" in os.environ else np.random.randint(2 ** 32 - 1)
+
+print(f"Random seed: {seed}")
+
+utils.init_random_with_seed(seed)
+
 def default_sys_argv(n, default, f=str):
     return f(sys.argv[n]) if len(sys.argv) > n else default
 
@@ -481,12 +487,13 @@ if not skip_test:
     assert len(set([k[7:] for k in test_data.keys() if k.startswith("inputs_")]).intersection(set(data_input_all_keys))) == len(data_input_all_keys), f"{[k for k in test_data.keys() if k.startswith('inputs_')]} vs keys"
 
 class MyDataset(Dataset):
-    def __init__(self, data, all_keys, create_groups=False, return_group=False):
+    def __init__(self, data, all_keys, create_groups=False, return_group=False, common_format_for_groups=True):
         self.create_groups = create_groups
         self.return_group = return_group
         self.data = {}
         self.uniq_groups = []
         self.all_keys = all_keys
+        self.common_format_for_groups = common_format_for_groups
 
         if create_groups:
             self.groups = data["groups"]
@@ -533,7 +540,7 @@ class MyDataset(Dataset):
         x = {k: [v.clone().detach().type(torch.float32) if k != "lm_inputs" else v.clone().detach() for v in l] for k, l in self.data[group]['x'].items()}
         y = [_y.clone().detach().type(torch.float32) for _y in self.data[group]['y']]
 
-        if not self.create_groups:
+        if not self.create_groups and not self.common_format_for_groups:
             assert len(y) == 1
 
             y = y[0]
@@ -548,28 +555,52 @@ class MyDataset(Dataset):
 
         return x, y
 
-def select_random_group_collate_fn(batch):
-    data, target = [], []
+def wrapper_select_random_group_collate_fn(tokenizer=None, remove_padding=True):
+    remove_padding = False if tokenizer is None else remove_padding
 
-    for idx in range(len(batch)):
-        x, y, group = batch[idx]
+    def collate_fn(batch, remove_padding=True, padding_id=None):
+        data, target = [], []
 
-        assert len(y) > 0
+        for idx in range(len(batch)):
+            x, y = batch[idx][:2]
 
-        for _x in x.values():
-            assert len(_x) == len(y)
+            assert len(y) > 0
 
-        group_idx = np.random.randint(len(y))
-        output_x = {k: v[group_idx] for k, v in x.items()}
-        output_y = y[group_idx]
+            for _x in x.values():
+                assert len(_x) == len(y)
 
-        data.append(output_x)
-        target.append(output_y)
+            group_idx = np.random.randint(len(y))
+            output_x = {k: v[group_idx] for k, v in x.items()}
+            output_y = y[group_idx]
 
-    target = torch.stack(target, dim=0)
-    data = {k: torch.stack([v[k] for v in data], dim=0) for k in data[0].keys()}
+            data.append(output_x)
+            target.append(output_y)
 
-    return data, target
+        target = torch.stack(target, dim=0)
+        data = {k: torch.stack([v[k] for v in data], dim=0) for k in data[0].keys()}
+
+        if remove_padding and padding_id is not None and "lm_inputs" in data.keys():
+            lm_len = data["lm_inputs"].shape[1]
+
+            assert data["lm_inputs"].shape == (len(batch), lm_len), data["lm_inputs"].shape
+
+            mask = ~(torch.all(data["lm_inputs"] == padding_id, dim=0))
+
+            assert mask.shape == (lm_len,), mask.shape
+
+            uc, uc_counts = torch.unique_consecutive(mask, return_counts=True)
+            uc = uc.tolist()
+            uc_counts = uc_counts.tolist()
+
+            assert uc in ([True, False], [True]), mask
+
+            data["lm_inputs"] = data["lm_inputs"][:, mask]
+
+            assert data["lm_inputs"].shape == (len(batch), uc_counts[0]), data["lm_inputs"].shape
+
+        return data, target
+
+    return lambda batch: collate_fn(batch, remove_padding=remove_padding, padding_id=tokenizer.pad_token_id)
 
 class SimpleCNN(nn.Module):
     def __init__(self, c, w, h, num_classes, all_keys, pooling="max", only_conv=True, lang_model=None, disable_cnn=False):
@@ -850,9 +881,10 @@ def eval(model, dataloader, all_keys, device):
 num_workers = 0
 train_dataset = MyDataset(train_data, data_input_all_keys, create_groups=True, return_group=True)
 train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers,
-                              collate_fn=select_random_group_collate_fn)
+                              collate_fn=wrapper_select_random_group_collate_fn(tokenizer=tokenizer, remove_padding=True))
 dev_dataset = MyDataset(dev_data, data_input_all_keys)
-dev_dataloader = DataLoader(dev_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+dev_dataloader = DataLoader(dev_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers,
+                            collate_fn=wrapper_select_random_group_collate_fn(tokenizer=tokenizer, remove_padding=True))
 
 # Model
 num_classes = 1
@@ -1029,6 +1061,8 @@ for epoch in range(epochs):
 
             print(f"Epoch loss (sum last 100 steps): step {batch_idx + 1}: {sum_partial_loss}")
 
+            sys.stdout.flush()
+
     sum_epoch_loss = sum(epoch_loss)
 
     print(f"Epoch loss: {sum_epoch_loss}")
@@ -1068,7 +1102,8 @@ if not skip_test:
     torch.cuda.empty_cache()
 
     test_dataset = MyDataset(test_data, data_input_all_keys)
-    test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers,
+                                 collate_fn=wrapper_select_random_group_collate_fn(tokenizer=tokenizer, remove_padding=True))
 
     test_results = eval(model, test_dataloader, data_input_all_keys, device)
 
