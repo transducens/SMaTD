@@ -597,8 +597,11 @@ def wrapper_select_random_group_collate_fn(tokenizer=None, remove_padding=True, 
             target.append(output_y)
 
             if return_text:
-                source_text.append(_source_text)
-                target_text.append(_target_text)
+                assert len(_source_text) == len(y)
+                assert len(_target_text) == len(y)
+
+                source_text.append(_source_text[group_idx])
+                target_text.append(_target_text[group_idx])
 
         target = torch.stack(target, dim=0)
         data = {k: torch.stack([v[k] for v in data], dim=0) for k in data[0].keys()}
@@ -883,6 +886,7 @@ def eval(model, dataloader, all_keys, device, print_result=False, print_desc='-'
 
     all_outputs = []
     all_labels = []
+    print_idx = 0
 
     for data, target in dataloader:
         _data = {k: data[k].to(device) for k in all_keys}
@@ -899,10 +903,11 @@ def eval(model, dataloader, all_keys, device, print_result=False, print_desc='-'
         if print_result:
             assert len(data["source_text"]) == len(outputs)
             assert len(data["target_text"]) == len(outputs)
-            assert len(outputs.shape) == 1
 
-            for idx, (source_text, target_text, output) in enumerate(zip(data["source_text"], data["target_text"], outputs)):
-                print(f"inference ({print_desc})\t{idx}\t{output}\t{source_text}\t{target_text}")
+            for source_text, target_text, output in zip(data["source_text"], data["target_text"], outputs):
+                print(f"inference: {print_desc}\t{print_idx}\t{output}\t{source_text}\t{target_text}")
+
+                print_idx += 1
 
     all_outputs = torch.as_tensor(all_outputs)
     all_labels = torch.as_tensor(all_labels)
@@ -1158,6 +1163,6 @@ if not skip_test:
     test_dataset = MyDataset(test_data, data_input_all_keys, add_text=model_inference)
     test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=collate_fn)
 
-    test_results = eval(model, test_dataloader, data_input_all_keys, device, print_result=model_inference, print_desc="train")
+    test_results = eval(model, test_dataloader, data_input_all_keys, device, print_result=model_inference, print_desc="test")
 
     print(f"Final test eval: {test_results}")
