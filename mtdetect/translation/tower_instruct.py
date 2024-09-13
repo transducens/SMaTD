@@ -24,13 +24,16 @@ def translate(batch, device):
     if _pipe.device != device:
         _pipe.model = pipe.model.to(device)
 
-    prompt = _pipe.tokenizer.apply_chat_template(batch, tokenize=False, add_generation_prompt=True)
-    output = _pipe(prompt, max_new_tokens=256, do_sample=False)
-    output = [o["generated_text"] for o in output]
+    prompt = [_pipe.tokenizer.apply_chat_template([b], tokenize=False, add_generation_prompt=True) for b in batch]
+    output = _pipe(prompt, max_new_tokens=512, do_sample=False)
 
-    assert len(output) == len(batch)
+    assert len(output) == len(batch), f"{output} vs {batch}"
 
     for idx, o in enumerate(output):
+        assert len(o) == 1
+
+        o = o[0]["generated_text"]
+
         assert isinstance(o, str)
 
         i = o.find("\n<|im_start|>assistant\n")
@@ -59,11 +62,13 @@ for l in sys.stdin:
 
         util.print_translation(translations, sentences)
 
-        batch = sentences = []
+        batch = []
+        sentences = []
 
 if len(batch) > 0:
     translations, current_patience = util.translate_oom_aware(batch, translate, device, current_patience=current_patience)
 
     util.print_translation(translations, sentences)
 
-    batch = sentences = []
+    batch = []
+    sentences = []
