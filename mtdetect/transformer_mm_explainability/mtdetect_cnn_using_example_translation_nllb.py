@@ -492,13 +492,13 @@ if not skip_test:
     assert len(set([k[7:] for k in test_data.keys() if k.startswith("inputs_")]).intersection(set(data_input_all_keys))) == len(data_input_all_keys), f"{[k for k in test_data.keys() if k.startswith('inputs_')]} vs keys"
 
 class MyDataset(Dataset):
-    def __init__(self, data, all_keys, create_groups=False, return_group=False, common_format_for_groups=True):
+    def __init__(self, data, all_keys, create_groups=False, return_group=False, add_text=False):
         self.create_groups = create_groups
         self.return_group = return_group
         self.data = {}
         self.uniq_groups = []
         self.all_keys = all_keys
-        self.common_format_for_groups = common_format_for_groups
+        self.add_text = add_text
 
         if create_groups:
             self.groups = data["groups"]
@@ -532,10 +532,18 @@ class MyDataset(Dataset):
                     'y': [],
                 }
 
+                if self.add_text:
+                    self.data[group]["source_text"] = []
+                    self.data[group]["target_text"] = []
+
             for k in self.all_keys:
                 self.data[group]['x'][k].append(data[f"inputs_{k}"][idx])
 
             self.data[group]['y'].append(data["labels"][idx])
+
+            if self.add_text:
+                self.data[group]["source_text"].append(data["source_text"][idx])
+                self.data[group]["target_text"].append(data["target_text"][idx])
 
     def __len__(self):
         return len(self.data)
@@ -545,29 +553,36 @@ class MyDataset(Dataset):
         x = {k: [v.clone().detach().type(torch.float32) if k != "lm_inputs" else v.clone().detach() for v in l] for k, l in self.data[group]['x'].items()}
         y = [_y.clone().detach().type(torch.float32) for _y in self.data[group]['y']]
 
-        if not self.create_groups and not self.common_format_for_groups:
+        if not self.create_groups:
             assert len(y) == 1
-
-            y = y[0]
 
             for k in self.all_keys:
                 assert len(x[k]) == 1
 
-                x[k] = x[k][0]
+        result = {"x": x, "y": y}
 
         if self.return_group:
-            return x, y, group
+            result["group"] = group
 
-        return x, y
+        if self.add_text:
+            result["source_text"] = self.data[group]["source_text"]
+            result["target_text"] = self.data[group]["target_text"]
 
-def wrapper_select_random_group_collate_fn(tokenizer=None, remove_padding=True):
+        return result
+
+def wrapper_select_random_group_collate_fn(tokenizer=None, remove_padding=True, return_text=False):
     remove_padding = False if tokenizer is None else remove_padding
+    padding_id = None if tokenizer is None else tokenizer.pad_token_id
 
-    def collate_fn(batch, remove_padding=True, padding_id=None):
+    def collate_fn(batch, remove_padding=True, padding_id=None, return_text=False):
         data, target = [], []
+        source_text, target_text = [], []
 
         for idx in range(len(batch)):
-            x, y = batch[idx][:2]
+            x = batch[idx]["x"]
+            y = batch[idx]["y"]
+            _source_text = batch[idx]["source_text"] if return_text else None
+            _target_text = batch[idx]["target_text"] if return_text else None
 
             assert len(y) > 0
 
@@ -580,6 +595,10 @@ def wrapper_select_random_group_collate_fn(tokenizer=None, remove_padding=True):
 
             data.append(output_x)
             target.append(output_y)
+
+            if return_text:
+                source_text.append(_source_text)
+                target_text.append(_target_text)
 
         target = torch.stack(target, dim=0)
         data = {k: torch.stack([v[k] for v in data], dim=0) for k in data[0].keys()}
@@ -603,9 +622,16 @@ def wrapper_select_random_group_collate_fn(tokenizer=None, remove_padding=True):
 
             assert data["lm_inputs"].shape == (len(batch), uc_counts[0]), data["lm_inputs"].shape
 
+        if return_text:
+            assert "source_text" not in data.keys()
+            assert "target_text" not in data.keys()
+
+            data["source_text"] = source_text
+            data["target_text"] = target_text
+
         return data, target
 
-    return lambda batch: collate_fn(batch, remove_padding=remove_padding, padding_id=tokenizer.pad_token_id)
+    return lambda batch: collate_fn(batch, remove_padding=remove_padding, padding_id=padding_id, return_text=return_text)
 
 class SimpleCNN(nn.Module):
     def __init__(self, c, w, h, num_classes, all_keys, pooling="max", only_conv=True, lang_model=None, disable_cnn=False):
@@ -859,8 +885,8 @@ def eval(model, dataloader, all_keys, device, print_result=False, print_desc='-'
     all_labels = []
 
     for data, target in dataloader:
-        data = {k: data[k].to(device) for k in all_keys}
-        results = apply_inference(model, data, target=None, loss_function=None, loss_apply_sigmoid=False)
+        _data = {k: data[k].to(device) for k in all_keys}
+        results = apply_inference(model, _data, target=None, loss_function=None, loss_apply_sigmoid=False)
         outputs_classification = results["outputs_classification_detach_list"]
         outputs = results["outputs"]
         outputs = torch.sigmoid(outputs).cpu().detach().tolist()
@@ -896,12 +922,11 @@ def eval(model, dataloader, all_keys, device, print_result=False, print_desc='-'
 
 # Load data
 num_workers = 0
-train_dataset = MyDataset(train_data, data_input_all_keys, create_groups=True, return_group=True)
-train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers,
-                              collate_fn=wrapper_select_random_group_collate_fn(tokenizer=tokenizer, remove_padding=True))
-dev_dataset = MyDataset(dev_data, data_input_all_keys)
-dev_dataloader = DataLoader(dev_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers,
-                            collate_fn=wrapper_select_random_group_collate_fn(tokenizer=tokenizer, remove_padding=True))
+collate_fn = wrapper_select_random_group_collate_fn(tokenizer=tokenizer, remove_padding=True, return_text=model_inference)
+train_dataset = MyDataset(train_data, data_input_all_keys, create_groups=True, return_group=True, add_text=model_inference)
+train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, collate_fn=collate_fn)
+dev_dataset = MyDataset(dev_data, data_input_all_keys, add_text=model_inference)
+dev_dataloader = DataLoader(dev_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=collate_fn)
 
 # Model
 num_classes = 1
@@ -991,7 +1016,7 @@ if not model_inference:
     print(f"Parameters with requires_grad=True: {len(model_parameters)} (LM: {len(lm_model_parameters)})")
     #print(f"CNN parameters with requires_grad=True: {' '.join(model_parameters_names)}")
 
-    optimizer = torch.optim.AdamW(optimizer_args, lr=learning_rate)
+    optimizer = torch.optim.AdamW(optimizer_args, lr=learning_rate, betas=(0.9, 0.999), eps=1e-08, weight_decay=0.0)
     lr_scheduler_str = "linear"
     warmup_steps = 400
 
@@ -1130,9 +1155,8 @@ if not skip_test:
 
     torch.cuda.empty_cache()
 
-    test_dataset = MyDataset(test_data, data_input_all_keys)
-    test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers,
-                                 collate_fn=wrapper_select_random_group_collate_fn(tokenizer=tokenizer, remove_padding=True))
+    test_dataset = MyDataset(test_data, data_input_all_keys, add_text=model_inference)
+    test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=collate_fn)
 
     test_results = eval(model, test_dataloader, data_input_all_keys, device, print_result=model_inference, print_desc="train")
 
