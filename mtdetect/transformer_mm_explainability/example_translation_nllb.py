@@ -260,7 +260,7 @@ def explainability(source_text, target_text, source_lang="eng_Latn", target_lang
     #  "transformers_version": "4.27.0.dev0"
     #}
 
-    decoder_start_token_id = tokenizer.eos_token_id
+    decoder_start_token_id = tokenizer.eos_token_id # Why eos instead of bos token: https://github.com/huggingface/transformers/issues/19943#issuecomment-1479590176
 
     # _from_model_config : https://github.com/huggingface/transformers/blob/52cb4034ada381fe1ffe8d428a1076e5411a8026/src/transformers/trainer_seq2seq.py#L315
     #  ... it handles the generation configuration override by the user, so we do not need to worry about it

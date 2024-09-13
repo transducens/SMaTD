@@ -24,6 +24,10 @@ print(f"Random seed: {seed}")
 
 utils.init_random_with_seed(seed)
 
+force_pickle_file = True # Change manually
+skip_test = False # Change manually
+disable_cnn = "MTDETECT_DISABLE_CNN" in os.environ and bool(int(os.environ["MTDETECT_DISABLE_CNN"]))
+
 def default_sys_argv(n, default, f=str):
     return f(sys.argv[n]) if len(sys.argv) > n else default
 
@@ -58,14 +62,15 @@ lm_model_input = default_sys_argv(21, None, f=lambda q: None if q == '' else q)
 lm_frozen_params = default_sys_argv(22, True, f=lambda q: True if q == '' else bool(int(q)))
 lm_learning_rate = default_sys_argv(23, 1e-5, f=float)
 cnn_model_input = default_sys_argv(24, '')
-force_pickle_file = True # Change manually
-skip_test = False # Change manually
-disable_cnn = "MTDETECT_DISABLE_CNN" in os.environ and bool(int(os.environ["MTDETECT_DISABLE_CNN"]))
+model_inference = default_sys_argv(25, False, f=lambda q: True if q == '' else bool(int(q)))
+
+if model_inference:
+    lm_frozen_params = True
 
 if lm_pretrained_model:
     print(f"LM is going to be used: {lm_pretrained_model} (local file: {lm_model_input})")
 
-if lm_pretrained_model and not lm_model_input and lm_frozen_params:
+if lm_pretrained_model and not lm_model_input and lm_frozen_params and not model_inference:
     print(f"warning: LM provided but it is not a fine-tuned model and its parameters are frozen: the format is src<sep>trg, and the output is the first output token, which might not be the expected behaviour for the model")
 
 def load_model(model_input, pretrained_model, device, name=None):
@@ -825,6 +830,8 @@ def apply_inference(model, data, target=None, loss_function=None, threshold=0.5,
     outputs = outputs.squeeze(1)
     loss = None
 
+    assert len(outputs.shape) == 1, outputs.shape
+
     if loss_function is not None and target is not None:
         loss = loss_function(torch.sigmoid(outputs) if loss_apply_sigmoid else outputs, target)
 
@@ -839,7 +846,7 @@ def apply_inference(model, data, target=None, loss_function=None, threshold=0.5,
 
     return results
 
-def eval(model, dataloader, all_keys, device):
+def eval(model, dataloader, all_keys, device, print_result=False, print_desc='-'):
     training = model.training
     training_lm = False if not model.lang_model else model.lang_model.training
 
@@ -855,11 +862,21 @@ def eval(model, dataloader, all_keys, device):
         data = {k: data[k].to(device) for k in all_keys}
         results = apply_inference(model, data, target=None, loss_function=None, loss_apply_sigmoid=False)
         outputs_classification = results["outputs_classification_detach_list"]
+        outputs = results["outputs"]
+        outputs = torch.sigmoid(outputs).cpu().detach().tolist()
         labels = target.cpu()
         labels = torch.round(labels).type(torch.long)
 
         all_outputs.extend(outputs_classification)
         all_labels.extend(labels.tolist())
+
+        if print_result:
+            assert len(data["source_text"]) == len(outputs)
+            assert len(data["target_text"]) == len(outputs)
+            assert len(outputs.shape) == 1
+
+            for idx, (source_text, target_text, output) in enumerate(zip(data["source_text"], data["target_text"], outputs)):
+                print(f"inference ({print_desc})\t{idx}\t{output}\t{source_text}\t{target_text}")
 
     all_outputs = torch.as_tensor(all_outputs)
     all_labels = torch.as_tensor(all_labels)
@@ -926,7 +943,7 @@ if cnn_model_input:
         cnn_state_dict["fc1.bias"] = nn.Parameter(fc1_bias, requires_grad=True)
         cnn_state_dict["fc1.weight"][:,:fc1_weight.shape[1]] = fc1_weight.clone().detach()
 
-        cnn_state_dict["fc1.weight"].requires_grad_(True)
+        cnn_state_dict["fc1.weight"].requires_grad_(not model_inference)
 
     new_model_state_dict_keys = set(cnn_state_dict.keys())
 
@@ -940,54 +957,66 @@ if cnn_model_input:
 
 model = model.to(device)
 
-model.train()
+if model_inference:
+    model.eval()
+else:
+    model.train()
+
+for p in model.parameters():
+    p.requires_grad_(not model_inference)
 
 if lang_model:
     if lm_frozen_params:
         lang_model.eval()
-
-        for p in lang_model.parameters():
-            p.requires_grad_(False)
     else:
         lang_model.train()
 
-loss_function = nn.BCELoss(reduction="mean") # BCELoss vs BCEWithLogitsLoss: check https://github.com/pytorch/pytorch/issues/49844
-loss_apply_sigmoid = True # https://pytorch.org/docs/stable/generated/torch.nn.BCELoss.html
-lm_model_parameters = list(filter(lambda p: p.requires_grad, lang_model.parameters())) if lang_model else []
-model_parameters_data = list(filter(lambda d: d[1].requires_grad, [(k, p) for k, p in model.named_parameters() if not k.startswith("lang_model.")]))
-model_parameters = [d[1] for d in model_parameters_data]
-model_parameters_names = [d[0] for d in model_parameters_data]
-optimizer_args = [{"params": model_parameters, "lr": learning_rate}]
+    for p in lang_model.parameters():
+        p.requires_grad_(not lm_frozen_params)
 
-assert len(model_parameters_data) == len(model_parameters) == len(model_parameters_names)
+if not model_inference:
+    loss_function = nn.BCELoss(reduction="mean") # BCELoss vs BCEWithLogitsLoss: check https://github.com/pytorch/pytorch/issues/49844
+    loss_apply_sigmoid = True # https://pytorch.org/docs/stable/generated/torch.nn.BCELoss.html
+    lm_model_parameters = list(filter(lambda p: p.requires_grad, lang_model.parameters())) if lang_model else []
+    model_parameters_data = list(filter(lambda d: d[1].requires_grad, [(k, p) for k, p in model.named_parameters() if not k.startswith("lang_model.")]))
+    model_parameters = [d[1] for d in model_parameters_data]
+    model_parameters_names = [d[0] for d in model_parameters_data]
+    optimizer_args = [{"params": model_parameters, "lr": learning_rate}]
 
-if lm_model_parameters:
-    optimizer_args.append({"params": lm_model_parameters, "lr": lm_learning_rate})
+    assert len(model_parameters_data) == len(model_parameters) == len(model_parameters_names)
 
-print(f"Parameters with requires_grad=True: {len(model_parameters)} (LM: {len(lm_model_parameters)})")
-#print(f"CNN parameters with requires_grad=True: {' '.join(model_parameters_names)}")
+    if lm_model_parameters:
+        optimizer_args.append({"params": lm_model_parameters, "lr": lm_learning_rate})
 
-optimizer = torch.optim.AdamW(optimizer_args, lr=learning_rate)
-lr_scheduler_str = "linear"
-warmup_steps = 400
+    print(f"Parameters with requires_grad=True: {len(model_parameters)} (LM: {len(lm_model_parameters)})")
+    #print(f"CNN parameters with requires_grad=True: {' '.join(model_parameters_names)}")
 
-print(f"Info: {epochs} epochs, {patience} patience, {lr_scheduler_str} LR scheduler ({warmup_steps} warmup, if applicable), {learning_rate} learning rate, {lm_learning_rate} LM learning rate")
+    optimizer = torch.optim.AdamW(optimizer_args, lr=learning_rate)
+    lr_scheduler_str = "linear"
+    warmup_steps = 400
 
-if lr_scheduler_str == "linear":
-    scheduler = transformers.get_linear_schedule_with_warmup(optimizer, 400, len(train_dataloader) * epochs)
-elif lr_scheduler_str == "OneCycleLR":
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=learning_rate * 1, steps_per_epoch=len(train_dataloader), epochs=epochs)
+    print(f"Info: {epochs} epochs, {patience} patience, {lr_scheduler_str} LR scheduler ({warmup_steps} warmup, if applicable), {learning_rate} learning rate, {lm_learning_rate} LM learning rate")
+
+    if lr_scheduler_str == "linear":
+        scheduler = transformers.get_linear_schedule_with_warmup(optimizer, 400, len(train_dataloader) * epochs)
+    elif lr_scheduler_str == "OneCycleLR":
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=learning_rate * 1, steps_per_epoch=len(train_dataloader), epochs=epochs)
+    else:
+        raise Exception(f"Unexpected LR scheduler: {lr_scheduler_str}")
+
+    early_stopping_best_result_dev = -np.inf # accuracy
+    early_stopping_best_result_train = -np.inf # accuracy
+    early_stopping_best_loss = np.inf
+    current_patience = 0
+    epoch_loss = []
+    sum_epoch_loss = np.inf
+
+if model_inference:
+    print("Inference!")
+
+    epochs = 0
 else:
-    raise Exception(f"Unexpected LR scheduler: {lr_scheduler_str}")
-
-early_stopping_best_result_dev = -np.inf # accuracy
-early_stopping_best_result_train = -np.inf # accuracy
-early_stopping_best_loss = np.inf
-current_patience = 0
-epoch_loss = []
-sum_epoch_loss = np.inf
-
-print("Training...")
+    print("Training!")
 
 sys.stdout.flush()
 
@@ -1071,7 +1100,7 @@ for epoch in range(epochs):
 
     sys.stdout.flush()
 
-if save_model_path:
+if save_model_path and not model_inference:
     print(f"Loading best model: {save_model_path}")
 
     model_state_dict = torch.load(save_model_path, weights_only=True, map_location=device)
@@ -1082,7 +1111,7 @@ if save_model_path:
 
     model = model.to(device)
 
-train_results = eval(model, train_dataloader, data_input_all_keys, device)
+train_results = eval(model, train_dataloader, data_input_all_keys, device, print_result=model_inference, print_desc="train")
 
 print(f"Final train eval: {train_results}")
 
@@ -1091,7 +1120,7 @@ del train_dataloader
 
 torch.cuda.empty_cache()
 
-dev_results = eval(model, dev_dataloader, data_input_all_keys, device)
+dev_results = eval(model, dev_dataloader, data_input_all_keys, device, print_result=model_inference, print_desc="dev")
 
 print(f"Final dev eval: {dev_results}")
 
@@ -1105,6 +1134,6 @@ if not skip_test:
     test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers,
                                  collate_fn=wrapper_select_random_group_collate_fn(tokenizer=tokenizer, remove_padding=True))
 
-    test_results = eval(model, test_dataloader, data_input_all_keys, device)
+    test_results = eval(model, test_dataloader, data_input_all_keys, device, print_result=model_inference, print_desc="train")
 
     print(f"Final test eval: {test_results}")
