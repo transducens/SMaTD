@@ -8,7 +8,7 @@ from transformers import pipeline
 
 source_lang = sys.argv[1] # e.g., Portuguese (check example in https://huggingface.co/Unbabel/TowerInstruct-7B-v0.2)
 target_lang = sys.argv[2] # e.g., Spanish
-batch_size = int(sys.argv[3]) if len(sys.argv) > 3 and len(sys.argv[3]) > 0 else 4
+batch_size = int(sys.argv[3]) if len(sys.argv) > 3 and len(sys.argv[3]) > 0 else 16
 pretrained_model = sys.argv[4] if len(sys.argv) > 4 and len(sys.argv[4]) > 0 else "Unbabel/TowerInstruct-7B-v0.2"
 
 assert batch_size > 0, batch_size
