@@ -293,3 +293,25 @@ def init_random_with_seed(seed):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+def get_rng():
+    result = {
+        "rng_random": random.getstate(),
+        "rng_np": np.random.get_state(),
+        "rng_torch": torch.get_rng_state(),
+    }
+
+    try:
+        result["rng_torch_cuda"] = torch.cuda.get_rng_state()
+    except:
+        result["rng_torch_cuda"] = None
+
+    return result
+
+def set_rng(rng_random, rng_np, rng_torch, rng_torch_cuda=None):
+    random.setstate(rng_random)
+    np.random.set_state(rng_np)
+    torch.set_rng_state(rng_torch)
+
+    if rng_torch_cuda is not None:
+        torch.cuda.set_rng_state(rng_torch_cuda)

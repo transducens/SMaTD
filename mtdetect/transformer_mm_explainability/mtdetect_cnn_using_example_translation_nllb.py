@@ -62,7 +62,12 @@ lm_model_input = default_sys_argv(21, None, f=lambda q: None if q == '' else q)
 lm_frozen_params = default_sys_argv(22, True, f=lambda q: True if q == '' else bool(int(q)))
 lm_learning_rate = default_sys_argv(23, 1e-5, f=float)
 cnn_model_input = default_sys_argv(24, '')
-model_inference = default_sys_argv(25, False, f=lambda q: True if q == '' else bool(int(q)))
+model_inference = default_sys_argv(25, False, f=lambda q: False if q == '' else bool(int(q)))
+gradient_accumulation = default_sys_argv(26, 1, f=lambda q: 1 if q == '' else int(q))
+
+assert gradient_accumulation > 0, gradient_accumulation
+
+print(f"Gradient accumulation: {gradient_accumulation} (if enabled, i.e. > 1, the same results would be obtained if dropout is disabled for both CNN and LM, train shuffle is disabled, and if float precision errors are ignored)")
 
 if model_inference:
     lm_frozen_params = True
@@ -73,15 +78,15 @@ if lm_pretrained_model:
 if lm_pretrained_model and not lm_model_input and lm_frozen_params and not model_inference:
     print(f"warning: LM provided but it is not a fine-tuned model and its parameters are frozen: the format is src<sep>trg, and the output is the first output token, which might not be the expected behaviour for the model")
 
-def load_model(model_input, pretrained_model, device, name=None):
+def load_model(model_input, pretrained_model, device, classifier_dropout=0.0):
     local_model = model_input is not None
-    model = transformers.AutoModelForSequenceClassification.from_pretrained(pretrained_model, num_labels=1)
+    config = transformers.AutoConfig.from_pretrained(pretrained_model, num_labels=1, classifier_dropout=classifier_dropout)
+    model = transformers.AutoModelForSequenceClassification.from_pretrained(pretrained_model, config=config)
     tokenizer = utils.get_tokenizer(pretrained_model)
 
     if local_model:
-        _model_input = f"{model_input}/{name}.pt" if name is not None else model_input
-        state_dict = torch.load(_model_input, weights_only=True, map_location=device) # weights_only: https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models
-                                                                                      # map_location: avoid creating a new process and using additional and useless memory
+        state_dict = torch.load(model_input, weights_only=True, map_location=device) # weights_only: https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models
+                                                                                     # map_location: avoid creating a new process and using additional and useless memory
 
         model.load_state_dict(state_dict)
 
@@ -122,7 +127,9 @@ translation_model_conf = json.dumps(translation_model_conf, indent=4)
 print(f"NLLB conf:\n{translation_model_conf}")
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-lang_model, tokenizer = load_model(lm_model_input, lm_pretrained_model, None) if lm_pretrained_model else (None, None)
+classifier_dropout = 0.1
+cnn_dropout = 0.5
+lang_model, tokenizer = load_model(lm_model_input, lm_pretrained_model, None, classifier_dropout=classifier_dropout) if lm_pretrained_model else (None, None)
 
 def extend_tensor_with_zeros_and_truncate(t, max_width, max_height, device):
     assert len(t.shape) == 2
@@ -637,7 +644,7 @@ def wrapper_select_random_group_collate_fn(tokenizer=None, remove_padding=True, 
     return lambda batch: collate_fn(batch, remove_padding=remove_padding, padding_id=padding_id, return_text=return_text)
 
 class SimpleCNN(nn.Module):
-    def __init__(self, c, w, h, num_classes, all_keys, pooling="max", only_conv=True, lang_model=None, disable_cnn=False):
+    def __init__(self, c, w, h, num_classes, all_keys, pooling="max", only_conv=True, lang_model=None, disable_cnn=False, dropout_p=0.5):
         super(SimpleCNN, self).__init__()
 
         if disable_cnn:
@@ -700,7 +707,7 @@ class SimpleCNN(nn.Module):
         self.fc1 = nn.Linear(self._to_linear, self.hidden)
         self.fc2 = nn.Linear(self.hidden, num_classes)
 
-        self.dropout = nn.Dropout(p=0.5)
+        self.dropout = nn.Dropout(p=dropout_p)
 
         self._initialize_weights()
 
@@ -762,7 +769,7 @@ class SimpleCNN(nn.Module):
         return x
 
 class MultiChannelCNN(nn.Module):
-    def __init__(self, num_classes, simple_cnns, all_keys, lang_model=None, disable_cnn=False):
+    def __init__(self, num_classes, simple_cnns, all_keys, lang_model=None, disable_cnn=False, dropout_p=0.5):
         super(MultiChannelCNN, self).__init__()
 
         self.all_keys = list(all_keys)
@@ -801,7 +808,7 @@ class MultiChannelCNN(nn.Module):
         self.fc1 = nn.Linear(self._to_linear_sum, self.hidden)
         self.fc2 = nn.Linear(self.hidden, num_classes)
 
-        self.dropout = nn.Dropout(p=0.5)
+        self.dropout = nn.Dropout(p=dropout_p)
 
         self._initialize_weights()
 
@@ -833,6 +840,9 @@ class MultiChannelCNN(nn.Module):
 
         if self.lang_model:
             lm_attention_mask = utils.get_attention_mask(tokenizer, lm_input_ids)
+
+            assert lm_attention_mask.shape == lm_input_ids.shape
+
             output = self.lang_model(input_ids=lm_input_ids, attention_mask=lm_attention_mask, output_hidden_states=True)
             last_hidden_state = output["hidden_states"][-1]
             classifier_token = last_hidden_state[:,0,:]
@@ -948,10 +958,10 @@ if multichannel:
         del _cnn_pooling[i]
         del _data_input_all_keys[i]
 
-    simple_cnns = {k: SimpleCNN(channels, cnn_width, cnn_height, num_classes, _data_input_all_keys, pooling=pooling, only_conv=True, disable_cnn=False) for k, pooling in zip(_data_input_all_keys, _cnn_pooling)}
-    model = MultiChannelCNN(num_classes, simple_cnns, data_input_all_keys, lang_model=lang_model, disable_cnn=disable_cnn)
+    simple_cnns = {k: SimpleCNN(channels, cnn_width, cnn_height, num_classes, _data_input_all_keys, pooling=pooling, only_conv=True, disable_cnn=False, dropout_p=cnn_dropout) for k, pooling in zip(_data_input_all_keys, _cnn_pooling)}
+    model = MultiChannelCNN(num_classes, simple_cnns, data_input_all_keys, lang_model=lang_model, disable_cnn=disable_cnn, dropout_p=cnn_dropout)
 else:
-    model = SimpleCNN(channels, cnn_width, cnn_height, num_classes, data_input_all_keys, pooling=cnn_pooling[0], only_conv=False, lang_model=lang_model, disable_cnn=disable_cnn)
+    model = SimpleCNN(channels, cnn_width, cnn_height, num_classes, data_input_all_keys, pooling=cnn_pooling[0], only_conv=False, lang_model=lang_model, disable_cnn=disable_cnn, dropout_p=cnn_dropout)
 
 if cnn_model_input:
     assert not disable_cnn
@@ -1005,7 +1015,7 @@ if lang_model:
         p.requires_grad_(not lm_frozen_params)
 
 if not model_inference:
-    loss_function = nn.BCELoss(reduction="mean") # BCELoss vs BCEWithLogitsLoss: check https://github.com/pytorch/pytorch/issues/49844
+    loss_function = nn.BCELoss(reduction="none") # BCELoss vs BCEWithLogitsLoss: check https://github.com/pytorch/pytorch/issues/49844
     loss_apply_sigmoid = True # https://pytorch.org/docs/stable/generated/torch.nn.BCELoss.html
     lm_model_parameters = list(filter(lambda p: p.requires_grad, lang_model.parameters())) if lang_model else []
     model_parameters_data = list(filter(lambda d: d[1].requires_grad, [(k, p) for k, p in model.named_parameters() if not k.startswith("lang_model.")]))
@@ -1099,23 +1109,43 @@ for epoch in range(epochs):
 
         break
 
+    model.zero_grad()
+    final_loss = None
+    loss_elements = 0
+
     for batch_idx, (data, target) in enumerate(train_dataloader, 1):
         data = {k: data[k].to(device) for k in data_input_all_keys}
         target = target.to(device)
 
-        model.zero_grad()
-
         result = apply_inference(model, data, target=target, loss_function=loss_function, loss_apply_sigmoid=loss_apply_sigmoid)
-        loss = result["loss"]
+        _loss = result["loss"]
 
-        epoch_loss.append(loss.cpu().detach().item())
+        assert len(_loss.shape) == 1, _loss.shape
 
-        loss.backward()
+        loss_elements += _loss.numel()
 
-        optimizer.step()
-        scheduler.step()
+        if final_loss is None:
+            final_loss = torch.sum(_loss)
+        else:
+            final_loss += torch.sum(_loss)
 
-        if (batch_idx + 1) % 100 == 0:
+        if batch_idx % gradient_accumulation == 0 or batch_idx == len(train_dataloader):
+            assert final_loss is not None
+
+            loss = final_loss / loss_elements
+            final_loss = None
+            loss_elements = 0
+
+            epoch_loss.append(loss.cpu().detach().item())
+
+            loss.backward()
+
+            optimizer.step()
+            scheduler.step()
+
+            model.zero_grad()
+
+        if batch_idx % (100 * gradient_accumulation) == 0:
             sum_partial_loss = sum(epoch_loss[-100:])
 
             print(f"Epoch loss (sum last 100 steps): step {batch_idx + 1}: {sum_partial_loss}")
