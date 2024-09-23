@@ -129,6 +129,7 @@ print(f"NLLB conf:\n{translation_model_conf}")
 device = "cuda" if torch.cuda.is_available() else "cpu"
 classifier_dropout = 0.1
 cnn_dropout = 0.5
+shuffle_training = True
 lang_model, tokenizer = load_model(lm_model_input, lm_pretrained_model, None, classifier_dropout=classifier_dropout) if lm_pretrained_model else (None, None)
 
 def extend_tensor_with_zeros_and_truncate(t, max_width, max_height, device):
@@ -939,7 +940,7 @@ def eval(model, dataloader, all_keys, device, print_result=False, print_desc='-'
 num_workers = 0
 collate_fn = wrapper_select_random_group_collate_fn(tokenizer=tokenizer, remove_padding=True, return_text=model_inference)
 train_dataset = MyDataset(train_data, data_input_all_keys, create_groups=True, return_group=True, add_text=model_inference)
-train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, collate_fn=collate_fn)
+train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=shuffle_training, num_workers=num_workers, collate_fn=collate_fn)
 dev_dataset = MyDataset(dev_data, data_input_all_keys, add_text=model_inference)
 dev_dataloader = DataLoader(dev_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=collate_fn)
 
@@ -1148,7 +1149,7 @@ for epoch in range(epochs):
         if batch_idx % (100 * gradient_accumulation) == 0:
             sum_partial_loss = sum(epoch_loss[-100:])
 
-            print(f"Epoch loss (sum last 100 steps): step {batch_idx + 1}: {sum_partial_loss}")
+            print(f"Epoch loss (sum last 100 steps): step {batch_idx}: {sum_partial_loss}")
 
             sys.stdout.flush()
 
