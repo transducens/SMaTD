@@ -144,7 +144,9 @@ def inference_from_stdin(model, tokenizer, batch_size, loss_function=None, devic
         total_tokens += sum([len(urls[urls != tokenizer.pad_token_id]) for urls in batch["url_tokens"]])
         urls = [url[url != tokenizer.pad_token_id] for url in batch["url_tokens"]]
         urls = [tokenizer.decode(url, skip_special_tokens=False) for url in urls]
-        urls = [list(map(lambda s: s.strip(), url.lstrip(tokenizer.bos_token).rstrip(tokenizer.eos_token).split(tokenizer.sep_token))) for url in urls]
+        urls = [url[len(tokenizer.bos_token):] for url in urls]
+        urls = [url[:len(url) - len(tokenizer.eos_token)] for url in urls]
+        urls = [list(map(lambda s: s.strip(), url.split(tokenizer.sep_token))) for url in urls]
 
         for url in urls:
             assert len(url) == (1 if monolingual else 2), url
