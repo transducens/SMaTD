@@ -230,6 +230,7 @@ def apply_patience(model, tokenizer, dataset_dev, loss_function, device, thresho
 
 def main(args):
     apply_inference = args.inference
+    inference_print_results = args.inference_print_results
 
     if not apply_inference:
         filename_dataset_train = args.dataset_train_filename
@@ -326,7 +327,7 @@ def main(args):
 
         if accelerator.is_local_main_process:
             metrics = inference.inference_from_stdin(model, tokenizer, batch_size, loss_function=loss_function, device=device, max_length_tokens=max_length_tokens,
-                                                     threshold=threshold, monolingual=monolingual, dataset_workers=dataset_workers)
+                                                     threshold=threshold, monolingual=monolingual, dataset_workers=dataset_workers, print_results=inference_print_results)
 
             if metrics is not None:
                 logger.info("Inference metrics: %s", metrics)
@@ -680,6 +681,8 @@ def initialization():
     parser.add_argument('--inference', action="store_true",
                         help="Do not train, just apply inference reading from stdin (flag --model-input is recommended). "
                              "If this option is set, it will be necessary to do not provide the input dataset.")
+    parser.add_argument('--inference-print-results', action="store_true",
+                        help="Print results per line")
     parser.add_argument('--patience', type=int, default=0,
                         help="Patience to stop training. If the specified value is greater than 0, epochs and patience will be taken into account")
     parser.add_argument('--train-until-patience', action="store_true",

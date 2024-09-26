@@ -27,6 +27,7 @@ utils.init_random_with_seed(seed)
 force_pickle_file = True # Change manually
 skip_test = False # Change manually
 disable_cnn = "MTDETECT_DISABLE_CNN" in os.environ and bool(int(os.environ["MTDETECT_DISABLE_CNN"]))
+model_inference_skip_train = "MTDETECT_MODEL_INFERENCE_SKIP_TRAIN" in os.environ and bool(int(os.environ["MTDETECT_MODEL_INFERENCE_SKIP_TRAIN"]))
 
 def default_sys_argv(n, default, f=str):
     return f(sys.argv[n]) if len(sys.argv) > n else default
@@ -68,6 +69,8 @@ gradient_accumulation = default_sys_argv(26, 1, f=lambda q: 1 if q == '' else in
 assert gradient_accumulation > 0, gradient_accumulation
 
 print(f"Gradient accumulation: {gradient_accumulation} (if enabled, i.e. > 1, the same results would be obtained if dropout is disabled for both CNN and LM, train shuffle is disabled, and if float precision errors are ignored)")
+
+model_inference_skip_train = model_inference_skip_train and model_inference
 
 if model_inference:
     lm_frozen_params = True
@@ -129,7 +132,7 @@ print(f"NLLB conf:\n{translation_model_conf}")
 device = "cuda" if torch.cuda.is_available() else "cpu"
 classifier_dropout = 0.1
 cnn_dropout = 0.5
-shuffle_training = True
+shuffle_training = True and not model_inference
 lang_model, tokenizer = load_model(lm_model_input, lm_pretrained_model, None, classifier_dropout=classifier_dropout) if lm_pretrained_model else (None, None)
 
 def extend_tensor_with_zeros_and_truncate(t, max_width, max_height, device):
@@ -886,7 +889,7 @@ def apply_inference(model, data, target=None, loss_function=None, threshold=0.5,
 
     return results
 
-def eval(model, dataloader, all_keys, device, print_result=False, print_desc='-'):
+def eval(model, dataloader, all_keys, device, print_result=False, print_desc='-', threshold=0.5):
     training = model.training
     training_lm = False if not model.lang_model else model.lang_model.training
 
@@ -914,9 +917,26 @@ def eval(model, dataloader, all_keys, device, print_result=False, print_desc='-'
         if print_result:
             assert len(data["source_text"]) == len(outputs)
             assert len(data["target_text"]) == len(outputs)
+            assert len(labels) == len(outputs)
 
-            for source_text, target_text, output in zip(data["source_text"], data["target_text"], outputs):
-                print(f"inference: {print_desc}\t{print_idx}\t{output}\t{source_text}\t{target_text}")
+            for source_text, target_text, output, label in zip(data["source_text"], data["target_text"], outputs, labels):
+                output_classification = int(output >= threshold)
+
+                assert output_classification in (0, 1), output_classification
+                assert label in (0, 1), label
+
+                if output_classification == 1 and label == 1:
+                    conf_mat_value = "tp"
+                elif output_classification == 1 and label == 0:
+                    conf_mat_value = "fp"
+                elif output_classification == 0 and label == 1:
+                    conf_mat_value = "fn"
+                elif output_classification == 0 and label == 0:
+                    conf_mat_value = "tn"
+                else:
+                    raise Exception(f"Unexpected values: {output_classification} vs {label}")
+
+                print(f"inference: {print_desc}\t{print_idx}\t{output}\tlabel={label}\t{conf_mat_value}\t{source_text}\t{target_text}")
 
                 print_idx += 1
 
@@ -965,13 +985,17 @@ else:
     model = SimpleCNN(channels, cnn_width, cnn_height, num_classes, data_input_all_keys, pooling=cnn_pooling[0], only_conv=False, lang_model=lang_model, disable_cnn=disable_cnn, dropout_p=cnn_dropout)
 
 if cnn_model_input:
+    print(f"Loading CNN model (and optionally LM): {cnn_model_input}")
+
     assert not disable_cnn
 
     old_model_state_dict_keys = set(model.state_dict().keys())
-    cnn_state_dict = torch.load(cnn_model_input, weights_only=True)
+    cnn_state_dict = torch.load(cnn_model_input, weights_only=True, map_location=device)
 
     if lang_model and model.state_dict()["fc1.weight"].shape[1] - cnn_state_dict["fc1.weight"].shape[1] == lang_model.config.hidden_size:
         # Our model has a longer feed-forward layer because of lang_model
+        print("Fixing shape of layers...")
+
         fc1_weight = copy.deepcopy(cnn_state_dict["fc1.weight"])
         fc1_bias = copy.deepcopy(cnn_state_dict["fc1.bias"])
 
@@ -1172,9 +1196,12 @@ if save_model_path and not model_inference:
 
     model = model.to(device)
 
-train_results = eval(model, train_dataloader, data_input_all_keys, device, print_result=model_inference, print_desc="train")
+if not model_inference_skip_train:
+    train_results = eval(model, train_dataloader, data_input_all_keys, device, print_result=model_inference, print_desc="train")
 
-print(f"Final train eval: {train_results}")
+    print(f"Final train eval: {train_results}")
+else:
+    print("Final train eval: skip (inference)")
 
 del train_dataset
 del train_dataloader

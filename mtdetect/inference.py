@@ -91,7 +91,8 @@ def inference_eval(model, tokenizer, _dataset, loss_function=None, device=None, 
     return metrics
 
 @torch.no_grad()
-def inference_from_stdin(model, tokenizer, batch_size, loss_function=None, device=None, max_length_tokens=None, threshold=0.5, monolingual=None, dataset_workers=-1):
+def inference_from_stdin(model, tokenizer, batch_size, loss_function=None, device=None, max_length_tokens=None, threshold=0.5,
+                         monolingual=None, dataset_workers=-1, print_results=False):
     training = model.training
 
     model.eval()
@@ -105,6 +106,8 @@ def inference_from_stdin(model, tokenizer, batch_size, loss_function=None, devic
     input_data = []
     output_data = []
     max_length_tokens = max_length_tokens if max_length_tokens is not None else tokenizer.model_max_length
+    print_idx = 0
+    monolingual_str = "monolingual" if monolingual else "bilingual"
 
     for l in sys.stdin:
         s = l.rstrip("\r\n").split('\t')
@@ -139,25 +142,56 @@ def inference_from_stdin(model, tokenizer, batch_size, loss_function=None, devic
 
     for batch in dataloader:
         total_tokens += sum([len(urls[urls != tokenizer.pad_token_id]) for urls in batch["url_tokens"]])
+        urls = [url[url != tokenizer.pad_token_id] for url in batch["url_tokens"]]
+        urls = [tokenizer.decode(url, skip_special_tokens=False) for url in urls]
+        urls = [list(map(lambda s: s.strip(), url.lstrip(tokenizer.bos_token).rstrip(tokenizer.eos_token).split(tokenizer.sep_token))) for url in urls]
+
+        for url in urls:
+            assert len(url) == (1 if monolingual else 2), url
 
         # Inference
         results = inference(model, batch, loss_function=loss_function, device=device, threshold=threshold)
+        outputs = torch.sigmoid(results["outputs"]).cpu().detach().tolist()
+        outputs_classification = results["outputs_classification_detach_list"]
+        labels = batch["labels"].cpu()
+        labels = torch.round(labels).type(torch.long).tolist()
+
+        assert len(outputs_classification) == len(outputs) == len(labels) == len(urls), f"{len(outputs_classification)} vs {len(outputs)} vs {len(labels)} vs {len(urls)}"
+
+        if print_results:
+            for url, output, output_classification, label in zip(urls, outputs, outputs_classification, labels):
+                original_text = '\t'.join(url)
+
+                if not do_eval:
+                    conf_mat_value = "fake"
+                elif output_classification == 1 and label == 1:
+                    conf_mat_value = "tp"
+                elif output_classification == 1 and label == 0:
+                    conf_mat_value = "fp"
+                elif output_classification == 0 and label == 1:
+                    conf_mat_value = "fn"
+                elif output_classification == 0 and label == 0:
+                    conf_mat_value = "tn"
+                else:
+                    raise Exception(f"Unexpected values: {output_classification} vs {label}")
+
+                logger.info("inference: stdin (%s)\t%d\t%s\tlabel=%s\t%s\t%s", monolingual_str, print_idx, output, label if do_eval else 'fake', conf_mat_value, original_text)
+
+                print_idx += 1
 
         # Results
-        if not do_eval:
-            output = torch.sigmoid(results["outputs"]).cpu().detach().item()
+        if not do_eval and not print_results:
+            for url, output in zip(urls, outputs):
+                original_text = '\t'.join(url)
 
-            logger.info("%s\t%s", s, output)
+                logger.info("%s\t%s", output, original_text)
 
             continue
 
-        outputs_classification = results["outputs_classification_detach_list"]
-        labels = batch["labels"].cpu()
-        labels = torch.round(labels).type(torch.long)
         loss = results["loss"].cpu().detach().item()
 
         all_outputs.extend(outputs_classification)
-        all_labels.extend(labels.tolist())
+        all_labels.extend(labels)
         all_loss.append(loss)
 
     assert total_tokens == _dataset.total_tokens, f"{total_tokens} != {_dataset.total_tokens}"
