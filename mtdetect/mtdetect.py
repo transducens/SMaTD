@@ -159,6 +159,7 @@ def load_dataset(filename_dataset, set_desc, **kwargs):
     file_dataset = open(filename_dataset, mode="rt", errors="backslashreplace")
     input_data = []
     output_data = []
+    groups_data = []
 
     # Read data from input files
     batch = dataset.tokenize_batch_from_iterator(file_dataset, kwargs["tokenizer"], kwargs["batch_size"], ignore_source_side=kwargs["monolingual"])
@@ -166,23 +167,26 @@ def load_dataset(filename_dataset, set_desc, **kwargs):
     for batch_urls in batch:
         input_data.extend(batch_urls["urls"])
         output_data.extend(batch_urls["labels"])
+        groups_data.extend(batch_urls["groups"])
 
-        if len(input_data) != len(output_data):
-            raise Exception(f"Different lengths for input and output data in {set_desc} set: {len(input_data)} vs {len(output_data)}")
+        if len(input_data) != len(output_data) or len(output_data) != len(groups_data):
+            raise Exception(f"Different lengths for input, output, groups data in {set_desc} set: {len(input_data)} vs {len(output_data)} vs {len(groups_data)}")
 
     non_parallel_urls = len([l for l in output_data if l == 0])
     parallel_urls = len([l for l in output_data if l == 1])
+    uniq_groups = set(groups_data)
 
     if non_parallel_urls + parallel_urls != len(input_data):
         raise Exception(f"Number of non-parallel + parallel URLs doesn't match the input data ({set_desc}): "
                         f"{non_parallel_urls} + {parallel_urls} != {len(input_data)}")
 
+    logger.info("Total pairs: %d; Total uniq groups: %d", len(groups_data), len(uniq_groups))
     logger.info("%d pairs of parallel URLs loaded (%s)", parallel_urls, set_desc)
     logger.info("%d pairs of non-parallel URLs loaded (%s)", non_parallel_urls, set_desc)
     logger.debug("Allocated memory after tokenization (%s): %d", set_desc, utils.get_current_allocated_memory_size())
 
     # Datasets
-    dataset_instance = dataset.SmartBatchingURLsDataset(input_data, output_data, kwargs["tokenizer"], kwargs["max_length_tokens"], set_desc=set_desc)
+    dataset_instance = dataset.SmartBatchingURLsDataset(input_data, output_data, kwargs["tokenizer"], kwargs["max_length_tokens"], set_desc=set_desc, groups=groups_data)
 
     logger.debug("Allocated memory after encoding the data: %d", utils.get_current_allocated_memory_size())
     logger.debug("Total tokens (%s): %d", set_desc, dataset_instance.total_tokens)
@@ -583,7 +587,6 @@ def main(args):
     del dataloader_train
     del dataset_train
     del dataset_dev
-    del model
 
     torch.cuda.empty_cache()
 
@@ -593,7 +596,7 @@ def main(args):
     dataset_test, _ = load_dataset(filename_dataset_test, "test", **dataset_static_args)
 
     if models_not_available:
-        saved_epochs_or_steps = [epoch if strategy == "epoch" else global_step]
+        saved_epochs_or_steps = [epoch if eval_strategy == "epoch" else global_step]
 
     for idx, epoch_or_step in enumerate(saved_epochs_or_steps):
         if idx % accelerator.num_processes != accelerator.process_index:

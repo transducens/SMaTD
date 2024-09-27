@@ -58,8 +58,16 @@ def pad_sequence(sequence_batch, pad_token_id, max_length=0):
 class SmartBatchingURLsDataset(Dataset):
     # Code based on https://www.kaggle.com/code/rhtsingh/speeding-up-transformer-w-optimization-strategies?scriptVersionId=67176227&cellId=2
 
-    def __init__(self, input_data, output_data, tokenizer, max_length, sampler_better_randomness=True, set_desc=''):
-        super(SmartBatchingURLsDataset, self).__init__()
+    def __init__(self, input_data, output_data, tokenizer, max_length, sampler_better_randomness=True, set_desc='', groups=None):
+        super().__init__()
+
+        if groups is None:
+            self.groups = [str(idx) for idx in range(len(input_data))]
+        else:
+            self.groups = groups
+
+        assert len(input_data) == len(output_data)
+        assert len(input_data) == len(self.groups)
 
         self.max_length = max_length
         self.pad_token_id = tokenizer.pad_token_id
@@ -84,23 +92,42 @@ class SmartBatchingURLsDataset(Dataset):
         self.labels["urls_classification"] = torch.from_numpy(self.labels["urls_classification"])
         self.labels["urls_classification"] = self.labels["urls_classification"].type(torch.float) # Regression
 
+        assert self.labels["urls_classification"].shape == (len(output_data),), self.labels["urls_classification"].shape
+
+        self.uniq_groups = []
+        self.data = {}
+        self.max_tokens_per_group = {}
+
+        for idx in range(len(self.groups)):
+            group = self.groups[idx]
+
+            if group not in self.data:
+                self.uniq_groups.append(group)
+                self.data[group] = {
+                    "tokens": [],
+                    "labels": [],
+                }
+                self.max_tokens_per_group[group] = -np.inf
+
+            self.data[group]["tokens"].append(self.tokens[idx])
+            self.data[group]["labels"].append(self.labels["urls_classification"][idx])
+            self.max_tokens_per_group[group] = max(self.max_tokens_per_group[group], len(self.tokens[idx]))
+
+            assert self.max_tokens_per_group[group] >= 0, self.max_tokens_per_group[group]
+
     def __len__(self):
-        return len(self.tokens)
+        return len(self.data)
 
     def __getitem__(self, idx):
-        if torch.is_tensor(idx):
-            idx = idx.tolist()
+        assert isinstance(idx, int), type(idx)
 
-        #return {"url_str": self.data[idx], "label": self.labels[idx]}
-        #return {
-        #    "url_tokens": self.tokens[idx],
-        #    #"url_attention_mask": self.attention_mask[idx],
-        #    "label": self.labels[idx],
-        #}
-
+        group = self.uniq_groups[idx]
+        url_tokens = [list(t) for t in self.data[group]["tokens"]]
+        label = [l.clone().detach() for l in self.data[group]["labels"]]
         result = {
-            "url_tokens": self.tokens[idx],
-            "label": self.labels["urls_classification"][idx],
+            "url_tokens": url_tokens,
+            "label": label,
+            "group": group,
         }
 
         return result
@@ -108,31 +135,33 @@ class SmartBatchingURLsDataset(Dataset):
     def get_dataloader(self, batch_size, device, num_workers, sampler=None, max_tokens=None, set_dataloader=True):
         is_device_gpu = device.type.startswith("cuda")
 
+        if not sampler:
+            lengths = [self.max_tokens_per_group[group] for group in self.uniq_groups] # We use the max tokens length of the group to cover the worst case
+
         if sampler:
             self.sampler = sampler
         elif self.sampler_better_randomness:
             # LengthGroupedSampler handles worse the padding problem (suboptimal) but better the randomness than SmartBatchingSampler
-            lengths = [len(seq) for seq in self.tokens]
             self.sampler = transformers.trainer_pt_utils.LengthGroupedSampler(batch_size, lengths=lengths)
         else:
-            self.sampler = SmartBatchingSampler(
-                data_source=self.tokens,
-                batch_size=batch_size,
-            )
+            self.sampler = SmartBatchingSampler(batch_size, lengths)
 
         if max_tokens:
             logger.info("Batch size will be data-dependant%s: batches of, approximately, %d tokens will be returned",
                         f" ({self.set_desc})" if self.set_desc else '', max_tokens)
 
-            collate_fn = MaxTokensCollate(
+            main_collate_fn = MaxTokensCollate(
                 pad_token_id=self.pad_token_id,
                 max_tokens=max_tokens,
                 total_number_of_batches=len(self.tokens),
             )
         else:
-            collate_fn = SmartBatchingCollate(
+            main_collate_fn = SmartBatchingCollate(
                 pad_token_id=self.pad_token_id,
             )
+
+        groups_collate_fn = SelectGroupCollate()
+        collate_fn = utils.chain_collate_fn(groups_collate_fn, main_collate_fn)
 
         # "RuntimeError: DataLoader worker (pid 22966) is killed by signal: Killed."
         #  Workaround: num_workers = 0
@@ -148,7 +177,7 @@ class SmartBatchingURLsDataset(Dataset):
 
         dataloader_kwargs = {
             "pin_memory": True,
-            "pin_memory_device": device.type,
+            "pin_memory_device": device.type, # This does not actually copy data to the device, it only "reports" about the future intention: https://discuss.pytorch.org/t/attributeerror-dataloader-object-has-no-attribute-pin-memory-device/170129/3 (and /4)
             "num_workers": num_workers,
         }
 
@@ -183,13 +212,16 @@ class SmartBatchingURLsDataset(Dataset):
     def total_tokens(self):
         return self._total_tokens
 
-class SmartBatchingSampler(Sampler):
-    def __init__(self, data_source, batch_size):
-        super(SmartBatchingSampler, self).__init__(data_source)
+    @property
+    def groups_are_affecting_total_tokens_count(self):
+        return len(self.uniq_groups) < len(self.groups)
 
-        self.len = len(data_source)
-        sample_lengths = [len(seq) for seq in data_source]
-        argsort_inds = np.argsort(sample_lengths) # Get indexes of tokens sorted by length
+class SmartBatchingSampler(Sampler):
+    def __init__(self, batch_size, lengths):
+        super().__init__() # class Sampler: 'data_source' argument is not used and will be removed in 2.2.0
+
+        self.len = len(lengths)
+        argsort_inds = np.argsort(lengths) # Get indexes of tokens sorted by length
         self.batches = list(more_itertools.chunked(argsort_inds, n=batch_size)) # Batches of indexes sorted by tokens length
         self._backsort_inds = None
 
@@ -221,7 +253,6 @@ class SmartBatchingCollate:
         self._pad_token_id = pad_token_id
 
     def __call__(self, batch):
-        targets_lang_id = None
         sequences = [b["url_tokens"] for b in batch]
         targets = [b["label"] for b in batch]
 
@@ -258,7 +289,6 @@ class MaxTokensCollate:
             self._aux_batch = [] # Auxiliar storage (we want to avoid to exceed max_tokens)
 
     def __call__(self, batch):
-        targets_lang_id = None
         sequence = batch["url_tokens"]
 
         if len(self._aux_batch) > 0:
@@ -309,11 +339,42 @@ class MaxTokensCollate:
             # Keep accumulating partial batches
             return None
 
+class SelectGroupCollate:
+    def __init__(self):
+        pass
+
+    def __call__(self, batch):
+        #data, labels = [], []
+        result = []
+
+        for idx in range(len(batch)):
+            x = batch[idx]["url_tokens"]
+            y = batch[idx]["label"]
+            group = batch[idx]["group"]
+
+            assert len(y) > 0
+            assert len(x) == len(y)
+
+            group_idx = np.random.randint(len(y))
+            output_x = x[group_idx]
+            output_y = y[group_idx]
+
+            result.append({
+                "url_tokens": output_x,
+                "label": output_y,
+            })
+
+        # The output format is the same that DataLoaded is using because this collate_fn is expected to be used before an actual collate_fn
+        # Check utils.chain_collate_fn
+
+        return result
+
 def tokenize_batch_from_iterator(iterator, tokenizer, batch_size, f=None, ignore_source_side=False, return_urls=False):
     def reset():
         urls = {
             "urls": [],
             "labels": [],
+            "groups": [],
         }
         initial_urls = []
 
@@ -325,9 +386,10 @@ def tokenize_batch_from_iterator(iterator, tokenizer, batch_size, f=None, ignore
     for idx, url in enumerate(iterator, 1):
         url = url.strip().split('\t')
 
-        assert len(url) == 3, f"src, trg, label"
+        assert len(url) >= 3, f"src trg label [group]"
 
-        src_url, trg_url, parallel_urls_output = f(url[0]), f(url[1]), int(url[2])
+        src_url, trg_url, label = f(url[0]), f(url[1]), int(url[2])
+        group = url[3] if len(url) > 3 else str(idx)
 
         if isinstance(src_url, list):
             assert len(src_url) == 1, src_url
@@ -338,7 +400,7 @@ def tokenize_batch_from_iterator(iterator, tokenizer, batch_size, f=None, ignore
 
             trg_url = trg_url[0]
 
-        assert parallel_urls_output in (0, 1), parallel_urls_output
+        assert label in (0, 1), label
 
         if ignore_source_side:
             urls["urls"].append(trg_url)
@@ -352,7 +414,8 @@ def tokenize_batch_from_iterator(iterator, tokenizer, batch_size, f=None, ignore
                                                                             #  (or other special tokens) since they are automatically added
                                                                             #  by tokenizer.encode_plus / tokenizer.batch_encode_plus
 
-        urls["labels"].append(parallel_urls_output)
+        urls["labels"].append(label)
+        urls["groups"].append(group)
         initial_urls.append((url[0], url[1]))
 
         if len(urls["urls"]) >= batch_size:

@@ -649,7 +649,7 @@ def wrapper_select_random_group_collate_fn(tokenizer=None, remove_padding=True, 
 
 class SimpleCNN(nn.Module):
     def __init__(self, c, w, h, num_classes, all_keys, pooling="max", only_conv=True, lang_model=None, disable_cnn=False, dropout_p=0.5):
-        super(SimpleCNN, self).__init__()
+        super().__init__()
 
         if disable_cnn:
             self.channels = 1
@@ -774,7 +774,7 @@ class SimpleCNN(nn.Module):
 
 class MultiChannelCNN(nn.Module):
     def __init__(self, num_classes, simple_cnns, all_keys, lang_model=None, disable_cnn=False, dropout_p=0.5):
-        super(MultiChannelCNN, self).__init__()
+        super().__init__()
 
         self.all_keys = list(all_keys)
         self.lang_model_hidden_size = 0

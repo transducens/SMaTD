@@ -76,7 +76,8 @@ def inference_eval(model, tokenizer, _dataset, loss_function=None, device=None, 
         all_labels.extend(labels.tolist())
         all_loss.append(loss)
 
-    assert total_tokens == _dataset.total_tokens, f"{total_tokens} != {_dataset.total_tokens}"
+    if not _dataset.groups_are_affecting_total_tokens_count:
+        assert total_tokens == _dataset.total_tokens, f"{total_tokens} != {_dataset.total_tokens}"
 
     all_outputs = torch.as_tensor(all_outputs)
     all_labels = torch.as_tensor(all_labels)
@@ -188,6 +189,7 @@ def inference_from_stdin(model, tokenizer, batch_size, loss_function=None, devic
 
                 logger.info("%s\t%s", output, original_text)
 
+        if not do_eval:
             continue
 
         loss = results["loss"].cpu().detach().item()
@@ -196,7 +198,8 @@ def inference_from_stdin(model, tokenizer, batch_size, loss_function=None, devic
         all_labels.extend(labels)
         all_loss.append(loss)
 
-    assert total_tokens == _dataset.total_tokens, f"{total_tokens} != {_dataset.total_tokens}"
+    if not _dataset.groups_are_affecting_total_tokens_count:
+        assert total_tokens == _dataset.total_tokens, f"{total_tokens} != {_dataset.total_tokens}"
 
     if not do_eval:
         return None

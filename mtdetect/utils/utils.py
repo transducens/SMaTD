@@ -315,3 +315,12 @@ def set_rng(rng_random, rng_np, rng_torch, rng_torch_cuda=None):
 
     if rng_torch_cuda is not None:
         torch.cuda.set_rng_state(rng_torch_cuda)
+
+def chain_collate_fn(*list_of_collate_fn):
+    def chained_collate_fn(batch):
+        for fn in list_of_collate_fn:
+            batch = fn(batch) # Pass the output of the previous collate_fn to the next one
+
+        return batch
+
+    return chained_collate_fn
