@@ -1,7 +1,11 @@
 
 import os
 import sys
+import random
 
+remove_duplicates = False # Change manually if you'd like different behaviour with the duplicates
+shuffle_before_print = True # Change manually
+print_positive_labels_once = True # Change manually
 labels_to_merge = sys.argv[1]
 
 assert labels_to_merge in ("pos", "neg", "both", "none"), labels_to_merge
@@ -31,7 +35,7 @@ assert len(input_fns) > 0, "You need to provide data files"
 
 mt_systems = list(input_fns.keys())
 
-def read(fn, mt):
+def read(fn, mt, remove_duplicates=False):
     src, trg, labels = [], [], []
     labels_count = {0: 0, 1: 0}
     src_count = {} # we assume that the human text is in the source side
@@ -65,34 +69,58 @@ def read(fn, mt):
         if count > 2:
             src_to_remove.add(_src)
 
-    print(f"{mt}: sentences to remove: {len(src_to_remove)}", file=sys.stderr)
+    expected_removed_sentences = sum([src_count[s] for s in src_to_remove])
 
-    if len(src_to_remove) > 0:
-        for _idx in range(len(src)):
-            idx = (_idx + 1) * -1 # reverse because removing can't be done in ascending order
-            _src = src[idx]
+    print(f"{mt}: duplicated sentences: {expected_removed_sentences} (uniq: {len(src_to_remove)})", file=sys.stderr)
 
+    if remove_duplicates and len(src_to_remove) > 0:
+        idxs_to_remove = []
+
+        for idx, _src in enumerate(src):
             if _src in src_to_remove:
-                # remove
-                del src[idx]
-                del trg[idx]
-                del labels[idx]
+                idxs_to_remove.insert(0, idx) # reverse order in order to safely remove the elements from the lists
 
                 src_count[_src] -= 1 # For later sanity check
 
+        assert len(idxs_to_remove) == expected_removed_sentences
+
+        for idx in idxs_to_remove:
+            # remove
+            del src[idx]
+            del trg[idx]
+            del labels[idx]
+
         # Sanity check
         for _src, count in src_count.items():
-            assert count == 2, f"{fn}: {count} != 2 and should be equal to 2: {_src}"
+            expected_count = 0 if _src in src_to_remove else 2
 
-    assert len(src) == len(trg) == len(labels)
+            assert count == expected_count, f"{fn}: {count} != {expected_count}: {_src}"
+
+        assert len(src) == len(trg) == len(labels)
 
     result = [(_src, _trg, label) for _src, _trg, label in zip(src, trg, labels)]
 
     return result
 
-    #return src, trg, labels
+if not remove_duplicates:
+    print("WARNING: since remove_duplicates=False, entries with the same source sentences will not be detected across MT systems. "
+          f"Therefore, these cases will be merged under the same group according to labels_to_merge={labels_to_merge}", file=sys.stderr)
 
-data = {mt: read(fn, mt) for mt, fn in input_fns.items()}
+data = {mt: read(fn, mt, remove_duplicates=remove_duplicates) for mt, fn in input_fns.items()}
+
+for idx_mt1 in range(len(mt_systems)):
+    idx_mt2 = idx_mt1 + 1
+
+    while idx_mt2 < len(mt_systems):
+        mt1 = mt_systems[idx_mt1]
+        mt2 = mt_systems[idx_mt2]
+
+        # We expect to have the same positive samples
+        assert set([f"{src}\t{trg}\t{label}" for src, trg, label in data[mt1] if label == 1]) == set([f"{src}\t{trg}\t{label}" for src, trg, label in data[mt2] if label == 1]), f"{mt1} {mt2}"
+
+        idx_mt2 += 1
+
+
 indices = {}
 groups = {mt: None for mt in mt_systems}
 all_src = set()
@@ -125,7 +153,7 @@ for src in all_src:
     assert len(indices[src]) == len(input_fns)
 
     for mt in mt_systems:
-        assert len(indices[src][mt]) == 2
+        assert len(indices[src][mt]) >= 2
 
     if labels_to_merge == "none":
         continue
@@ -159,17 +187,10 @@ for src in all_src:
 
         assert any_group is not None
 
-        # Sanity check
-        for mt1 in mt_systems:
-            for mt2 in mt_systems:
-                assert len(idxs_to_update[mt1]) == 1
-                assert len(idxs_to_ignore[mt2]) == 1
-
-                if mt1 != mt2:
-                    assert idxs_to_update[mt1][0] != idxs_to_update[mt2][0]
-
         # Update
         for mt in mt_systems:
+            assert len(idxs_to_update[mt]) == len(idxs_to_ignore[mt])
+
             for idx in idxs_to_ignore[mt]:
                 _src, _trg, label = data[mt][idx]
 
@@ -185,10 +206,31 @@ for src in all_src:
                 groups[mt][idx] = any_group
 
 # Print data with groups
+first_mt = True
+print_data = []
+
+if print_positive_labels_once:
+    print("INFO: positive labels are being printed just once instead of once per MT system", file=sys.stderr)
+
 for mt, results in data.items():
     for idx, (src, trg, label) in enumerate(results):
         group = groups[mt][idx]
+        data = f"{src}\t{trg}\t{label}\t{group}"
 
-        print(f"{src}\t{trg}\t{label}\t{group}")
+        if print_positive_labels_once and label == 1 and not first_mt:
+            # It has been checked before that the positive labels data were the same across all MT systems, so it is ok to print just once
+            continue
+
+        print_data.append(data)
+
+    first_mt = False
+
+if shuffle_before_print:
+    print("INFO: results are shuffled", file=sys.stderr)
+
+    random.shuffle(print_data)
+
+for data in print_data:
+    print(data)
 
 print("Done!", file=sys.stderr)
