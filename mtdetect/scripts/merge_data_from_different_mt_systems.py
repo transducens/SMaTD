@@ -94,8 +94,14 @@ def read(fn, mt):
 
 data = {mt: read(fn, mt) for mt, fn in input_fns.items()}
 indices = {}
-groups = {mt: [idx for idx in range(len(data[mt]))] for mt in mt_systems}
+groups = {mt: None for mt in mt_systems}
 all_src = set()
+seen_idx = {mt: set() for mt in mt_systems}
+aggregated_groups = 0
+
+for mt in mt_systems:
+    groups[mt] = [aggregated_groups + idx for idx in range(len(data[mt]))]
+    aggregated_groups += len(groups[mt])
 
 for mt, results in data.items():
     assert len(results) == len(groups[mt])
@@ -106,8 +112,11 @@ for mt, results in data.items():
         if mt not in indices[src]:
             indices[src][mt] = []
 
+        assert idx not in seen_idx[mt]
+
         indices[src][mt].append(idx)
         all_src.add(src)
+        seen_idx[mt].add(idx)
 
 # Update groups using indices
 for src in all_src:
@@ -122,17 +131,17 @@ for src in all_src:
         continue
     elif labels_to_merge == "both":
         mt = mt_systems[0]
-        any_idx = int(indices[src][mt][0])
+        any_group = groups[mt][indices[src][mt][0]]
 
         for mt in mt_systems:
             for idx in indices[src][mt]:
-                groups[mt][idx] = any_idx
+                groups[mt][idx] = any_group
     else:
         # TODO for some reason, this configuration is not working as expected...
 
         assert labels_to_merge in ("pos", "neg"), f"Unexpected value for labels_to_merge: {labels_to_merge}"
 
-        any_idx = None
+        any_group = None
         idxs_to_update = {mt: [] for mt in mt_systems}
         idxs_to_ignore = {mt: [] for mt in mt_systems}
 
@@ -140,15 +149,17 @@ for src in all_src:
             for idx in indices[src][mt]:
                 _src, _trg, label = data[mt][idx]
 
+                assert _src == src, f"{_src} != {src}"
+
                 if label == target_label:
-                    if any_idx is None:
-                        any_idx = int(idx)
+                    if any_group is None:
+                        any_group = groups[mt][idx]
 
                     idxs_to_update[mt].append(idx)
                 else:
                     idxs_to_ignore[mt].append(idx)
 
-        assert any_idx is not None
+        assert any_group is not None
 
         # Sanity check
         for mt1 in mt_systems:
@@ -164,14 +175,16 @@ for src in all_src:
             for idx in idxs_to_ignore[mt]:
                 _src, _trg, label = data[mt][idx]
 
+                assert _src == src, f"{_src} != {src}"
                 assert label != target_label
 
             for idx in idxs_to_update[mt]:
                 _src, _trg, label = data[mt][idx]
 
+                assert _src == src, f"{_src} != {src}"
                 assert label == target_label
 
-                groups[mt][idx] = int(any_idx)
+                groups[mt][idx] = any_group
 
 # Print data with groups
 for mt, results in data.items():
