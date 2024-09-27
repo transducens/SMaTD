@@ -137,8 +137,6 @@ for src in all_src:
             for idx in indices[src][mt]:
                 groups[mt][idx] = any_group
     else:
-        # TODO for some reason, this configuration is not working as expected...
-
         assert labels_to_merge in ("pos", "neg"), f"Unexpected value for labels_to_merge: {labels_to_merge}"
 
         any_group = None
