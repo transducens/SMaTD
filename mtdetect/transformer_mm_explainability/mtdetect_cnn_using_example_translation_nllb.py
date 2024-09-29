@@ -452,10 +452,71 @@ for _direction, _teacher_forcing, _ignore_attention in zip(direction, teacher_fo
 
         data_input_all_keys.append(inputs)
 
+_max_length_encoder = 512 # TODO add user argument?
+translation_max_length_encoder = utils.get_encoder_max_length(lang_model, translation_tokenizer, max_length_tokens=_max_length_encoder)
+translation_max_length_encoder = min(translation_max_length_encoder, _max_length_encoder)
+checks = 0
+
+for d, desc in ((train_data, "train"), (dev_data, "dev"), (test_data, "test")):
+    for idx, (source_text, target_text) in enumerate(zip(d["source_text"], d["target_text"])):
+        # Sanity check to verify that the number of tokens of the source and target text match with the expected dimensions
+
+        source_inputs = translation_tokenizer.encode_plus(source_text, return_tensors=None, add_special_tokens=True, max_length=translation_max_length_encoder,
+                                                            return_attention_mask=False, truncation=True, padding="longest")["input_ids"]
+        target_inputs = translation_tokenizer.encode_plus(target_text, return_tensors=None, add_special_tokens=True, max_length=translation_max_length_encoder,
+                                                            return_attention_mask=False, truncation=True, padding="longest")["input_ids"]
+
+        for _attention_matrix in attention_matrix:
+            keys_filter_check_shape = list(filter(lambda s: s.startswith(f"original_data_{_attention_matrix}_"), d.keys()))
+
+            assert len(keys_filter_check_shape) > 0
+
+            for k in keys_filter_check_shape:
+                assert isinstance(d[k][idx], np.ndarray), f"{k}: {idx}: {type(d[k][idx])}"
+                assert len(d[k][idx].shape) == 2, d[k][idx].shape
+
+                if "_src2trg_" in k:
+                    assert "_trg2src_" not in k
+                    _direction = "src2trg"
+                elif "_trg2src_" in k:
+                    assert "_src2src_" not in k
+                    _direction = "trg2src"
+                else:
+                    raise Exception(f"Unexpected direction: {k}")
+
+                if _direction == "src2trg":
+                    _source_inputs, _target_inputs = source_inputs, target_inputs
+                elif _direction == "trg2src":
+                    _source_inputs, _target_inputs = target_inputs, source_inputs
+                else:
+                    raise Exception("?")
+
+                if _attention_matrix == "explainability_encoder":
+                    expected_shape = (len(_source_inputs), len(_source_inputs))
+                elif _attention_matrix == "explainability_decoder":
+                    expected_shape = (len(_target_inputs), len(_target_inputs))
+                elif _attention_matrix == "explainability_cross":
+                    expected_shape = (len(_target_inputs), len(_source_inputs))
+                else:
+                    raise Exception(f"Unexpected matrix key: {_attention_matrix}")
+
+                assert d[k][idx].shape == expected_shape, f"{k}: {direction}: {d[k][idx].shape} vs {expected_shape}: {_source_inputs} | {_target_inputs}"
+
+                checks += 1
+
+    for _attention_matrix in attention_matrix:
+        keys_filter_check_shape = list(filter(lambda s: s.startswith(f"original_data_{_attention_matrix}_"), d.keys()))
+
+        assert len(keys_filter_check_shape) > 0
+
+        for k in keys_filter_check_shape:
+            del d[k]
+
+print(f"Dimension checks: {checks}")
+
 if lang_model:
     # Add LM data to inputs
 
-    _max_length_encoder = 512 # TODO add user argument?
     max_length_encoder = utils.get_encoder_max_length(lang_model, tokenizer, max_length_tokens=_max_length_encoder)
     max_length_encoder = min(max_length_encoder, _max_length_encoder)
     data_input_all_keys.append("lm_inputs")
@@ -471,43 +532,8 @@ if lang_model:
         d["inputs_lm_inputs"] = []
         all_texts = []
 
-        for idx, (source_text, target_text) in enumerate(zip(d["source_text"], d["target_text"])):
+        for source_text, target_text in zip(d["source_text"], d["target_text"]):
             all_texts.append(f"{source_text}{tokenizer.sep_token}{target_text}")
-
-            # Sanity check to verify that the number of tokens of the source and target text match with the expected dimensions
-
-            source_inputs = translation_tokenizer.encode_plus(source_text, return_tensors=None, add_special_tokens=True, max_length=max_length_encoder,
-                                                              return_attention_mask=False, truncation=True, padding="longest")["input_ids"]
-            target_inputs = translation_tokenizer.encode_plus(target_text, return_tensors=None, add_special_tokens=True, max_length=max_length_encoder,
-                                                              return_attention_mask=False, truncation=True, padding="longest")["input_ids"]
-
-            for _attention_matrix in attention_matrix:
-                keys_filter_check_shape = list(filter(lambda s: s.startswith(f"original_data_{_attention_matrix}_"), d.keys()))
-
-                assert len(keys_filter_check_shape) > 0
-
-                for k in keys_filter_check_shape:
-                    assert isinstance(d[k][idx], np.ndarray), f"{k}: {idx}: {type(d[k][idx])}"
-                    assert len(d[k][idx].shape) == 2, d[k][idx].shape
-
-                    if _attention_matrix == "explainability_encoder":
-                        expected_shape = (len(source_inputs), len(source_inputs))
-                    elif _attention_matrix == "explainability_decoder":
-                        expected_shape = (len(target_inputs), len(target_inputs))
-                    elif _attention_matrix == "explainability_cross":
-                        expected_shape = (len(target_inputs), len(source_inputs))
-                    else:
-                        raise Exception(f"Unexpected matrix key: {_attention_matrix}")
-
-                    assert d[k][idx].shape == expected_shape, f"{k}: {d[k][idx].shape} vs {expected_shape}: {source_inputs} | {target_inputs}"
-
-        for _attention_matrix in attention_matrix:
-            keys_filter_check_shape = list(filter(lambda s: s.startswith(f"original_data_{_attention_matrix}_"), d.keys()))
-
-            assert len(keys_filter_check_shape) > 0
-
-            for k in keys_filter_check_shape:
-                del d[k]
 
         inputs = tokenizer.batch_encode_plus(all_texts, return_tensors=None, add_special_tokens=True, max_length=max_length_encoder,
                                              return_attention_mask=False, truncation=True, padding="longest")
