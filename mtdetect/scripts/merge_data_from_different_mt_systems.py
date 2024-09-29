@@ -159,6 +159,10 @@ if not remove_duplicates:
 data = {mt: read(input_fns[mt], mt, pickle_fn=input_fns_pickle[mt], remove_duplicates=remove_duplicates) for mt in mt_systems}
 data_results = {mt: data[mt]["result"] for mt in mt_systems}
 data_pickle = {mt: data[mt]["pickle"] for mt in mt_systems}
+pickle_mat_keys = []
+
+if load_pickle_data:
+    pickle_mat_keys = list(data_pickle[mt_systems[0]][0].keys())
 
 for mt in mt_systems:
     assert isinstance(data_pickle[mt], list), type(data_pickle[mt])
@@ -276,7 +280,9 @@ for src in all_src:
 # Print data with groups
 first_mt = True
 print_data = []
-data_pickle_update = {k: [[] for _ in range(len(data_pickle[k]))] for k in data_pickle.keys()}
+data_pickle_update = {mt: [{k: [] for k in data_pickle[mt][idx].keys()} for idx in range(len(data_pickle[mt]))] for mt in mt_systems}
+data_pickle_update_skip = {mt: 0 for mt in mt_systems}
+data_pickle_update_merge = [{k: [] for k in pickle_mat_keys} for _ in range(len(data_pickle[mt_systems[0]]))]
 
 if print_positive_labels_once:
     print("INFO: positive labels are being printed just once instead of once per MT system", file=sys.stderr)
@@ -288,34 +294,81 @@ for mt, results in data_results.items():
 
         if print_positive_labels_once and label == 1 and not first_mt:
             # It has been checked before that the positive labels data were the same across all MT systems, so it is ok to print just once
+            data_pickle_update_skip[mt] += 1 if load_pickle_data else 0
+
             continue
 
         print_data.append(d)
 
         if load_pickle_data:
-            for v in data_pickle[mt]:
-                for vidx in range(len(v)):
-                    # TODO fix
-                    data_pickle_update[mt][vidx].append(v[vidx][idx])
+            for vidx, v in enumerate(data_pickle[mt]):
+                for vdk in data_pickle[mt][vidx].keys():
+                    assert isinstance(v[vdk], list), type(v[vdk])
+                    assert isinstance(v[vdk][idx], np.ndarray), type(v[vdk])
+                    assert len(v[vdk][idx].shape) == 2
 
-                assert len(v) == len(data_pickle_update[k])
+                    data_pickle_update[mt][vidx][vdk].append(v[vdk][idx])
 
-                for vidx in range(len(v)):
-                    assert len(v[vidx]) == len(data_pickle_update[k][vidx])
+            assert len(data_pickle_update_merge) == len(pickle_output) == len(data_pickle[mt])
 
-                    vidx2 = vidx + 1
-
-                    while vidx2 < len(v):
-                        assert len(v[vidx]) == len(data_pickle_update[k][vidx2])
-
-                        vidx2 += 1
+            for output_idx in range(len(data_pickle_update_merge)):
+                for k in pickle_mat_keys:
+                    data_pickle_update_merge[output_idx][k].append(data_pickle[mt][output_idx][k][idx])
 
     first_mt = False
 
 if load_pickle_data:
-    for k in data_pickle_update.keys():
-        for idx in range(len(data_pickle_update[k])):
-            assert len(print_data) == len(data_pickle_update[k][idx]), f"{k}: {idx}: {len(print_data)} vs {len(data_pickle_update[k][idx])}"
+    for output_idx in range(len(data_pickle_update_merge)):
+        k = pickle_mat_keys[0]
+        expected_elements_to_be_printed = sum([len(data_pickle[mt][output_idx][k]) for mt in mt_systems])
+
+        assert expected_elements_to_be_printed == len(data_pickle_update_merge[output_idx][k]) + sum([data_pickle_update_skip[mt] for mt in mt_systems])
+
+for mt in mt_systems:
+    # Sanity checks
+
+    assert isinstance(data_pickle_update[mt], list), type(data_pickle_update[mt])
+
+    if load_pickle_data:
+        assert len(data_pickle_update[mt]) > 0
+        assert len(data_pickle_update[mt]) == len(pickle_output)
+        assert isinstance(data_pickle_update[mt], list), type(data_pickle_update[mt])
+
+        for idx in range(len(data_pickle_update[mt])):
+            assert isinstance(data_pickle_update[mt][idx], dict), type(data_pickle_update[mt][idx])
+
+            for k in data_pickle_update[mt][idx].keys():
+                assert isinstance(data_pickle_update[mt][idx][k], list), type(data_pickle_update[mt][idx][k])
+
+                for vidx in range(len(data_pickle_update[mt][idx][k])):
+                    assert isinstance(data_pickle_update[mt][idx][k][vidx], np.ndarray), type(data_pickle_update[mt][idx][k][vidx])
+                    assert len(data_pickle_update[mt][idx][k][vidx].shape) == 2, data_pickle_update[mt][idx][k][vidx].shape
+
+        for vidx, v in enumerate(data_pickle[mt]):
+            for vdk in data_pickle[mt][vidx].keys():
+                assert len(v[vdk]) == (len(data_pickle_update[mt][vidx][vdk]) + data_pickle_update_skip[mt]), f"{mt}: {vidx}: {len(v[vdk])} vs {len(data_pickle_update[mt][vidx][vdk])} + {data_pickle_update_skip[mt]}"
+
+                vidx2 = vidx + 1
+
+                while vidx2 < len(data_pickle[mt]):
+                    assert len(v[vdk]) == (len(data_pickle_update[mt][vidx2][vdk]) + data_pickle_update_skip[mt]), f"{mt}: {len(v[vdk])} vs {len(data_pickle_update[mt][vidx2][vdk])} + {data_pickle_update_skip[mt]}"
+
+                    vidx2 += 1
+
+        assert len(data_pickle[mt]) == len(data_pickle_update[mt])
+
+if load_pickle_data:
+    expected_elements_to_be_printed = 0
+
+    for mt in mt_systems:
+        for idx in range(len(data_pickle_update[mt])):
+            vdk = list(data_pickle_update[mt][idx].keys())[0]
+            expected_elements_to_be_printed += len(data_pickle_update[mt][idx][vdk])
+
+            for _vdk in data_pickle_update[mt][idx].keys():
+                assert len(data_pickle_update[mt][idx][_vdk]) == len(data_pickle_update[mt][idx][vdk])
+
+    assert len(print_data) * len(pickle_output) == expected_elements_to_be_printed, f"{mt}: {len(print_data)} * {len(pickle_output)} vs {expected_elements_to_be_printed}"
 
 if shuffle_before_print:
     print("INFO: results are shuffled", file=sys.stderr)
@@ -327,24 +380,18 @@ if shuffle_before_print:
     print_data = [print_data[idx] for idx in idxs]
 
     if load_pickle_data:
-        #data_pickle_update = {k: [data_pickle_update[k][idx] for idx in idxs] for k in data_pickle_update.keys()}
-        data_pickle_update = {k: [[data_pickle_update[k][vidx][idx] for idx in idxs] for vidx in range(len(v))] for k, v in data_pickle_update.items()}
+        for output_idx in range(len(data_pickle_update_merge)):
+            for k in pickle_mat_keys:
+                assert len(data_pickle_update_merge[output_idx][k]) == len(print_data)
+
+        data_pickle_update_merge = [{k: [data_pickle_update_merge[output_idx][k][idx] for idx in idxs] for k in pickle_mat_keys} for output_idx in range(len(data_pickle_update_merge))]
 
 if load_pickle_data:
-    for k in data_pickle_update.keys():
-        assert len(pickle_output) == len(data_pickle_update[k])
-        assert isinstance(data_pickle_update[k], list), type(data_pickle_update[k])
+    for output_idx, _pickle_output in enumerate(pickle_output):
+        _data_pickle_update_merge = data_pickle_update_merge[output_idx]
 
-        for idx in range(len(data_pickle_update[k])):
-            assert isinstance(data_pickle_update[k][idx], list), type(data_pickle_update[k][idx])
-            assert isinstance(data_pickle_update[k][idx][0], np.ndarray), type(data_pickle_update[k][idx][0])
-            assert isinstance(data_pickle_update[k][idx][0][0], np.float64), type(data_pickle_update[k][idx][0][0])
-
-    for idx, _pickle_output in enumerate(pickle_output):
-#        _data_pickle_update = {k: v[k][idx] for k, v in data_pickle_update.items()}
-#
-#        with open(_pickle_output, "wb") as pickle_fd:
-#            pickle.dump(_data_pickle_update, pickle_fd)
+        with open(_pickle_output, "wb") as pickle_fd:
+            pickle.dump(_data_pickle_update_merge, pickle_fd)
 
         print(f"INFO: pickle data dumped: {_pickle_output}", file=sys.stderr)
 
