@@ -66,6 +66,9 @@ cnn_model_input = default_sys_argv(24, '')
 model_inference = default_sys_argv(25, False, f=lambda q: False if q == '' else bool(int(q)))
 gradient_accumulation = default_sys_argv(26, 1, f=lambda q: 1 if q == '' else int(q))
 
+if pretrained_model == '':
+    pretrained_model = "facebook/nllb-200-distilled-600M"
+
 assert gradient_accumulation > 0, gradient_accumulation
 
 print(f"Gradient accumulation: {gradient_accumulation} (if enabled, i.e. > 1, the same results would be obtained if dropout is disabled for both CNN and LM, train shuffle is disabled, and if float precision errors are ignored)")
@@ -116,6 +119,7 @@ assert cnn_max_height > 0, cnn_max_height
 
 attention_matrix = [f"explainability_{_attention_matrix}" for _attention_matrix in attention_matrix]
 translation_model_conf = {
+    "pretrained_model": pretrained_model,
     "source_lang": source_lang,
     "target_lang": target_lang,
     "direction": direction,
@@ -126,6 +130,7 @@ translation_model_conf = {
     "ignore_attention": ignore_attention,
 }
 translation_model_conf = json.dumps(translation_model_conf, indent=4)
+translation_tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model)
 
 print(f"NLLB conf:\n{translation_model_conf}")
 
@@ -331,8 +336,11 @@ def read(filename, direction, source_lang, target_lang, self_attention_remove_di
 
 def get_data(explainability_matrix, labels, loaded_samples, cnn_width, cnn_height, device, convert_labels_to_tensor=True):
     inputs = []
+    original_inputs = []
 
     for _input in explainability_matrix:
+        original_inputs.append(_input)
+
         _input = torch.from_numpy(_input)
 
         assert len(_input.shape) == 2
@@ -354,7 +362,7 @@ def get_data(explainability_matrix, labels, loaded_samples, cnn_width, cnn_heigh
     assert inputs.shape == inputs_expected_shape, inputs.shape
     assert labels.shape == labels_expected_shape, labels.shape
 
-    return inputs, labels
+    return inputs, labels, original_inputs
 
 channels_factor_len_set = set([len(direction), len(teacher_forcing), len(ignore_attention)])
 
@@ -432,11 +440,11 @@ for _direction, _teacher_forcing, _ignore_attention in zip(direction, teacher_fo
 
     for _attention_matrix in attention_matrix:
         inputs = f"{_attention_matrix}_{_direction}_{_teacher_forcing_str}_{_ignore_attention_str}"
-        train_data[f"inputs_{inputs}"], train_data["labels"] = get_data(train_data[_attention_matrix], train_data["labels"], train_data["loaded_samples"], cnn_width, cnn_height, None, convert_labels_to_tensor=first_time)
-        dev_data[f"inputs_{inputs}"], dev_data["labels"] = get_data(dev_data[_attention_matrix], dev_data["labels"], dev_data["loaded_samples"], cnn_width, cnn_height, None, convert_labels_to_tensor=first_time)
+        train_data[f"inputs_{inputs}"], train_data["labels"], train_data[f"original_data_{inputs}"] = get_data(train_data[_attention_matrix], train_data["labels"], train_data["loaded_samples"], cnn_width, cnn_height, None, convert_labels_to_tensor=first_time)
+        dev_data[f"inputs_{inputs}"], dev_data["labels"], dev_data[f"original_data_{inputs}"] = get_data(dev_data[_attention_matrix], dev_data["labels"], dev_data["loaded_samples"], cnn_width, cnn_height, None, convert_labels_to_tensor=first_time)
 
         if not skip_test:
-            test_data[f"inputs_{inputs}"], test_data["labels"] = get_data(test_data[_attention_matrix], test_data["labels"], test_data["loaded_samples"], cnn_width, cnn_height, None, convert_labels_to_tensor=first_time)
+            test_data[f"inputs_{inputs}"], test_data["labels"], test_data[f"original_data_{inputs}"] = get_data(test_data[_attention_matrix], test_data["labels"], test_data["loaded_samples"], cnn_width, cnn_height, None, convert_labels_to_tensor=first_time)
 
         first_time = False
 
@@ -463,8 +471,43 @@ if lang_model:
         d["inputs_lm_inputs"] = []
         all_texts = []
 
-        for source_text, target_text in zip(d["source_text"], d["target_text"]):
+        for idx, (source_text, target_text) in enumerate(zip(d["source_text"], d["target_text"])):
             all_texts.append(f"{source_text}{tokenizer.sep_token}{target_text}")
+
+            # Sanity check to verify that the number of tokens of the source and target text match with the expected dimensions
+
+            source_inputs = translation_tokenizer.encode_plus(source_text, return_tensors=None, add_special_tokens=True, max_length=max_length_encoder,
+                                                              return_attention_mask=False, truncation=True, padding="longest")["input_ids"]
+            target_inputs = translation_tokenizer.encode_plus(target_text, return_tensors=None, add_special_tokens=True, max_length=max_length_encoder,
+                                                              return_attention_mask=False, truncation=True, padding="longest")["input_ids"]
+
+            for _attention_matrix in attention_matrix:
+                keys_filter_check_shape = list(filter(lambda s: s.startswith(f"original_data_{_attention_matrix}_"), d.keys()))
+
+                assert len(keys_filter_check_shape) > 0
+
+                for k in keys_filter_check_shape:
+                    assert isinstance(d[k][idx], np.ndarray), f"{k}: {idx}: {type(d[k][idx])}"
+                    assert len(d[k][idx].shape) == 2, d[k][idx].shape
+
+                    if _attention_matrix == "explainability_encoder":
+                        expected_shape = (len(source_inputs), len(source_inputs))
+                    elif _attention_matrix == "explainability_decoder":
+                        expected_shape = (len(target_inputs), len(target_inputs))
+                    elif _attention_matrix == "explainability_cross":
+                        expected_shape = (len(target_inputs), len(source_inputs))
+                    else:
+                        raise Exception(f"Unexpected matrix key: {_attention_matrix}")
+
+                    assert d[k][idx].shape == expected_shape, f"{k}: {d[k][idx].shape} vs {expected_shape}: {source_inputs} | {target_inputs}"
+
+        for _attention_matrix in attention_matrix:
+            keys_filter_check_shape = list(filter(lambda s: s.startswith(f"original_data_{_attention_matrix}_"), d.keys()))
+
+            assert len(keys_filter_check_shape) > 0
+
+            for k in keys_filter_check_shape:
+                del d[k]
 
         inputs = tokenizer.batch_encode_plus(all_texts, return_tensors=None, add_special_tokens=True, max_length=max_length_encoder,
                                              return_attention_mask=False, truncation=True, padding="longest")
