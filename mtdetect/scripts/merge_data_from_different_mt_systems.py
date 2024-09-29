@@ -2,43 +2,75 @@
 import os
 import sys
 import random
+import pickle
+
+import numpy as np
+
+print(f"INFO: args provided: {sys.argv[1:]}", file=sys.stderr)
 
 remove_duplicates = False # Change manually if you'd like different behaviour with the duplicates
 shuffle_before_print = True # Change manually
 print_positive_labels_once = True # Change manually
 labels_to_merge = sys.argv[1]
+pickle_output = sys.argv[2].split(':')
 
 assert labels_to_merge in ("pos", "neg", "both", "none"), labels_to_merge
 
+for _pickle_output in pickle_output:
+    assert not os.path.isfile(_pickle_output), f"{_pickle_output}: does exist"
+
 target_label = 1 if labels_to_merge == "pos" else 0
 input_fns = {}
+input_fns_pickle = {}
 
-for idx, mt_fn in enumerate(sys.argv[2:], 1):
+for idx, mt_fn in enumerate(sys.argv[3:], 1):
     r = mt_fn.split(':')
 
-    assert len(r) in (1, 2), r
+    assert len(r) >= 2, r
 
-    if len(r) == 1:
-        mt = f"mt{idx}"
-        fn = r[0]
-    else:
-        mt = r[0]
-        fn = r[1]
+    mt = r[0]
+    fn = r[1]
+    fn_pickle = []
+
+    for _fn_pickle in r[2:]:
+        assert _fn_pickle not in pickle_output
+        assert os.path.isfile(_fn_pickle), f"{_fn_pickle}: does not exist (arg {idx}: {mt_fn})"
+
+        fn_pickle.append(_fn_pickle)
 
     assert os.path.isfile(fn), f"{fn}: does not exist (arg {idx}: {mt_fn})"
+    assert mt not in input_fns, "Same MT provided twice or more times"
 
     input_fns[mt] = fn
-
-print("NOTE: we assume that the source side is human text, and that the target is machine or human translated text. We use human text to discriminate unique sentences", file=sys.stderr)
+    input_fns_pickle[mt] = fn_pickle
 
 assert len(input_fns) > 0, "You need to provide data files"
+assert len(input_fns_pickle) == len(input_fns)
 
 mt_systems = list(input_fns.keys())
+pickle_len = None
 
-def read(fn, mt, remove_duplicates=False):
+for mt in mt_systems:
+    if pickle_len is None:
+        pickle_len = len(input_fns_pickle[mt])
+
+    assert pickle_len == len(input_fns_pickle[mt]), f"{mt}: {pickle_len} vs {len(input_fns_pickle[mt])}"
+
+load_pickle_data = pickle_len > 0
+
+if load_pickle_data:
+    assert len(pickle_output) == pickle_len, f"{len(pickle_output)} vs {pickle_len}"
+
+print(f"INFO: loading pickle data: {load_pickle_data}", file=sys.stderr)
+print("NOTE: we assume that the source side is human text, and that the target is machine or human translated text. We use human text to discriminate unique sentences", file=sys.stderr)
+
+def read(fn, mt, pickle_fn=[], remove_duplicates=False):
     src, trg, labels = [], [], []
     labels_count = {0: 0, 1: 0}
     src_count = {} # we assume that the human text is in the source side
+
+    if remove_duplicates:
+        assert len(pickle_fn) == 0, "Pickle processing and remove_duplicates=True is not supported"
 
     with open(fn, "rt") as fd:
         for l in fd:
@@ -59,6 +91,21 @@ def read(fn, mt, remove_duplicates=False):
 
     assert len(src) == len(trg) == len(labels)
     assert labels_count[0] == labels_count[1], f"{fn}: same number of positive and negative samples is expected"
+
+    # Load pickle files
+    pickle_data = []
+
+    if len(pickle_fn) > 0:
+        for _pickle_fn in pickle_fn:
+            with open(_pickle_fn, "rb") as pickle_fd:
+                _pickle_data = pickle.load(pickle_fd)
+
+                for k in _pickle_data.keys():
+                    assert len(src) == len(_pickle_data[k]), f"{_pickle_fn}: {k}: {len(src)} vs {len(_pickle_data[k])}"
+
+                pickle_data.append(_pickle_data)
+
+    # Remove if necessary
 
     src_to_remove = set()
 
@@ -100,13 +147,35 @@ def read(fn, mt, remove_duplicates=False):
 
     result = [(_src, _trg, label) for _src, _trg, label in zip(src, trg, labels)]
 
-    return result
+    return {
+        "result": result,
+        "pickle": pickle_data,
+    }
 
 if not remove_duplicates:
     print("WARNING: since remove_duplicates=False, entries with the same source sentences will not be detected across MT systems. "
           f"Therefore, these cases will be merged under the same group according to labels_to_merge={labels_to_merge}", file=sys.stderr)
 
-data = {mt: read(fn, mt, remove_duplicates=remove_duplicates) for mt, fn in input_fns.items()}
+data = {mt: read(input_fns[mt], mt, pickle_fn=input_fns_pickle[mt], remove_duplicates=remove_duplicates) for mt in mt_systems}
+data_results = {mt: data[mt]["result"] for mt in mt_systems}
+data_pickle = {mt: data[mt]["pickle"] for mt in mt_systems}
+
+for mt in mt_systems:
+    assert isinstance(data_pickle[mt], list), type(data_pickle[mt])
+
+    if load_pickle_data:
+        assert len(data_pickle[mt]) > 0
+        assert len(data_pickle[mt]) == len(pickle_output)
+
+        for idx in range(len(data_pickle[mt])):
+            assert isinstance(data_pickle[mt][idx], dict), type(data_pickle[mt][idx])
+
+            for k in data_pickle[mt][idx].keys():
+                assert isinstance(data_pickle[mt][idx][k], list), type(data_pickle[mt][idx][k])
+                assert isinstance(data_pickle[mt][idx][k][0], np.ndarray), type(data_pickle[mt][idx][k][0])
+                assert len(data_pickle[mt][idx][k][0].shape) == 2, data_pickle[mt][idx][k][0].shape
+    else:
+        assert len(data_pickle[mt]) == 0
 
 for idx_mt1 in range(len(mt_systems)):
     idx_mt2 = idx_mt1 + 1
@@ -116,10 +185,9 @@ for idx_mt1 in range(len(mt_systems)):
         mt2 = mt_systems[idx_mt2]
 
         # We expect to have the same positive samples
-        assert set([f"{src}\t{trg}\t{label}" for src, trg, label in data[mt1] if label == 1]) == set([f"{src}\t{trg}\t{label}" for src, trg, label in data[mt2] if label == 1]), f"{mt1} {mt2}"
+        assert set([f"{src}\t{trg}\t{label}" for src, trg, label in data_results[mt1] if label == 1]) == set([f"{src}\t{trg}\t{label}" for src, trg, label in data_results[mt2] if label == 1]), f"{mt1} {mt2}"
 
         idx_mt2 += 1
-
 
 indices = {}
 groups = {mt: None for mt in mt_systems}
@@ -128,10 +196,10 @@ seen_idx = {mt: set() for mt in mt_systems}
 aggregated_groups = 0
 
 for mt in mt_systems:
-    groups[mt] = [aggregated_groups + idx for idx in range(len(data[mt]))]
+    groups[mt] = [aggregated_groups + idx for idx in range(len(data_results[mt]))]
     aggregated_groups += len(groups[mt])
 
-for mt, results in data.items():
+for mt, results in data_results.items():
     assert len(results) == len(groups[mt])
 
     for idx, (src, trg, label) in enumerate(results):
@@ -173,7 +241,7 @@ for src in all_src:
 
         for mt in mt_systems:
             for idx in indices[src][mt]:
-                _src, _trg, label = data[mt][idx]
+                _src, _trg, label = data_results[mt][idx]
 
                 assert _src == src, f"{_src} != {src}"
 
@@ -192,13 +260,13 @@ for src in all_src:
             assert len(idxs_to_update[mt]) == len(idxs_to_ignore[mt])
 
             for idx in idxs_to_ignore[mt]:
-                _src, _trg, label = data[mt][idx]
+                _src, _trg, label = data_results[mt][idx]
 
                 assert _src == src, f"{_src} != {src}"
                 assert label != target_label
 
             for idx in idxs_to_update[mt]:
-                _src, _trg, label = data[mt][idx]
+                _src, _trg, label = data_results[mt][idx]
 
                 assert _src == src, f"{_src} != {src}"
                 assert label == target_label
@@ -208,29 +276,79 @@ for src in all_src:
 # Print data with groups
 first_mt = True
 print_data = []
+data_pickle_update = {k: [[] for _ in range(len(data_pickle[k]))] for k in data_pickle.keys()}
 
 if print_positive_labels_once:
     print("INFO: positive labels are being printed just once instead of once per MT system", file=sys.stderr)
 
-for mt, results in data.items():
+for mt, results in data_results.items():
     for idx, (src, trg, label) in enumerate(results):
         group = groups[mt][idx]
-        data = f"{src}\t{trg}\t{label}\t{group}"
+        d = f"{src}\t{trg}\t{label}\t{group}"
 
         if print_positive_labels_once and label == 1 and not first_mt:
             # It has been checked before that the positive labels data were the same across all MT systems, so it is ok to print just once
             continue
 
-        print_data.append(data)
+        print_data.append(d)
+
+        if load_pickle_data:
+            for v in data_pickle[mt]:
+                for vidx in range(len(v)):
+                    # TODO fix
+                    data_pickle_update[mt][vidx].append(v[vidx][idx])
+
+                assert len(v) == len(data_pickle_update[k])
+
+                for vidx in range(len(v)):
+                    assert len(v[vidx]) == len(data_pickle_update[k][vidx])
+
+                    vidx2 = vidx + 1
+
+                    while vidx2 < len(v):
+                        assert len(v[vidx]) == len(data_pickle_update[k][vidx2])
+
+                        vidx2 += 1
 
     first_mt = False
+
+if load_pickle_data:
+    for k in data_pickle_update.keys():
+        for idx in range(len(data_pickle_update[k])):
+            assert len(print_data) == len(data_pickle_update[k][idx]), f"{k}: {idx}: {len(print_data)} vs {len(data_pickle_update[k][idx])}"
 
 if shuffle_before_print:
     print("INFO: results are shuffled", file=sys.stderr)
 
-    random.shuffle(print_data)
+    idxs = list(range(len(print_data)))
 
-for data in print_data:
-    print(data)
+    random.shuffle(idxs)
+
+    print_data = [print_data[idx] for idx in idxs]
+
+    if load_pickle_data:
+        #data_pickle_update = {k: [data_pickle_update[k][idx] for idx in idxs] for k in data_pickle_update.keys()}
+        data_pickle_update = {k: [[data_pickle_update[k][vidx][idx] for idx in idxs] for vidx in range(len(v))] for k, v in data_pickle_update.items()}
+
+if load_pickle_data:
+    for k in data_pickle_update.keys():
+        assert len(pickle_output) == len(data_pickle_update[k])
+        assert isinstance(data_pickle_update[k], list), type(data_pickle_update[k])
+
+        for idx in range(len(data_pickle_update[k])):
+            assert isinstance(data_pickle_update[k][idx], list), type(data_pickle_update[k][idx])
+            assert isinstance(data_pickle_update[k][idx][0], np.ndarray), type(data_pickle_update[k][idx][0])
+            assert isinstance(data_pickle_update[k][idx][0][0], np.float64), type(data_pickle_update[k][idx][0][0])
+
+    for idx, _pickle_output in enumerate(pickle_output):
+#        _data_pickle_update = {k: v[k][idx] for k, v in data_pickle_update.items()}
+#
+#        with open(_pickle_output, "wb") as pickle_fd:
+#            pickle.dump(_data_pickle_update, pickle_fd)
+
+        print(f"INFO: pickle data dumped: {_pickle_output}", file=sys.stderr)
+
+for d in print_data:
+    print(d)
 
 print("Done!", file=sys.stderr)
