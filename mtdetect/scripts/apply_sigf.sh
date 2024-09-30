@@ -1,15 +1,19 @@
 #!/bin/bash
 
-nllb="distilled-600M"
 workers="1"
 njobs="0"
 focus="dev" # or test
 p_value_statistically_significant="0.05"
 
 add_mono_and_bilingual="$1"
+nllb="$2" # e.g., distilled-600M 1.3B 3.3B
 
 if [[ "$focus" != "dev" ]] && [[ "$focus" != "test" ]]; then
     echo "ERROR: focus must be either dev or test"
+    exit 1
+fi
+if [[ -z "$nllb" ]]; then
+    echo "ERROR: nllb was not provided"
     exit 1
 fi
 
@@ -18,7 +22,7 @@ if [[ "$add_mono_and_bilingual" != "0" ]] && [[ "$add_mono_and_bilingual" != "1"
     exit 1
 fi
 
-mkdir -p "./inference"
+mkdir -p "./inference.nllb-200-${nllb}"
 
 # inference lm
 
@@ -44,7 +48,7 @@ lm="microsoft/mdeberta-v3-base"
 lm_str=$(echo "$lm" | tr '/' '_')
 lm_input="yes"
 lm_frozen="0"
-inference_output="./inference/inference.${l}.${mono_or_bilingual}.${m}.lm_${lm_str}.lm_input_${lm_input}.lm_frozen_${lm_frozen}"
+inference_output="./inference.nllb-200-${nllb}/inference.${l}.${mono_or_bilingual}.${m}.lm_${lm_str}.lm_input_${lm_input}.lm_frozen_${lm_frozen}"
 input_file="./wmt_data/${l}.all.sentences.shuf.${focus}.${m}.out.all.shuf"
 echo "Check (LM): $inference_output"
 if [[ ! -f "$input_file" ]]; then
@@ -105,7 +109,7 @@ if [[ ! -f "$input_model" ]]; then
     >&2 echo "ERROR: model not found: $input_model"
     continue
 fi
-inference_output="./inference/inference.${l}.${d}.${m}.lm_${lm_str}.lm_input_${lm_input}.lm_frozen_${lm_frozen}"
+inference_output="./inference.nllb-200-${nllb}/inference.${l}.${d}.${m}.lm_${lm_str}.lm_input_${lm_input}.lm_frozen_${lm_frozen}"
 echo "Check: $inference_output"
 if [[ -f "$inference_output" ]]; then
     echo "Already exists: $inference_output"
@@ -120,7 +124,7 @@ fi
 (
 #CUDA_VISIBLE_DEVICES="" \
 MTDETECT_MODEL_INFERENCE_SKIP_TRAIN="1" \
-MTDETECT_PICKLE_FN="./wmt_data/${l}.all.sentences.shuf.{template}.${m}.out.all.shuf.pickle_file.facebook_nllb-200-distilled-600M.{direction}.${nllb_l1}.${nllb_l2}.teacher_forcing_{teacher_forcing}.ignore_attention_{ignore_attention}.pickle" \
+MTDETECT_PICKLE_FN="./wmt_data/${l}.all.sentences.shuf.{template}.${m}.out.all.shuf.pickle_file.facebook_nllb-200-${nllb}.{direction}.${nllb_l1}.${nllb_l2}.teacher_forcing_{teacher_forcing}.ignore_attention_{ignore_attention}.pickle" \
 python3 ./mtdetect/transformer_mm_explainability/mtdetect_cnn_using_example_translation_nllb.py \
   ./wmt_data/${l}.all.sentences.shuf.{train,dev,test}.${m}.out.all.shuf \
   16 64 64 "$nllb_l1" "$nllb_l2" ${d} encoder+decoder+cross none 1 avg+max+avg '' 5e-3 1 '' yes no "$lm" '' "$lm_frozen" 1e-5 \
@@ -149,7 +153,7 @@ fi
 # prepare data for sigf
 
 for l in $(echo "de-en-mtpaper zh-en-mtpaper ru-en-mtpaper"); do
-tmp_aggregated_results="./inference/eval_${focus}.nllb-200-${nllb}.${l}.dict_file_acc.all.includes_mono_and_bilingual_${add_mono_and_bilingual}"
+tmp_aggregated_results="./inference.nllb-200-${nllb}/eval_${focus}.nllb-200-${nllb}.${l}.dict_file_acc.all.includes_mono_and_bilingual_${add_mono_and_bilingual}"
 rm -f "$tmp_aggregated_results"
 touch "$tmp_aggregated_results"
 echo "Check aggregated results for $l: $tmp_aggregated_results"
@@ -171,7 +175,7 @@ lm_input=$(echo "$lmdata" | cut -d: -f2)
 lm_frozen=$(echo "$lmdata" | cut -d: -f3)
 all_ok="1"
 for m in $(echo "deepl google Unbabel_TowerInstruct-7B-v0.2"); do
-inference_output="./inference/inference.${l}.${d}.${m}.lm_${lm_str}.lm_input_${lm_input}.lm_frozen_${lm_frozen}"
+inference_output="./inference.nllb-200-${nllb}/inference.${l}.${d}.${m}.lm_${lm_str}.lm_input_${lm_input}.lm_frozen_${lm_frozen}"
 
 if [[ ! -f "$inference_output" ]]; then
     echo "ERROR: does not exist: $inference_output"
@@ -184,7 +188,7 @@ if [[ "$all_ok" == "0" ]]; then
     continue
 fi
 
-inference_output="./inference/inference.${l}.${d}.{deepl,google,Unbabel_TowerInstruct-7B-v0.2}.lm_${lm_str}.lm_input_${lm_input}.lm_frozen_${lm_frozen}"
+inference_output="./inference.nllb-200-${nllb}/inference.${l}.${d}.{deepl,google,Unbabel_TowerInstruct-7B-v0.2}.lm_${lm_str}.lm_input_${lm_input}.lm_frozen_${lm_frozen}"
 
 if [[ "$d" == "monolingual" ]] || [[ "$d" == "bilingual" ]]; then
 sanity_check=$(eval cat "$inference_output" | egrep -a "Inference metrics: " | wc -l)
@@ -197,7 +201,7 @@ if [[ "$sanity_check" != "3" ]]; then
     continue
 fi
 
-output="./inference/eval_${focus}.tp_and_tn_are_1s_otherwise_0.${l}.${d}.all_mt.lm_${lm_str}.lm_input_${lm_input}.lm_frozen_${lm_frozen}"
+output="./inference.nllb-200-${nllb}/eval_${focus}.tp_and_tn_are_1s_otherwise_0.${l}.${d}.all_mt.lm_${lm_str}.lm_input_${lm_input}.lm_frozen_${lm_frozen}"
 
 if [[ "$d" == "monolingual" ]] || [[ "$d" == "bilingual" ]]; then
 eval cat "$inference_output" | fgrep -a "inference: stdin" | sed 's/^.*inference: stdin/inference: stdin/' | cut -f5 | sed -e 's/tp/1/' -e 's/tn/1/' -e 's/fp/0/' -e 's/fn/0/' \

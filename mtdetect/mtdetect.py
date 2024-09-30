@@ -207,6 +207,9 @@ def apply_patience(model, tokenizer, dataset_dev, loss_function, device, thresho
                    current_patience, patience, dev_best_epoch, model_output):
     #if accelerator.is_local_main_process: # Do not even think about it ;) for some good reason (that I would like to know), it gets stuck
     dev_eval = inference.inference_eval(model, tokenizer, dataset_dev, loss_function=loss_function, device=device, threshold=threshold)
+
+    assert dev_best_metric in dev_eval.keys(), dev_best_metric
+
     dev_patience_metric = dev_eval[dev_best_metric]
 
     if accelerator.is_local_main_process:
@@ -222,7 +225,7 @@ def apply_patience(model, tokenizer, dataset_dev, loss_function, device, thresho
             logger.info("Exhausting patience... %d/%d", current_patience, patience)
     else:
         if accelerator.is_local_main_process:
-            logger.info("Best dev patience metric update: %s -> %s", dev_best_metric_value, dev_patience_metric)
+            logger.info("Best dev patience metric update (metric: %s): %s -> %s", dev_best_metric, dev_best_metric_value, dev_patience_metric)
 
         dev_best_metric_value = dev_patience_metric
         dev_best_epoch = epoch
@@ -263,6 +266,7 @@ def main(args):
     eval_steps = args.strategy_steps
     classifier_dropout = args.classifier_dropout
     gradient_accumulation_steps = args.gradient_accumulation
+    dev_patience_metric = args.dev_patience_metric
 
     if gradient_accumulation_steps > 1:
         assert (batch_size % gradient_accumulation_steps) == 0, f"batch_size % gradient_accumulation_steps != 0 -> {batch_size % gradient_accumulation_steps} != 0"
@@ -448,7 +452,7 @@ def main(args):
     stop_training = False
     epoch = 0
     current_patience = 0
-    dev_best_metric = "acc"
+    dev_best_metric = dev_patience_metric
     dev_best_epoch = 0
     dev_best_metric_value = -np.inf
     global_step = 0
@@ -707,6 +711,7 @@ def initialization():
     parser.add_argument('--strategy-steps', type=int, default=1000, help="Steps to evaluate and save the model when the strategy is 'steps'")
     parser.add_argument('--classifier-dropout', type=float, default=0.1, help="Dropout applied to the classifier layer")
     parser.add_argument('--gradient-accumulation', type=int, default=1, help="Gradient accumulation steps")
+    parser.add_argument('--dev-patience-metric', type=str, choices=["acc", "macro_f1"], default="acc", help="Metric to calculate patience using the dev set")
 
     parser.add_argument('--seed', type=int, default=71213,
                         help="Seed in order to have deterministic results (not fully guaranteed). "

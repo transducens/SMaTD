@@ -78,6 +78,8 @@ model_inference_skip_train = model_inference_skip_train and model_inference
 if model_inference:
     lm_frozen_params = True
 
+    assert save_model_path == '', save_model_path
+
 if lm_pretrained_model:
     print(f"LM is going to be used: {lm_pretrained_model} (local file: {lm_model_input})")
 
@@ -1154,6 +1156,10 @@ else:
 
 sys.stdout.flush()
 
+patience_metric = "acc" if "MTDETECT_PATIENCE_METRIC" not in os.environ else os.environ["MTDETECT_PATIENCE_METRIC"]
+
+assert patience_metric in ("acc", "macro_f1"), f"{patience_metric} not supported"
+
 for epoch in range(epochs):
     print(f"Epoch {epoch}")
 
@@ -1171,20 +1177,23 @@ for epoch in range(epochs):
     print(f"Dev eval: {dev_results}")
 
     epoch_loss = []
-    early_stopping_metric_train = train_results["acc"]
-    early_stopping_metric_dev = dev_results["acc"]
+
+    assert patience_metric in dev_results, patience_metric
+
+    early_stopping_metric_train = train_results[patience_metric]
+    early_stopping_metric_dev = dev_results[patience_metric]
     better_train_result = False
     patience_dev_equal = np.isclose(early_stopping_metric_dev, early_stopping_best_result_dev)
     patience_train_equal = np.isclose(early_stopping_metric_train, early_stopping_best_result_train)
 
     if early_stopping_metric_train > early_stopping_best_result_train:
-        print(f"Better train result: {early_stopping_best_result_train} -> {early_stopping_metric_train}")
+        print(f"Better train result (metric: {patience_metric}): {early_stopping_best_result_train} -> {early_stopping_metric_train}")
 
         better_train_result = True
         early_stopping_best_result_train = early_stopping_metric_train
 
     if early_stopping_metric_dev > early_stopping_best_result_dev or ((patience_dev_equal and better_train_result) or (patience_dev_equal and patience_train_equal and better_loss_result)):
-        print(f"Patience better dev result: {early_stopping_best_result_dev} -> {early_stopping_metric_dev}")
+        print(f"Patience better dev result (metric: {patience_metric}): {early_stopping_best_result_dev} -> {early_stopping_metric_dev}")
 
         current_patience = 0
         early_stopping_best_result_dev = early_stopping_metric_dev
