@@ -223,6 +223,7 @@ def read(filename, direction, source_lang, target_lang, self_attention_remove_di
         target = l[1]
         label = l[2]
         group = l[3] if len(l) > 3 else str(idx)
+        group = group.split(':')[0] # remove "optional" part of the group
 
         assert label in ('0', '1'), label # 0 is NMT; 1 is HT
 
@@ -606,6 +607,8 @@ class MyDataset(Dataset):
 
         for idx in range(len(self.groups)):
             group = self.groups[idx]
+
+            assert ':' not in group
 
             if group not in self.data:
                 self.uniq_groups.append(group)

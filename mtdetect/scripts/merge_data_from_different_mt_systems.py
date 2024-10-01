@@ -13,6 +13,7 @@ shuffle_before_print = True # Change manually
 print_positive_labels_once = True # Change manually
 labels_to_merge = sys.argv[1]
 pickle_output = sys.argv[2].split(':')
+select_random_value_if_same_group = bool(int(sys.argv[3])) # according to labels_to_merge
 
 assert labels_to_merge in ("pos", "neg", "both", "none"), labels_to_merge
 
@@ -23,7 +24,7 @@ target_label = 1 if labels_to_merge == "pos" else 0
 input_fns = {}
 input_fns_pickle = {}
 
-for idx, mt_fn in enumerate(sys.argv[3:], 1):
+for idx, mt_fn in enumerate(sys.argv[4:], 1):
     r = mt_fn.split(':')
 
     assert len(r) >= 2, r
@@ -150,16 +151,20 @@ def read(fn, mt, pickle_fn=[], remove_duplicates=False):
     return {
         "result": result,
         "pickle": pickle_data,
+        "len_remove": len(src_to_remove),
     }
-
-if not remove_duplicates:
-    print("WARNING: since remove_duplicates=False, entries with the same source sentences will not be detected across MT systems. "
-          f"Therefore, these cases will be merged under the same group according to labels_to_merge={labels_to_merge}", file=sys.stderr)
 
 data = {mt: read(input_fns[mt], mt, pickle_fn=input_fns_pickle[mt], remove_duplicates=remove_duplicates) for mt in mt_systems}
 data_results = {mt: data[mt]["result"] for mt in mt_systems}
 data_pickle = {mt: data[mt]["pickle"] for mt in mt_systems}
 pickle_mat_keys = []
+
+if not remove_duplicates:
+    total_remove = sum([data[mt]["len_remove"] for mt in mt_systems])
+
+    if total_remove > 0:
+        print(f"WARNING: {total_remove} unique sentences should be removed but since remove_duplicates=False, entries with the same source sentences will not be detected across MT systems. "
+              f"Therefore, these cases will be merged under the same group according to labels_to_merge={labels_to_merge}", file=sys.stderr)
 
 if load_pickle_data:
     pickle_mat_keys = list(data_pickle[mt_systems[0]][0].keys())
@@ -195,16 +200,27 @@ for idx_mt1 in range(len(mt_systems)):
 
 indices = {}
 groups = {mt: None for mt in mt_systems}
+descs = {mt: None for mt in mt_systems}
 all_src = set()
 seen_idx = {mt: set() for mt in mt_systems}
 aggregated_groups = 0
 
 for mt in mt_systems:
-    groups[mt] = [aggregated_groups + idx for idx in range(len(data_results[mt]))]
+    groups[mt] = []
+    descs[mt] = []
+
+    for idx in range(len(data_results[mt])):
+        src, trg, label = data_results[mt][idx]
+        desc = f"mt:system_is_{mt}" if label == 0 else f"human:from_{mt}_file"
+
+        groups[mt].append(f"{aggregated_groups + idx}")
+        descs[mt].append(desc)
+
     aggregated_groups += len(groups[mt])
 
 for mt, results in data_results.items():
     assert len(results) == len(groups[mt])
+    assert len(descs[mt]) == len(groups[mt])
 
     for idx, (src, trg, label) in enumerate(results):
         if src not in indices:
@@ -235,7 +251,23 @@ for src in all_src:
 
         for mt in mt_systems:
             for idx in indices[src][mt]:
-                groups[mt][idx] = any_group
+                _src, _trg, label = data_results[mt][idx]
+
+                assert _src == src, f"{_src} != {src}"
+
+                groups[mt][idx] = None if select_random_value_if_same_group else any_group
+
+        random_mt = None
+
+        for mt in random.sample(mt_systems, len(mt_systems)):
+            if len(indices[src][mt]) > 0: # there may not be samples in any MT system
+                random_mt = mt
+
+                break
+
+        if random_mt is not None:
+            random_idx = random.choice(indices[src][random_mt])
+            groups[random_mt][random_idx] = any_group # random value if select_random_value_if_same_group, otherwise harmless
     else:
         assert labels_to_merge in ("pos", "neg"), f"Unexpected value for labels_to_merge: {labels_to_merge}"
 
@@ -275,7 +307,19 @@ for src in all_src:
                 assert _src == src, f"{_src} != {src}"
                 assert label == target_label
 
-                groups[mt][idx] = any_group
+                groups[mt][idx] = None if select_random_value_if_same_group else any_group
+
+        random_mt = None
+
+        for mt in random.sample(mt_systems, len(mt_systems)):
+            if len(idxs_to_update[mt]) > 0: # there may not be samples in any MT system
+                random_mt = mt
+
+                break
+
+        if random_mt is not None:
+            random_idx = random.choice(idxs_to_update[random_mt])
+            groups[random_mt][random_idx] = any_group # random value if select_random_value_if_same_group, otherwise harmless
 
 # Print data with groups
 first_mt = True
@@ -290,7 +334,14 @@ if print_positive_labels_once:
 for mt, results in data_results.items():
     for idx, (src, trg, label) in enumerate(results):
         group = groups[mt][idx]
-        d = f"{src}\t{trg}\t{label}\t{group}"
+        desc = descs[mt][idx]
+
+        if group is None:
+            data_pickle_update_skip[mt] += 1 if load_pickle_data else 0
+
+            continue
+
+        d = f"{src}\t{trg}\t{label}\t{group}:{desc}"
 
         if print_positive_labels_once and label == 1 and not first_mt:
             # It has been checked before that the positive labels data were the same across all MT systems, so it is ok to print just once

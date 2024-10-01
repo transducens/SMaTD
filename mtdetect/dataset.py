@@ -101,6 +101,8 @@ class SmartBatchingURLsDataset(Dataset):
         for idx in range(len(self.groups)):
             group = self.groups[idx]
 
+            assert ':' not in group
+
             if group not in self.data:
                 self.uniq_groups.append(group)
                 self.data[group] = {
@@ -354,6 +356,7 @@ class SelectGroupCollate:
 
             assert len(y) > 0
             assert len(x) == len(y)
+            assert ':' not in group
 
             group_idx = np.random.randint(len(y))
             output_x = x[group_idx]
@@ -390,6 +393,7 @@ def tokenize_batch_from_iterator(iterator, tokenizer, batch_size, f=None, ignore
 
         src_url, trg_url, label = f(url[0]), f(url[1]), int(url[2])
         group = url[3] if len(url) > 3 else str(idx)
+        group = group.split(':')[0] # remove "optional" part of the group
 
         if isinstance(src_url, list):
             assert len(src_url) == 1, src_url
