@@ -66,6 +66,8 @@ print(f"INFO: loading pickle data: {load_pickle_data}", file=sys.stderr)
 print("NOTE: we assume that the source side is human text, and that the target is machine or human translated text. We use human text to discriminate unique sentences", file=sys.stderr)
 
 def read(fn, mt, pickle_fn=[], remove_duplicates=False):
+    assert ':' not in mt
+
     src, trg, labels = [], [], []
     labels_count = {0: 0, 1: 0}
     src_count = {} # we assume that the human text is in the source side
@@ -77,6 +79,7 @@ def read(fn, mt, pickle_fn=[], remove_duplicates=False):
         for l in fd:
             _src, _trg, label = l.rstrip("\r\n").split('\t')
             label = int(label)
+            _src = f"no_duplicated:{_src}" # necessary for processing duplicates
 
             assert label in (0, 1), f"{fn}: {label}"
 
@@ -146,25 +149,91 @@ def read(fn, mt, pickle_fn=[], remove_duplicates=False):
 
         assert len(src) == len(trg) == len(labels)
 
-    result = [(_src, _trg, label) for _src, _trg, label in zip(src, trg, labels)]
+    result = [(_src, _trg, label) for idx, (_src, _trg, label) in enumerate(zip(src, trg, labels))]
 
     return {
         "result": result,
         "pickle": pickle_data,
-        "len_remove": len(src_to_remove),
+        "src_to_remove": src_to_remove,
     }
 
 data = {mt: read(input_fns[mt], mt, pickle_fn=input_fns_pickle[mt], remove_duplicates=remove_duplicates) for mt in mt_systems}
 data_results = {mt: data[mt]["result"] for mt in mt_systems}
+data_results_src = {mt: [src for src, trg, label in data_results[mt]] for mt in mt_systems}
 data_pickle = {mt: data[mt]["pickle"] for mt in mt_systems}
+src_to_remove = {mt: data[mt]["src_to_remove"] for mt in mt_systems}
 pickle_mat_keys = []
 
+assert len(set([len(src_to_remove[mt]) for mt in mt_systems])) == 1, "Since we expect the same source sentences for all MT systems, duplicates should be the same"
+assert len(set.intersection(*[src_to_remove[mt] for mt in mt_systems])) == len(src_to_remove[mt_systems[0]]), "Same duplicated sentences were expected"
+
 if not remove_duplicates:
-    total_remove = sum([data[mt]["len_remove"] for mt in mt_systems])
+    uniq_src_to_remove = set.union(*[src_to_remove[mt] for mt in mt_systems])
+    total_remove = len(uniq_src_to_remove)
 
     if total_remove > 0:
-        print(f"WARNING: {total_remove} unique sentences should be removed but since remove_duplicates=False, entries with the same source sentences will not be detected across MT systems. "
-              f"Therefore, these cases will be merged under the same group according to labels_to_merge={labels_to_merge}", file=sys.stderr)
+        print(f"INFO: {total_remove} src unique sentences found", file=sys.stderr)
+
+        sorted_duplicated_sentences = sorted(list(uniq_src_to_remove))
+
+        for duplicated_sentence in sorted_duplicated_sentences:
+            assert duplicated_sentence.split(':')[0] == "no_duplicated"
+
+            all_found_values = []
+
+            for mt in mt_systems:
+                found_idx = 0
+                idx_and_trg_and_label_pairs = []
+
+                while True:
+                    try:
+                        new_idx = data_results_src[mt].index(duplicated_sentence, found_idx)
+                    except ValueError:
+                        break
+
+                    found_idx = new_idx + 1
+                    src, trg, label = data_results[mt][new_idx]
+
+                    assert data_results_src[mt][new_idx] == duplicated_sentence == src
+
+                    idx_and_trg_and_label_pairs.append((new_idx, trg, label))
+
+                all_found_values.append(len(idx_and_trg_and_label_pairs))
+
+                idx_and_trg_and_label_pairs = sorted(idx_and_trg_and_label_pairs, key=lambda e: (e[2], e[1])) # We do not care about which elements are matched with each other, but we do care that the label values are the same and sort by trg
+                sum_labels = [sum([1 if l == 0 else 0 for _, _, l in idx_and_trg_and_label_pairs]), sum([1 if l == 1 else 0 for _, _, l in idx_and_trg_and_label_pairs])]
+
+                assert sum_labels[0] == sum_labels[1]
+                assert len(idx_and_trg_and_label_pairs) % 2 == 0
+
+                # We need to apply changes to BOTH positive and negative label samples
+                for idx1 in range(len(idx_and_trg_and_label_pairs) // 2):
+                    idx2 = idx1 + len(idx_and_trg_and_label_pairs) // 2
+                    found_idx1 = idx_and_trg_and_label_pairs[idx1][0]
+                    found_idx2 = idx_and_trg_and_label_pairs[idx2][0]
+                    src1, trg1, label1 = data_results[mt][found_idx1]
+                    src2, trg2, label2 = data_results[mt][found_idx2]
+
+                    assert duplicated_sentence == src1 == src2 == data_results_src[mt][found_idx1] == data_results_src[mt][found_idx2]
+
+                    data_results[mt][found_idx1] = (f"duplicated_idx_{idx1}:{':'.join(duplicated_sentence.split(':')[1:])}", *data_results[mt][found_idx1][1:])
+                    data_results[mt][found_idx2] = (f"duplicated_idx_{idx1}:{':'.join(duplicated_sentence.split(':')[1:])}", *data_results[mt][found_idx2][1:])
+                    data_results_src[mt][found_idx1] = data_results[mt][found_idx1][0]
+                    data_results_src[mt][found_idx2] = data_results[mt][found_idx2][0]
+
+                    _src1, _trg1, _label1 = data_results[mt][found_idx1]
+                    _src2, _trg2, _label2 = data_results[mt][found_idx2]
+
+                    assert src1.split(':')[0] != _src1.split(':')[0]
+                    assert src2.split(':')[0] != _src2.split(':')[0]
+                    assert ':'.join(src1.split(':')[1:]) == ':'.join(_src1.split(':')[1:]) == ':'.join(src2.split(':')[1:]) == ':'.join(_src2.split(':')[1:])
+                    assert trg1 == _trg1
+                    assert trg2 == _trg2
+                    assert label1 == _label1
+                    assert label2 == _label2
+                    assert label1 != label2
+
+            assert len(set(all_found_values)) == 1, all_found_values
 
 if load_pickle_data:
     pickle_mat_keys = list(data_pickle[mt_systems[0]][0].keys())
@@ -192,9 +261,12 @@ for idx_mt1 in range(len(mt_systems)):
     while idx_mt2 < len(mt_systems):
         mt1 = mt_systems[idx_mt1]
         mt2 = mt_systems[idx_mt2]
+        set1 = set([f"{src}\t{trg}\t{label}" for src, trg, label in data_results[mt1] if label == 1])
+        set2 = set([f"{src}\t{trg}\t{label}" for src, trg, label in data_results[mt2] if label == 1])
 
         # We expect to have the same positive samples
-        assert set([f"{src}\t{trg}\t{label}" for src, trg, label in data_results[mt1] if label == 1]) == set([f"{src}\t{trg}\t{label}" for src, trg, label in data_results[mt2] if label == 1]), f"{mt1} {mt2}"
+        assert len(set1) == len(set2), f"{mt1} {mt2}"
+        assert set1 == set2, f"{mt1} {mt2}: {set.difference(set1, set2)} - {set.difference(set2, set1)}"
 
         idx_mt2 += 1
 
@@ -234,6 +306,23 @@ for mt, results in data_results.items():
         all_src.add(src)
         seen_idx[mt].add(idx)
 
+all_groups = set.union(*[set(groups[mt]) for mt in mt_systems])
+group2label = {group: set() for group in all_groups}
+
+for mt in mt_systems:
+    for idx, (src, trg, label) in enumerate(data_results[mt]):
+        group = groups[mt][idx]
+
+        if group not in group2label:
+            group2label[group] = set()
+
+        group2label[group].add(label)
+
+assert len(all_groups) == len(group2label.keys())
+
+for group in all_groups:
+    assert len(group2label[group]) == 1, group
+
 # Update groups using indices
 for src in all_src:
     # Replace groups according to labels_to_merge
@@ -241,7 +330,7 @@ for src in all_src:
     assert len(indices[src]) == len(input_fns)
 
     for mt in mt_systems:
-        assert len(indices[src][mt]) >= 2
+        assert len(indices[src][mt]) >= 2, f"{mt}: {indices[src][mt]}: {src}"
 
     if labels_to_merge == "none":
         continue
@@ -341,6 +430,11 @@ for mt, results in data_results.items():
 
             continue
 
+        src_id = src.split(':')[0]
+
+        assert src_id == "no_duplicated" or src_id.startswith("duplicated_idx_"), src.split(':')
+
+        src = ':'.join(src.split(':')[1:])
         d = f"{src}\t{trg}\t{label}\t{group}:{desc}"
 
         if print_positive_labels_once and label == 1 and not first_mt:
