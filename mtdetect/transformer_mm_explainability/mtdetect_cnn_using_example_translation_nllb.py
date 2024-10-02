@@ -586,7 +586,7 @@ class MyDataset(Dataset):
         if create_groups:
             self.groups = data["groups"]
         else:
-            self.groups = list(range(len(data["labels"])))
+            self.groups = [str(idx) for idx in range(len(data["labels"]))]
 
             if "groups" in data:
                 assert len(data["groups"]) == len(self.groups)
