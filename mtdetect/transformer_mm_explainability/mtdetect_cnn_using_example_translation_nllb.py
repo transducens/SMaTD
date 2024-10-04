@@ -8,6 +8,7 @@ import pickle
 import mtdetect.transformer_mm_explainability.example_translation_nllb as example_translation_nllb
 import mtdetect.inference as inference
 import mtdetect.utils.utils as utils
+import mtdetect.dataset as dataset
 
 import numpy as np
 import torch
@@ -46,12 +47,10 @@ source_lang = source_lang if source_lang != '' else "eng_Latn"
 target_lang = default_sys_argv(8, "spa_Latn")
 target_lang = target_lang if target_lang != '' else "spa_Latn"
 direction = default_sys_argv(9, ["src2trg"], f=lambda q: ["src2trg"] if q == '' else [_q for _q in q.split('+')])
-attention_matrix = default_sys_argv(10, "encoder+decoder+cross")
-attention_matrix = attention_matrix.split('+') # The order is not important (i.e., cross+decoder should be equivalent to decoder+cross) -> sorted
+attention_matrix = default_sys_argv(10, "encoder+decoder+cross").split('+') # The order is not important (i.e., cross+decoder should be equivalent to decoder+cross) -> sorted
 explainability_normalization = default_sys_argv(11, "none")
 self_attention_remove_diagonal = default_sys_argv(12, True, f=lambda q: bool(int(q)))
-cnn_pooling = default_sys_argv(13, "avg+max+avg")
-cnn_pooling = cnn_pooling.split('+')
+cnn_pooling = default_sys_argv(13, "avg+max+avg").split('+')
 save_model_path = default_sys_argv(14, '')
 learning_rate = default_sys_argv(15, 5e-3, f=float)
 multichannel = default_sys_argv(16, True, f=lambda q: bool(int(q)))
@@ -79,6 +78,9 @@ if model_inference:
     lm_frozen_params = True
 
     assert save_model_path == '', save_model_path
+
+if save_model_path != '':
+    assert not os.path.isfile(save_model_path), f"File found in the profided path to save the model: {save_model_path}"
 
 if lm_pretrained_model:
     print(f"LM is going to be used: {lm_pretrained_model} (local file: {lm_model_input})")
@@ -161,7 +163,9 @@ def read(filename, direction, source_lang, target_lang, self_attention_remove_di
     target_text = []
     labels = []
     groups = [] # If more than 1 entry belongs to the same group, they will be randomly selected dynamically
+    groups_balanced = [] # Data will be sampled according to NLLB and mBART papers temperature sampling
     uniq_groups = set()
+    uniq_groups_balanced = set()
     explainability_ee = []
     explainability_dd = []
     explainability_de = []
@@ -223,7 +227,15 @@ def read(filename, direction, source_lang, target_lang, self_attention_remove_di
         target = l[1]
         label = l[2]
         group = l[3] if len(l) > 3 else str(idx)
-        group = group.split(':')[0] # remove "optional" part of the group
+        group_data = group.split(':')
+        group = group_data[0] # remove "optional" part of the group
+        group_balanced = "none"
+
+        if len(group_data) > 1:
+            group_data_balanced = ':'.join(group_data[1:]) # get the "other" group to balance different datasets from the "optional" part of the group
+
+            if '#' in group_data_balanced:
+                group_balanced = group_data_balanced.split('#')[-1]
 
         assert label in ('0', '1'), label # 0 is NMT; 1 is HT
 
@@ -233,7 +245,9 @@ def read(filename, direction, source_lang, target_lang, self_attention_remove_di
         target_text.append(target)
         labels.append(label)
         groups.append(group)
+        groups_balanced.append(group_balanced)
         uniq_groups.add(group)
+        uniq_groups_balanced.add(group_balanced)
 
         if not fn_pickle_array_exists:
             input_tokens, output_tokens, output, r_ee, r_dd, r_de = \
@@ -322,7 +336,22 @@ def read(filename, direction, source_lang, target_lang, self_attention_remove_di
 
             pickle.dump(pickle_data, pickle_fd)
 
-    print(f"Samples: {len(groups)} (limit: {limit_data}); Groups: {len(uniq_groups)}")
+    print(f"Samples: {len(groups)} (limit: {limit_data}); Groups: {len(uniq_groups)}; Balanced groups: {len(uniq_groups_balanced)}")
+
+    # groups
+    # groups_balanced
+    assert len(groups) == len(groups_balanced)
+
+    groups2groups_balanced = {}
+
+    for group, group_balanced in zip(groups, groups_balanced):
+        if group not in groups2groups_balanced:
+            groups2groups_balanced[group] = set()
+
+        groups2groups_balanced[group].add(group_balanced)
+
+        assert len(groups2groups_balanced[group]) == 1, f"Group {group} was found in more than one balanced group: {groups2groups_balanced[group]}. " \
+                                                        "There can be multiple samples for the same group, but they must be in the same balanced group"
 
     return {
         "cnn_width": cnn_width,
@@ -332,6 +361,7 @@ def read(filename, direction, source_lang, target_lang, self_attention_remove_di
         "target_text": target_text,
         "labels": labels,
         "groups": groups,
+        "groups_balanced": groups_balanced,
         "explainability_encoder": explainability_ee,
         "explainability_decoder": explainability_dd,
         "explainability_cross": explainability_de,
@@ -411,6 +441,8 @@ data_input_all_keys = []
 train_data = {}
 dev_data = {}
 test_data = {}
+multiplicative_inverse_temperature_sampling = 0.3 # TODO provide via argument - NLLB value
+temperature_sampling = 1 / multiplicative_inverse_temperature_sampling
 
 assert len(direction) == len(teacher_forcing) == len(ignore_attention)
 
@@ -580,21 +612,29 @@ class MyDataset(Dataset):
         self.return_group = return_group
         self.data = {}
         self.uniq_groups = []
+        self.groups_balanced_aligned_with_uniq_groups = []
         self.all_keys = all_keys
         self.add_text = add_text
+        self.groups2group_balanced = {}
 
         if create_groups:
             self.groups = data["groups"]
+            self.groups_balanced = data["groups_balanced"]
         else:
             self.groups = [str(idx) for idx in range(len(data["labels"]))]
+            self.groups_balanced = ["none" for _ in range(len(data["labels"]))]
 
-            if "groups" in data:
+            if "groups" in data or "groups_balanced" in data:
+                assert "groups" in data and "groups_balanced" in data, data.keys()
                 assert len(data["groups"]) == len(self.groups)
+                assert len(data["groups_balanced"]) == len(self.groups_balanced)
+                assert len(self.groups) == len(self.groups_balanced)
 
-                _set_groups = set(data["groups"])
+                for k in ("groups", "groups_balanced"):
+                    _set_groups = set(data[k])
 
-                if len(_set_groups) < len(self.groups):
-                    print("warning: create_groups=False, but groups were provided, and there are groups with >1 element: {len(self.groups) - len(_set_groups)} groups with >1 element")
+                    if len(_set_groups) < len(data[k]):
+                        print(f"warning: create_groups=False, but {k} were provided, and there are groups with >1 element: {len(data[k]) - len(_set_groups)} groups with >1 element")
 
         for i in range(len(self.all_keys) - 1):
             k1 = self.all_keys[i]
@@ -604,22 +644,36 @@ class MyDataset(Dataset):
             assert len(data[f"inputs_{k1}"]) == len(data["labels"])
 
         assert len(data["labels"]) == len(self.groups)
+        assert len(data["labels"]) == len(self.groups_balanced)
 
         for idx in range(len(self.groups)):
             group = self.groups[idx]
+            group_balanced = self.groups_balanced[idx]
 
             assert ':' not in group
+            assert '#' not in group_balanced
+
+            if group_balanced not in self.groups_balanced_aligned_with_uniq_groups:
+                assert group not in self.data, f"This error might be caused by using the same group in different balanced groups, which is not supported: {group} | {group_balanced}"
 
             if group not in self.data:
                 self.uniq_groups.append(group)
+                self.groups_balanced_aligned_with_uniq_groups.append(group_balanced)
+
                 self.data[group] = {
                     'x': {k: [] for k in self.all_keys},
                     'y': [],
+                    "group_balanced": group_balanced,
                 }
 
                 if self.add_text:
                     self.data[group]["source_text"] = []
                     self.data[group]["target_text"] = []
+
+                self.groups2group_balanced[group] = group_balanced
+
+            assert self.groups2group_balanced[group] == group_balanced # this should be also true when group in self.data (i.e., did not enter the previous if statement)
+            assert len(self.groups_balanced_aligned_with_uniq_groups) == len(self.uniq_groups) # these two should be aligned in terms of nubmer of elements
 
             for k in self.all_keys:
                 self.data[group]['x'][k].append(data[f"inputs_{k}"][idx])
@@ -630,11 +684,15 @@ class MyDataset(Dataset):
                 self.data[group]["source_text"].append(data["source_text"][idx])
                 self.data[group]["target_text"].append(data["target_text"][idx])
 
+        assert len(self.groups2group_balanced) == len(self.uniq_groups)
+        assert len(set(self.groups2group_balanced.values())) == len(set(self.groups_balanced_aligned_with_uniq_groups))
+
     def __len__(self):
-        return len(self.data)
+        return len(self.uniq_groups)
 
     def __getitem__(self, idx):
         group = self.uniq_groups[idx]
+        group_balanced = self.data[group]["group_balanced"]
         x = {k: [v.clone().detach().type(torch.float32) if k != "lm_inputs" else v.clone().detach() for v in l] for k, l in self.data[group]['x'].items()}
         y = [_y.clone().detach().type(torch.float32) for _y in self.data[group]['y']]
 
@@ -648,6 +706,7 @@ class MyDataset(Dataset):
 
         if self.return_group:
             result["group"] = group
+            result["group_balanced"] = group_balanced
 
         if self.add_text:
             result["source_text"] = self.data[group]["source_text"]
@@ -1034,9 +1093,11 @@ def eval(model, dataloader, all_keys, device, print_result=False, print_desc='-'
 num_workers = 0
 collate_fn = wrapper_select_random_group_collate_fn(tokenizer=tokenizer, remove_padding=True, return_text=model_inference)
 train_dataset = MyDataset(train_data, data_input_all_keys, create_groups=True, return_group=True, add_text=model_inference)
-train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=shuffle_training, num_workers=num_workers, collate_fn=collate_fn)
+train_sampler = dataset.GroupBalancedSampler(train_dataset, batch_size, temperature_sampling=temperature_sampling, shuffle=shuffle_training, desc="train")
+train_dataloader = DataLoader(train_dataset, batch_size=batch_size, num_workers=num_workers, sampler=train_sampler, collate_fn=collate_fn)
 dev_dataset = MyDataset(dev_data, data_input_all_keys, add_text=model_inference)
-dev_dataloader = DataLoader(dev_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=collate_fn)
+dev_sampler = dataset.GroupBalancedSampler(dev_dataset, batch_size, temperature_sampling=1, shuffle=False, desc="dev")
+dev_dataloader = DataLoader(dev_dataset, batch_size=batch_size, num_workers=num_workers, sampler=dev_sampler, collate_fn=collate_fn)
 
 # Model
 num_classes = 1
@@ -1300,7 +1361,8 @@ if not skip_test:
     torch.cuda.empty_cache()
 
     test_dataset = MyDataset(test_data, data_input_all_keys, add_text=model_inference)
-    test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=collate_fn)
+    test_sampler = dataset.GroupBalancedSampler(test_dataset, batch_size, temperature_sampling=1, shuffle=False, desc="test")
+    test_dataloader = DataLoader(test_dataset, batch_size=batch_size, num_workers=num_workers, sampler=test_sampler, collate_fn=collate_fn)
 
     test_results = eval(model, test_dataloader, data_input_all_keys, device, print_result=model_inference, print_desc="test")
 

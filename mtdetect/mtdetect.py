@@ -153,13 +153,14 @@ def load_model(model_input, pretrained_model, device, name=None, classifier_drop
 
     return model
 
-def load_dataset(filename_dataset, set_desc, **kwargs):
+def load_dataset(filename_dataset, set_desc, group_balanced_sampler=False, **kwargs):
     logger.debug("Allocated memory before starting tokenization (%s): %d", set_desc, utils.get_current_allocated_memory_size())
 
     file_dataset = open(filename_dataset, mode="rt", errors="backslashreplace")
     input_data = []
     output_data = []
     groups_data = []
+    groups_balanced_data = []
 
     # Read data from input files
     batch = dataset.tokenize_batch_from_iterator(file_dataset, kwargs["tokenizer"], kwargs["batch_size"], ignore_source_side=kwargs["monolingual"])
@@ -168,6 +169,7 @@ def load_dataset(filename_dataset, set_desc, **kwargs):
         input_data.extend(batch_urls["urls"])
         output_data.extend(batch_urls["labels"])
         groups_data.extend(batch_urls["groups"])
+        groups_balanced_data.extend(batch_urls["groups_balanced"])
 
         if len(input_data) != len(output_data) or len(output_data) != len(groups_data):
             raise Exception(f"Different lengths for input, output, groups data in {set_desc} set: {len(input_data)} vs {len(output_data)} vs {len(groups_data)}")
@@ -186,7 +188,9 @@ def load_dataset(filename_dataset, set_desc, **kwargs):
     logger.debug("Allocated memory after tokenization (%s): %d", set_desc, utils.get_current_allocated_memory_size())
 
     # Datasets
-    dataset_instance = dataset.SmartBatchingURLsDataset(input_data, output_data, kwargs["tokenizer"], kwargs["max_length_tokens"], set_desc=set_desc, groups=groups_data)
+    dataset_instance = dataset.SmartBatchingURLsDataset(input_data, output_data, kwargs["tokenizer"], kwargs["max_length_tokens"], set_desc=set_desc,
+                                                        groups=groups_data, groups_balanced=groups_balanced_data)
+    sampler = None
 
     logger.debug("Allocated memory after encoding the data: %d", utils.get_current_allocated_memory_size())
     logger.debug("Total tokens (%s): %d", set_desc, dataset_instance.total_tokens)
@@ -197,7 +201,11 @@ def load_dataset(filename_dataset, set_desc, **kwargs):
 
     logger.debug("Allocated memory after removing pairs of URLs (str): %d", utils.get_current_allocated_memory_size())
 
-    dataloader_instance = dataset_instance.get_dataloader(kwargs["batch_size"], kwargs["device"], kwargs["dataset_workers"])
+    if group_balanced_sampler:
+        sampler = dataset.GroupBalancedSampler(dataset_instance, kwargs["batch_size"], kwargs["temperature_sampling"], normalize_p=True, shuffle=kwargs["shuffle"],
+                                               desc=set_desc, logger=logger)
+
+    dataloader_instance = dataset_instance.get_dataloader(kwargs["batch_size"], kwargs["device"], kwargs["dataset_workers"], sampler=sampler)
 
     file_dataset.close()
 
@@ -267,6 +275,7 @@ def main(args):
     classifier_dropout = args.classifier_dropout
     gradient_accumulation_steps = args.gradient_accumulation
     dev_patience_metric = args.dev_patience_metric
+    multiplicative_inverse_temperature_sampling = args.multiplicative_inverse_temperature_sampling
 
     if gradient_accumulation_steps > 1:
         assert (batch_size % gradient_accumulation_steps) == 0, f"batch_size % gradient_accumulation_steps != 0 -> {batch_size % gradient_accumulation_steps} != 0"
@@ -357,8 +366,9 @@ def main(args):
         "tokenizer": tokenizer,
         "max_length_tokens": max_length_tokens,
         "monolingual": monolingual,
+        "temperature_sampling": 1 / multiplicative_inverse_temperature_sampling,
     }
-    dataset_train, dataloader_train = load_dataset(filename_dataset_train, "train", **dataset_static_args)
+    dataset_train, dataloader_train = load_dataset(filename_dataset_train, "train", **dataset_static_args, group_balanced_sampler=True, shuffle=True)
     dataset_dev, _ = load_dataset(filename_dataset_dev, "dev", **dataset_static_args)
 
     #training_steps_per_epoch = len(dataloader_train) // num_processes
@@ -712,6 +722,7 @@ def initialization():
     parser.add_argument('--classifier-dropout', type=float, default=0.1, help="Dropout applied to the classifier layer")
     parser.add_argument('--gradient-accumulation', type=int, default=1, help="Gradient accumulation steps")
     parser.add_argument('--dev-patience-metric', type=str, choices=["acc", "macro_f1"], default="acc", help="Metric to calculate patience using the dev set")
+    parser.add_argument('--multiplicative-inverse-temperature-sampling', type=float, default=0.3, help="See https://arxiv.org/pdf/1907.05019 (section 4.2). Default value has been set the one used in the NLLB paper")
 
     parser.add_argument('--seed', type=int, default=71213,
                         help="Seed in order to have deterministic results (not fully guaranteed). "

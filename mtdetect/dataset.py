@@ -1,7 +1,6 @@
 
 import os
 import logging
-import multiprocessing
 
 import mtdetect.utils.utils as utils
 
@@ -58,7 +57,7 @@ def pad_sequence(sequence_batch, pad_token_id, max_length=0):
 class SmartBatchingURLsDataset(Dataset):
     # Code based on https://www.kaggle.com/code/rhtsingh/speeding-up-transformer-w-optimization-strategies?scriptVersionId=67176227&cellId=2
 
-    def __init__(self, input_data, output_data, tokenizer, max_length, sampler_better_randomness=True, set_desc='', groups=None):
+    def __init__(self, input_data, output_data, tokenizer, max_length, sampler_better_randomness=True, set_desc='', groups=None, groups_balanced=None):
         super().__init__()
 
         if groups is None:
@@ -66,8 +65,14 @@ class SmartBatchingURLsDataset(Dataset):
         else:
             self.groups = groups
 
+        if groups_balanced is None:
+            self.groups_balanced = ["none" for _ in range(len(input_data))]
+        else:
+            self.groups_balanced = groups_balanced
+
         assert len(input_data) == len(output_data)
         assert len(input_data) == len(self.groups)
+        assert len(input_data) == len(self.groups_balanced)
 
         self.max_length = max_length
         self.pad_token_id = tokenizer.pad_token_id
@@ -77,6 +82,7 @@ class SmartBatchingURLsDataset(Dataset):
         self.labels = {
             "urls_classification": np.array(output_data)
         }
+        self.groups2group_balanced = {}
 
         # Tokenize data (we need to tokenize one by one because the length of all the provided URLs will not be the same)
         # We let the tokenizer do the truncation because manual truncation may remove special tokens...
@@ -95,27 +101,43 @@ class SmartBatchingURLsDataset(Dataset):
         assert self.labels["urls_classification"].shape == (len(output_data),), self.labels["urls_classification"].shape
 
         self.uniq_groups = []
+        self.groups_balanced_aligned_with_uniq_groups = []
         self.data = {}
         self.max_tokens_per_group = {}
 
         for idx in range(len(self.groups)):
             group = self.groups[idx]
+            group_balanced = self.groups_balanced[idx]
 
             assert ':' not in group
+            assert '#' not in group_balanced
+
+            if group_balanced not in self.groups_balanced_aligned_with_uniq_groups:
+                assert group not in self.data, f"This error might be caused by using the same group in different balanced groups, which is not supported: {group} | {group_balanced}"
 
             if group not in self.data:
                 self.uniq_groups.append(group)
+                self.groups_balanced_aligned_with_uniq_groups.append(group_balanced)
+
                 self.data[group] = {
                     "tokens": [],
                     "labels": [],
                 }
                 self.max_tokens_per_group[group] = -np.inf
+                self.groups2group_balanced[group] = group_balanced
+
+            assert self.groups2group_balanced[group] == group_balanced # this should be also true when group in self.data (i.e., did not enter the previous if statement)
+            assert len(self.groups_balanced_aligned_with_uniq_groups) == len(self.uniq_groups) # these two should be aligned in terms of nubmer of elements
 
             self.data[group]["tokens"].append(self.tokens[idx])
             self.data[group]["labels"].append(self.labels["urls_classification"][idx])
             self.max_tokens_per_group[group] = max(self.max_tokens_per_group[group], len(self.tokens[idx]))
 
             assert self.max_tokens_per_group[group] >= 0, self.max_tokens_per_group[group]
+
+        assert len(self.data) == len(self.uniq_groups)
+        assert len(self.groups2group_balanced) == len(self.uniq_groups)
+        assert len(set(self.groups2group_balanced.values())) == len(set(self.groups_balanced_aligned_with_uniq_groups))
 
     def __len__(self):
         return len(self.data)
@@ -142,6 +164,8 @@ class SmartBatchingURLsDataset(Dataset):
 
         if sampler:
             self.sampler = sampler
+
+            assert max_tokens is None
         elif self.sampler_better_randomness:
             # LengthGroupedSampler handles worse the padding problem (suboptimal) but better the randomness than SmartBatchingSampler
             self.sampler = transformers.trainer_pt_utils.LengthGroupedSampler(batch_size, lengths=lengths)
@@ -249,6 +273,125 @@ class SmartBatchingSampler(Sampler):
             self._backsort_inds = np.argsort(self._inds)
 
         return self._backsort_inds
+
+class GroupBalancedSampler(Sampler):
+    # https://arxiv.org/abs/1907.05019 section 4.2
+
+    def __init__(self, dataset, batch_size, temperature_sampling=1, normalize_p=True, shuffle=False, force_last_batch_to_be_complete=False,
+                 desc='-', logger=None):
+        self.total_elements = len(dataset.data.keys())
+        self.desc = desc
+        self.logger_debug_func = logger.debug if logger else lambda s: print(f"DEBUG: {s}")
+
+        if force_last_batch_to_be_complete:
+            self.total_elements += max(self.total_elements, self.batch_size) % self.batch_size
+
+        self.batch_size = batch_size
+        self.temperature_sampling = temperature_sampling
+        self.normalize_p = normalize_p
+        self.shuffle = shuffle
+
+        assert normalize_p, "np.random.choice needs that p adds up to 1.0"
+
+        # Obtain relevant elements from dataset
+        self.groups = dataset.groups
+        self.uniq_groups = dataset.uniq_groups
+        self.groups_balanced = dataset.groups_balanced
+        self.groups_balanced_aligned_with_uniq_groups = dataset.groups_balanced_aligned_with_uniq_groups
+        self.uniq_groups_balanced = set(self.groups_balanced_aligned_with_uniq_groups)
+
+        assert len(set(self.uniq_groups)) == len(self.uniq_groups)
+        assert len(self.uniq_groups) == self.total_elements
+        assert len(self.uniq_groups) == len(self.groups_balanced_aligned_with_uniq_groups) # aligned in terms of number of elements
+        assert len(set(self.groups_balanced)) == len(self.uniq_groups_balanced)
+        assert len(self.groups) == len(self.groups_balanced)
+
+        # Obtain p
+        # NOTICE that p is calculated using self.uniq_groups and not self.groups, meaning that the considered size of the dataset is the number of unique groups
+        #self.pre = {uniq_group_balanced: sum([1 if group_balanced == uniq_group_balanced else 0 for group_balanced in self.groups_balanced]) for uniq_group_balanced in self.uniq_groups_balanced}
+        self.pre = {uniq_group_balanced: len(set([group for group, group_balanced in zip(self.groups, self.groups_balanced) if group_balanced == uniq_group_balanced])) for uniq_group_balanced in self.uniq_groups_balanced}
+        self.p = {k: (p / self.total_elements) ** (1 / self.temperature_sampling) for k, p in self.pre.items()}
+        self.normalization_ratio = sum(self.p.values())
+
+        #assert sum(self.pre.values()) == len(self.groups) # This is True if p is calculated using self.groups instead of self.uniq_groups
+        assert sum(self.pre.values()) == self.total_elements, f"{self.pre} (sum. of values: {sum(self.pre.values())}) vs {self.total_elements}"
+
+        if self.normalize_p:
+            self.p = {k: p / self.normalization_ratio for k, p in self.p.items()}
+
+            assert np.isclose(sum([p for p in self.p.values()]), 1.0)
+
+        # Necessary elements to sample
+        #self.group_balanced2groups = {uniq_group_balanced: [group for group, group_balanced in zip(self.groups, self.groups_balanced) if group_balanced == uniq_group_balanced] for uniq_group_balanced in self.uniq_groups_balanced}
+        self.group_balanced2groups = {uniq_group_balanced: [uniq_group for uniq_group, inner_uniq_group_balanced in zip(self.uniq_groups, self.groups_balanced_aligned_with_uniq_groups) if inner_uniq_group_balanced == uniq_group_balanced] for uniq_group_balanced in self.uniq_groups_balanced}
+        self.group_balanced_n_elements = {k: len(v) for k, v in self.group_balanced2groups.items()}
+
+        for uniq_group_balanced in self.uniq_groups_balanced:
+            initial_n = self.group_balanced_n_elements[uniq_group_balanced]
+            initial_values = list(self.group_balanced2groups[uniq_group_balanced])
+
+            assert initial_n == len(initial_values)
+
+            while self.group_balanced_n_elements[uniq_group_balanced] < self.total_elements:
+                if self.shuffle:
+                    np.random.shuffle(initial_values) # necessary for the last iteration, so we do not obtain just the first elements
+
+                self.group_balanced2groups[uniq_group_balanced] += initial_values # replicate the list as many times as needed
+                self.group_balanced_n_elements[uniq_group_balanced] += initial_n
+
+            assert self.group_balanced_n_elements[uniq_group_balanced] >= self.total_elements
+            assert self.group_balanced_n_elements[uniq_group_balanced] - initial_n < self.total_elements
+
+            self.group_balanced2groups[uniq_group_balanced] = self.group_balanced2groups[uniq_group_balanced][:self.total_elements] # remove extra (unnecessary) elements
+            self.group_balanced_n_elements[uniq_group_balanced] = len(self.group_balanced2groups[uniq_group_balanced]) # adjust count
+
+        assert len(set(self.group_balanced_n_elements.values())) == 1
+        assert list(self.group_balanced_n_elements.values())[0] == self.total_elements
+
+        set_data = {k: set(v) for k, v in self.group_balanced2groups.items()}
+        list_uniq_groups_balanced = list(self.uniq_groups_balanced)
+
+        for idx1 in range(len(set_data)):
+            for idx2 in range(idx1 + 1, len(set_data)):
+                bgroup1 = list_uniq_groups_balanced[idx1]
+                bgroup2 = list_uniq_groups_balanced[idx2]
+
+                assert len(set.intersection(set_data[bgroup1], set_data[bgroup2])) == 0, "Intersection between different balanced groups is not supported"
+
+        self.logger_debug_func(f"{self.desc}: indices are ready to be created. Value of p: {self.p} (number of unique groups: {self.pre})")
+
+    def __iter__(self):
+        # Create indices
+
+        if self.shuffle:
+            # shuffling each new epoch is necessary, if self.shuffle is set
+
+            for uniq_group_balanced in self.uniq_groups_balanced:
+                np.random.shuffle(self.group_balanced2groups[uniq_group_balanced])
+
+        indices = []
+        sampled_elements = {k: 0 for k in self.uniq_groups_balanced}
+        uniq_groups_balanced, p = zip(*[(k, p) for k, p in self.p.items()])
+        uniq_groups_balanced, p = list(uniq_groups_balanced), list(p)
+
+        for _ in range(self.total_elements):
+            group_balanced = np.random.choice(uniq_groups_balanced, size=None, replace=False, p=p)
+            idx = sampled_elements[group_balanced]
+            group = self.group_balanced2groups[group_balanced][idx]
+            sampled_elements[group_balanced] += 1
+            group_idx = self.uniq_groups.index(group)
+
+            indices.append(group_idx)
+
+        sampled_elements_total = sum(sampled_elements.values())
+        sampled_elements_p = {k: v / sampled_elements_total * 100 for k, v in sampled_elements.items()}
+
+        self.logger_debug_func(f"{self.desc}: new indices have been created. Sampled elements: {sampled_elements} (total: {sampled_elements_total}; perc: {sampled_elements_p})")
+
+        yield from indices
+
+    def __len__(self):
+        return self.total_elements
 
 class SmartBatchingCollate:
     def __init__(self, pad_token_id):
@@ -378,6 +521,7 @@ def tokenize_batch_from_iterator(iterator, tokenizer, batch_size, f=None, ignore
             "urls": [],
             "labels": [],
             "groups": [],
+            "groups_balanced": [],
         }
         initial_urls = []
 
@@ -393,7 +537,15 @@ def tokenize_batch_from_iterator(iterator, tokenizer, batch_size, f=None, ignore
 
         src_url, trg_url, label = f(url[0]), f(url[1]), int(url[2])
         group = url[3] if len(url) > 3 else str(idx)
-        group = group.split(':')[0] # remove "optional" part of the group
+        group_data = group.split(':')
+        group = group_data[0] # remove "optional" part of the group
+        group_balanced = "none"
+
+        if len(group_data) > 1:
+            group_data_balanced = ':'.join(group_data[1:]) # get the "other" group to balance different datasets from the "optional" part of the group
+
+            if '#' in group_data_balanced:
+                group_balanced = group_data_balanced.split('#')[-1]
 
         if isinstance(src_url, list):
             assert len(src_url) == 1, src_url
@@ -420,6 +572,7 @@ def tokenize_batch_from_iterator(iterator, tokenizer, batch_size, f=None, ignore
 
         urls["labels"].append(label)
         urls["groups"].append(group)
+        urls["groups_balanced"].append(group_balanced)
         initial_urls.append((url[0], url[1]))
 
         if len(urls["urls"]) >= batch_size:
