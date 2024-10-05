@@ -187,12 +187,14 @@ data_pickle_update_merge = [{k: [] for k in pickle_mat_keys} for _ in range(len(
 
 for lang, results in data_results.items():
     for idx, (src, trg, label, group) in enumerate(results):
+        assert group == groups[lang][idx]
+
         desc = descs[lang][idx]
 
         if desc != '':
             group += f":{desc}"
 
-        assert group == groups[lang][idx]
+        group = f"{lang}_{group}" # to avoid future problems with local group collisions
 
         d = f"{src}\t{trg}\t{label}\t{group}#{lang}"
 
