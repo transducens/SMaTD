@@ -13,14 +13,9 @@ import mtdetect.dataset as dataset
 import mtdetect.inference as inference
 
 import torch
-from torch.optim.lr_scheduler import CyclicLR
 from torch.optim import Adam, AdamW, SGD
 import torch.nn as nn
 import transformers
-from transformers import (
-    get_linear_schedule_with_warmup,
-    get_inverse_sqrt_schedule,
-)
 import accelerate
 import numpy as np
 from torch.utils.tensorboard import SummaryWriter
@@ -28,89 +23,6 @@ from torch.utils.tensorboard import SummaryWriter
 logger = logging.getLogger("mtdetect")
 accelerator = None
 writer = None
-
-_lr_scheduler_args = {
-    "none": {},
-    "linear": {
-        "nargs": 1,
-        "metavar": ("warmup_steps",),
-        "default": ("10%",), # '%' is optional, and if not provided, absolute number of steps is taken
-        "type": utils.argparse_nargs_type(str),
-    },
-    "CLR": {
-        "nargs": 6,
-        "metavar": ("max_lr", "step_size", "mode", "gamma", "max_lr_factor", "step_size_factor"),
-        "default": (8e-5, 2000, "triangular2", 1.0, 4, 2),
-        "type": utils.argparse_nargs_type(float, int, str, float, {"type": int, "choices": (3, 4)},
-                                            {"type": int, "choices": tuple(range(2,8+1))}),
-    },
-    "inverse_sqrt": {
-        "nargs": 1,
-        "metavar": ("warmup_steps",),
-        "default": ("10%",), # '%' is optional, and if not provided, absolute number of steps is taken
-        "type": utils.argparse_nargs_type(str),
-    }
-}
-_optimizer_args = {
-    "none": {},
-    "adam": {
-        "nargs": 4,
-        "metavar": ("beta1", "beta2", "eps", "weight_decay"),
-        "default": (0.9, 0.999, 1e-08, 0.0),
-        "type": utils.argparse_nargs_type(float, float, float, float),
-    },
-    "adamw": {
-        "nargs": 4,
-        "metavar": ("beta1", "beta2", "eps", "weight_decay"),
-        "default": (0.9, 0.999, 1e-08, 0.01),
-        "type": utils.argparse_nargs_type(float, float, float, float),
-    },
-    "sgd": {
-        "nargs": 2,
-        "metavar": ("momentum", "weight_decay"),
-        "default": (0.0, 0.0),
-        "type": utils.argparse_nargs_type(float, float),
-    }
-}
-
-def get_lr_scheduler(scheduler, optimizer, *args, **kwargs):
-    scheduler_instance = None
-    mandatory_args = ""
-
-    def check_args(num_args, str_args):
-        if len(args) != num_args:
-            raise Exception(f"LR scheduler: '{scheduler}' mandatory args: {str_args}")
-
-    if scheduler == "none":
-        pass
-    elif scheduler == "linear":
-        mandatory_args = "num_warmup_steps, num_training_steps"
-
-        check_args(2, mandatory_args)
-
-        scheduler_instance = get_linear_schedule_with_warmup(optimizer, *args, **kwargs)
-    elif scheduler == "CLR": # CyclicLR
-        mandatory_args = "base_lr, max_lr"
-
-        check_args(2, mandatory_args)
-
-        scheduler_instance = CyclicLR(optimizer, *args, **kwargs)
-    elif scheduler == "inverse_sqrt":
-        mandatory_args = "num_warmup_steps"
-
-        check_args(1, mandatory_args)
-
-        if optimizer is None:
-            raise Exception(f"Optimizer not provided, so the selected LR scheduler can't be configured: {scheduler}")
-
-        scheduler_instance = get_inverse_sqrt_schedule(optimizer, *args, **kwargs)
-    else:
-        raise Exception(f"Unknown LR scheduler: {scheduler}")
-
-    logger.debug("LR scheduler: '%s' mandatory args: %s: %s", scheduler, mandatory_args, str(args))
-    logger.debug("LR scheduler: '%s' optional args: %s", scheduler, str(kwargs))
-
-    return scheduler_instance
 
 def save_model(model, model_output=None, name="mtd"):
     # Be aware that all threads need to reach this function
@@ -233,7 +145,7 @@ def apply_patience(model, tokenizer, dataset_dev, loss_function, device, thresho
             logger.info("Exhausting patience... %d/%d", current_patience, patience)
     else:
         if accelerator.is_local_main_process:
-            logger.info("Best dev patience metric update (metric: %s): %s -> %s", dev_best_metric, dev_best_metric_value, dev_patience_metric)
+            logger.info("Best dev patience metric update (metric: %s; epoch or step: %d): %s -> %s", dev_best_metric, epoch, dev_best_metric_value, dev_patience_metric)
 
         dev_best_metric_value = dev_patience_metric
         dev_best_epoch = epoch
@@ -304,6 +216,9 @@ def main(args):
 
     training_context_manager = accelerator.accumulate if gradient_accumulation_steps > 1 else contextlib.nullcontext
 
+    if train_until_patience:
+        assert patience > 0, "Infinite training loop"
+
     if scheduler_str in ("linear",) and train_until_patience:
         # Depending on the LR scheduler, the training might even stop at some point (e.g. linear LR scheduler will set the LR=0 if the run epochs is greater than the provided epochs)
         logger.warning("You set a LR scheduler ('%s' scheduler) which conflicts with --train-until-patince: you might want to check this out and change the configuration", scheduler_str)
@@ -312,11 +227,13 @@ def main(args):
         logger.warning("Flag --model-input is recommended when --inference is provided")
 
     if seed >= 0:
-        utils.init_random_with_seed(seed)
-
         logger.debug("Deterministic values enabled (not fully-guaranteed): seed %d", seed)
     else:
-        logger.warning("Deterministic values disable (you set a negative seed)")
+        seed = np.random.randint(2 ** 32 - 1)
+
+        logger.warning("Deterministic values disable (you set a negative seed): random seed %d", seed)
+
+    utils.init_random_with_seed(seed)
 
     max_length_tokens = utils.get_encoder_max_length(model, tokenizer, max_length_tokens=max_length_tokens, pretrained_model=pretrained_model, logger=logger)
 
@@ -380,83 +297,8 @@ def main(args):
 
     model_parameters = filter(lambda p: p.requires_grad, model.parameters())
 
-    logger.debug("Optimizer args: %s", optimizer_args)
-
-    if optimizer_str == "none":
-        optimizer = None
-
-        logger.debug("Be aware that even with the optimizer disabled minor changes might be observed while training since the model is "
-                     "not in inference mode, so layers like Dropout have a random component which is enabled")
-    elif optimizer_str == "adam":
-        optimizer_kwargs = {
-            "betas": tuple(optimizer_args[0:2]),
-            "eps": optimizer_args[2],
-            "weight_decay": optimizer_args[3],
-        }
-        optimizer = Adam(model_parameters, lr=learning_rate, **optimizer_kwargs)
-    elif optimizer_str == "adamw":
-        optimizer_kwargs = {
-            "betas": tuple(optimizer_args[0:2]),
-            "eps": optimizer_args[2],
-            "weight_decay": optimizer_args[3],
-        }
-        optimizer = AdamW(model_parameters, lr=learning_rate, **optimizer_kwargs)
-    elif optimizer_str == "sgd":
-        optimizer_kwargs = {
-            "momentum": optimizer_args[0],
-            "weight_decay": optimizer_args[1],
-        }
-        optimizer = SGD(model_parameters, lr=learning_rate, **optimizer_kwargs)
-    else:
-        raise Exception(f"Unknown optimizer: {optimizer_str}")
-
-    # Get LR scheduler args
-    scheduler_args = []
-    scheduler_kwargs = {}
-
-    logger.debug("LR scheduler args: %s", lr_scheduler_args)
-
-    if scheduler_str == "none":
-        pass
-    elif scheduler_str == "linear":
-        if lr_scheduler_args[0][-1] == '%':
-            scheduler_args = [int((float(lr_scheduler_args[0][:-1]) / 100.0) * training_steps), training_steps]
-        else:
-            scheduler_args = [int(lr_scheduler_args[0]), training_steps]
-    elif scheduler_str == "CLR":
-        scheduler_max_lr, scheduler_step_size, scheduler_mode, scheduler_gamma, scheduler_max_lr_factor, scheduler_step_size_factor \
-            = lr_scheduler_args
-
-        if learning_rate > scheduler_max_lr:
-            new_scheduler_max_lr = learning_rate * scheduler_max_lr_factor # Based on the CLR paper (possible values are [3.0, 4.0])
-
-            logger.warning("LR scheduler: '%s': provided LR (%f) is greater than provided max. LR (%f): setting max. LR to %f",
-                           scheduler_str, learning_rate, scheduler_max_lr, new_scheduler_max_lr)
-
-            scheduler_max_lr = new_scheduler_max_lr
-        if scheduler_step_size <= 0:
-            scheduler_step_size = scheduler_step_size_factor * training_steps_per_epoch # Based on the CLR paper (possible values are [2, ..., 8])
-
-            logger.warning("LR scheduler: '%s': provided step size is 0 or negative: setting value to %d", scheduler_str, scheduler_step_size)
-
-        scheduler_args = [learning_rate, scheduler_max_lr]
-        scheduler_kwargs = {
-            "step_size_up": scheduler_step_size,
-            "step_size_down": scheduler_step_size,
-            "mode": scheduler_mode,
-            "gamma": scheduler_gamma,
-            "cycle_momentum": False, # https://github.com/pytorch/pytorch/issues/73910
-        }
-    elif scheduler_str == "inverse_sqrt":
-        if lr_scheduler_args[0][-1] == '%':
-            scheduler_args = [int((float(lr_scheduler_args[0][:-1]) / 100.0) * training_steps)]
-        else:
-            scheduler_args = [int(lr_scheduler_args[0])]
-    else:
-        raise Exception(f"Unknown LR scheduler: {scheduler}")
-
-    scheduler = get_lr_scheduler(scheduler_str, optimizer, *scheduler_args, **scheduler_kwargs)
-
+    optimizer, scheduler = \
+        utils.get_lr_scheduler_and_optimizer_using_argparse_values(optimizer_str, scheduler_str, optimizer_args, lr_scheduler_args, model_parameters, learning_rate, training_steps, training_steps_per_epoch, logger)
     model, optimizer, dataloader_train, scheduler = accelerator.prepare(model, optimizer, dataloader_train, scheduler)
 
     stop_training = False
@@ -562,7 +404,7 @@ def main(args):
             for i, v in duplicated_data.items():
                 total_duplicated += v - 1
 
-            #assert total_duplicated < batch_size, f"{total_duplicated} >= {batch_size}" # True when there are no duplicates in the data...
+            #assert total_duplicated < batch_size, f"{total_duplicated} >= {batch_size}" # Always True only when there are no duplicates in the data...
             #assert abs(len(duplicated_data) - batch_size * training_steps_per_epoch // num_processes) < batch_size, f"abs({len(duplicated_data)} - {batch_size} * {training_steps_per_epoch} // {num_processes}) >= {batch_size}" # True when there are no duplicates in the data...
 
         epoch += 1
@@ -621,7 +463,7 @@ def main(args):
         if not models_not_available:
             # Eval model trained on epoch {epoch_or_step}
             model_name = f"{save_model_prefix}_{epoch_or_step}"
-            desc = f" (best dev model)" if epoch_or_step == dev_best_epoch else ''
+            desc = f" (best dev model; epoch or step: {dev_best_epoch})" if epoch_or_step == dev_best_epoch else ''
             model = load_model(model_output, pretrained_model, device, name=model_name, classifier_dropout=classifier_dropout)
         # else: eval last model
 
@@ -653,42 +495,21 @@ def main(args):
 
     logger.info("Done!")
 
-def get_options_from_argv(argv_flag, default_value, dict_with_options):
-    choices = list(dict_with_options.keys())
-    args_options = dict_with_options[default_value]
-
-    if argv_flag in sys.argv:
-        idx = sys.argv.index(argv_flag)
-
-        if len(sys.argv) > idx + 1:
-            value = sys.argv[idx + 1]
-
-            if value in choices:
-                args_options = dict_with_options[value]
-
-    result = {
-        "default": default_value,
-        "choices": choices,
-        "options": args_options,
-    }
-
-    return result
-
 def initialization():
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter,
                                      description="MTDetect")
     inference = "--inference" in sys.argv
-    lr_scheduler_conf = get_options_from_argv("--lr-scheduler", "inverse_sqrt", _lr_scheduler_args)
-    optimizer_conf = get_options_from_argv("--optimizer", "adamw", _optimizer_args)
+    lr_scheduler_conf = utils.get_options_from_argv("--lr-scheduler", "inverse_sqrt_chichirau_et_al", utils.argparse_pytorch_conf.lr_scheduler_args)
+    optimizer_conf = utils.get_options_from_argv("--optimizer", "adamw_no_wd", utils.argparse_pytorch_conf.optimizer_args)
 
     if not inference:
         parser.add_argument('dataset_train_filename', type=str, help="Filename with train data (TSV format). Format: original text (OT), machine (MT) or human (HT) translation, 0 if MT or 1 if HT")
         parser.add_argument('dataset_dev_filename', type=str, help="Filename with dev data (TSV format)")
         parser.add_argument('dataset_test_filename', type=str, help="Filename with test data (TSV format)")
 
-    parser.add_argument('--batch-size', type=int, default=16,
+    parser.add_argument('--batch-size', type=int, default=32,
                         help="Batch size. Elements which will be processed before proceed to train")
-    parser.add_argument('--epochs', type=int, default=3, help="Epochs")
+    parser.add_argument('--epochs', type=int, default=10, help="Epochs")
     parser.add_argument('--dataset-workers', type=int, default=-1,
                         help="No. workers when loading the data in the dataset. When negative, all available CPUs will be used")
     parser.add_argument('--pretrained-model', default="xlm-roberta-base", help="Pretrained model")
@@ -700,7 +521,7 @@ def initialization():
                              "If this option is set, it will be necessary to do not provide the input dataset.")
     parser.add_argument('--inference-print-results', action="store_true",
                         help="Print results per line")
-    parser.add_argument('--patience', type=int, default=0,
+    parser.add_argument('--patience', type=int, default=6,
                         help="Patience to stop training. If the specified value is greater than 0, epochs and patience will be taken into account")
     parser.add_argument('--train-until-patience', action="store_true",
                         help="Train until patience value is reached (--epochs will be ignored in order to stop, but will still be "
@@ -756,7 +577,7 @@ def cli():
     logger = utils.set_up_logging_logger(logger, level=logging.DEBUG if args.verbose else logging.INFO, accelerator=accelerator)
 
     if accelerator.is_local_main_process:
-        logger.debug("Arguments processed: {}".format(str(args))) # First logging message should be the processed arguments
+        logger.debug("Arguments processed: %s", str(args)) # First logging message should be the processed arguments
 
         if not args.inference:
             # Let's avoid creating directories to do not log anything
