@@ -2,6 +2,8 @@
 import re
 import sys
 
+# execution example: python3 xml2tsv_v2.py en:ru ../wmt_translation_task_data/news_domain/xml/newstest2021.en-ru.xml | wc -l # header + 1002
+
 p_setid = re.compile(r'^<dataset id="([^"]*)">$')
 p_collection = re.compile(r'^<collection id="([^"]*)">$')
 p_trglang = re.compile(r'^.* trglang="([^"]*)".*>$')

@@ -2,6 +2,8 @@
 import re
 import sys
 
+# execution example: python3 sgm2tsv_v2.py de:en ../wmt_translation_task_data/news_domain/sgm/news-test2008-src.de.sgm:../wmt_translation_task_data/news_domain/sgm/news-test2008-ref.en.sgm | wc -l # header + 361
+
 p_setid = re.compile(r'^.* setid="([^"]*)".*>$')
 p_trglang = re.compile(r'^.* trglang="([^"]*)".*>$')
 p_docid = re.compile(r'^.* docid="([^"]*)".*>$')
