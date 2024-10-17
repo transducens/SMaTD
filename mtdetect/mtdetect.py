@@ -463,7 +463,6 @@ def main(args):
         if not models_not_available:
             # Eval model trained on epoch {epoch_or_step}
             model_name = f"{save_model_prefix}_{epoch_or_step}"
-            desc = f" (best dev model; epoch or step: {dev_best_epoch})" if epoch_or_step == dev_best_epoch else ''
             model = load_model(model_output, pretrained_model, device, name=model_name, classifier_dropout=classifier_dropout)
         # else: eval last model
 
@@ -489,7 +488,7 @@ def main(args):
                 logger.info("Test metrics: %s", test_eval)
             else:
                 model_name = f"{save_model_prefix}_{epoch_or_step}"
-                desc = f" (best dev model)" if epoch_or_step == dev_best_epoch else ''
+                desc = f" (best dev model; epoch or step: {epoch_or_step})" if epoch_or_step == dev_best_epoch else ''
 
                 logger.info("Test metrics for model %s%s: %s", model_name, desc, test_eval)
 

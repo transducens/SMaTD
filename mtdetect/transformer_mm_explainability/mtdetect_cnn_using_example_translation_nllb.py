@@ -72,6 +72,9 @@ def main(args):
     assert isinstance(direction[0], str)
     assert gradient_accumulation > 0, gradient_accumulation
 
+    teacher_forcing = [True if teacher_forcing else False] * len(direction)
+    ignore_attention = [True if ignore_attention else False] * len(direction)
+
     if train_until_patience:
         assert patience > 0, "Infinite training loop"
 
@@ -113,7 +116,7 @@ def main(args):
         logger.warning("LM provided but it is not a fine-tuned model and its parameters are frozen: the format is src<sep>trg, and the output is the first output token, which might not be the expected behaviour for the model")
 
     def load_model(model_input, pretrained_model, device, classifier_dropout=0.0):
-        local_model = model_input is not None
+        local_model = bool(model_input)
         config = transformers.AutoConfig.from_pretrained(pretrained_model, num_labels=1, classifier_dropout=classifier_dropout)
         model = transformers.AutoModelForSequenceClassification.from_pretrained(pretrained_model, config=config)
         tokenizer = utils.get_tokenizer(pretrained_model)
@@ -357,7 +360,7 @@ def main(args):
 
                 pickle.dump(pickle_data, pickle_fd)
 
-        logger.info("Samples: %d (limit: %d); Groups: {len(uniq_groups)}; Balanced groups: {len(uniq_groups_balanced)}", len(groups), limit_data)
+        logger.info("Samples: %d (limit: %s); Groups: %d; Balanced groups: %d", len(groups), limit_data, len(uniq_groups), len(uniq_groups_balanced))
 
         # groups
         # groups_balanced
@@ -451,7 +454,7 @@ def main(args):
     ignore_attention *= 1 if len(ignore_attention) > 1 else max(channels_factor_len_set)
     channels *= channels_factor
 
-    logger.debug("Total channels: %d (factor: %d)", channels, channels_factor, channels_factor)
+    logger.debug("Total channels: %d (factor: %d)", channels, channels_factor)
 
     if channels_factor > 1 and not force_pickle_file:
         logger.warning("channels_factor=%d > 1, and force_pickle_file=False: it may be very slow to create all the pickle files if they do not exist (they may exist)", channels_factor)
@@ -1399,9 +1402,9 @@ def main(args):
 
         test_dataset = MyDataset(test_data, data_input_all_keys, add_text=model_inference)
         test_sampler = dataset.GroupBalancedSampler(test_dataset, batch_size, temperature_sampling=1, shuffle=False, desc="test")
-        test_dataloader = DataLoader(test_dataset, batch_size=batch_size, num_workers=num_workers, sampler=test_sampler, collate_fn=collate_fn, threshold=threshold)
+        test_dataloader = DataLoader(test_dataset, batch_size=batch_size, num_workers=num_workers, sampler=test_sampler, collate_fn=collate_fn)
 
-        test_results = eval(model, test_dataloader, data_input_all_keys, device, print_result=model_inference, print_desc="test")
+        test_results = eval(model, test_dataloader, data_input_all_keys, device, print_result=model_inference, print_desc="test", threshold=threshold)
 
         logger.info("Final test eval: %s", test_results)
 
@@ -1443,7 +1446,7 @@ def initialization():
     parser.add_argument('--attention-matrix', type=str, nargs='+', choices=["encoder", "decoder", "cross"], default=["encoder", "decoder", "cross"], help="Explainability matrixes provided to the CNN classifier. Providing several values is supported")
     parser.add_argument('--explainability-normalization', type=str, choices=["none", "absolute", "relative"], default="none", help="Normalization applied to --attention-matrix")
     parser.add_argument('--self-attention-do-not-remove-diagonal', action="store_true", help="Do not set 0s to the explainability self-attention matrices")
-    parser.add_argument('--cnn-pooling', type=str, nargs='+', choices=["avg", "max"], default=["avg"], help="CNN pooling. Providing several values is supported")
+    parser.add_argument('--cnn-pooling', type=str, nargs='+', choices=["avg", "max"], default=["max"], help="CNN pooling. Providing several values is supported")
     parser.add_argument('--not-multichannel', action="store_true", help="Do not train CNN in a multichannel setting (i.e., process --attention-matrix together instead of independently)")
     parser.add_argument('--not-teacher-forcing', action="store_true", help="Do not apply teacher forcing when calculating --attention-matrix (i.e., 'free' translation)")
     parser.add_argument('--ignore-attention', action="store_true", help="Ignore attention matrices when calculating --attention-matrix")
@@ -1456,7 +1459,7 @@ def initialization():
                              "use -h and set --lr-scheduler)")
     parser.add_argument('--gradient-accumulation', type=int, default=1, help="Gradient accumulation steps")
     parser.add_argument('--multiplicative-inverse-temperature-sampling', type=float, default=0.3, help="See https://arxiv.org/pdf/1907.05019 (section 4.2). Default value has been set the one used in the NLLB paper")
-    parser.add_argument('--cnn-dropout', type=float, default=0.5, help="Dropout applied to the CNN model")
+    parser.add_argument('--cnn-dropout', type=float, default=0.3, help="Dropout applied to the CNN model")
     parser.add_argument('--lm-classifier-dropout', type=float, default=0.1, help="Dropout applied to the classifier layer of the encoder-like model")
     parser.add_argument('--threshold', type=float, default=0.5, help="Threshold to consider a given text to be HT")
     parser.add_argument('--not-force-pickle-file', action="store_true", help="Create --attention-matrix if pickle files are not found")
