@@ -20,7 +20,7 @@ forced_bos_token_id = model.generation_config.decoder_start_token_id
 beam_size = model.generation_config.num_beams
 max_new_tokens = model.generation_config.max_length
 
-sys.stderr.write(f"Translating from {source_lang} to {target_lang} (pretrained_model={pretrained_model})\n")
+sys.stderr.write(f"Translating from {source_lang} to {target_lang} (pretrained_model={pretrained_model}; beam_size={beam_size}; max_new_tokens={max_new_tokens})\n")
 
 def translate(batch, device):
     _model = model
