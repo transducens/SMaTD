@@ -14,7 +14,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 # Functions
 
-def visualize_heatmap_with_labels_and_values(rows, cols, intensity_matrix, text_color="black", font_size=40, output_image="heatmap_with_values.png", desc=None):
+def visualize_heatmap_with_labels_and_values(rows, cols, intensity_matrix, text_color="black", font_size=40, output_image="heatmap_with_values.png", desc=None, color_absolute_normalization=False):
     rows = [s.replace('▁', '_') for s in rows]
     cols = [s.replace('▁', '_') for s in cols]
 
@@ -64,16 +64,24 @@ def visualize_heatmap_with_labels_and_values(rows, cols, intensity_matrix, text_
         text_y = (cell_height - text_height) / 2
         draw.text((text_x, text_y), col, font=font, fill=text_color)
 
-    satured = (intensity_matrix < 0.0).any() or (intensity_matrix > 1.0).any()
+    intensity_color = np.copy(intensity_matrix)
+    satured = (intensity_color < 0.0).any() or (intensity_color > 1.0).any()
+
+    if color_absolute_normalization:
+        intensity_color = (intensity_color - intensity_color.min()) / (intensity_color.max() - intensity_color.min())
 
     if satured:
-        print(f"warning: intensity values are not in [0, 1] and color will be saturated: {output_image}")
+        if color_absolute_normalization:
+            print(f"warning: intensity values are not in [0, 1]: intensity color is going to be normalized (absolute): {output_image}")
+        else:
+            print(f"warning: intensity values are not in [0, 1] and color will be saturated: {output_image}")
 
     # Iterate over each cell in the matrix
     for i, row in enumerate(rows):
         for j, col in enumerate(cols):
             value = intensity_matrix[i][j]
-            intensity = min(max(value, 0.0), 1.0)
+            value_color = intensity_color[i][j]
+            intensity = min(max(value_color, 0.0), 1.0)
 
             # Calculate background color
             red_value = 255
@@ -706,7 +714,7 @@ if __name__ == "__main__":
                                              (output_tokens, input_tokens, r_de, "cross")):
                 colorize_output_fn = f"{colorize_output_prefix}.{idx}.{desc}.png"
 
-                visualize_heatmap_with_labels_and_values(rows, cols, matrix, output_image=colorize_output_fn, desc=desc)
+                visualize_heatmap_with_labels_and_values(rows, cols, matrix, output_image=colorize_output_fn, desc=desc, color_absolute_normalization=True if explainability_normalization == "none" else False)
                 print(f"Image with tokens and intensities stored: {colorize_output_fn}")
 
     if pickle_prefix_filename:
