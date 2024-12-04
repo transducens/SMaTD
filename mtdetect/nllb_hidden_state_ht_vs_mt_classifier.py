@@ -522,7 +522,7 @@ def main(args):
 
             early_stopping_best_loss = sum_epoch_loss
 
-        logger.info("Dev eval: %s")
+        logger.info("Dev eval: %s", dev_results)
 
         early_stopping_metric_dev = dev_results[patience_metric]
 
