@@ -503,8 +503,10 @@ def main(args):
     current_patience = 0
     epoch = 0
     do_training = not do_inference and (epoch < epochs or train_until_patience)
-    loss_function = nn.BCEWithLogitsLoss(reduction="none")
-    loss_apply_sigmoid = False # Should be True if loss_function = nn.BCELoss()
+    #loss_function = nn.BCEWithLogitsLoss(reduction="none")
+    loss_function = nn.BCELoss(reduction="none")
+    #loss_apply_sigmoid = False # Should be True if loss_function = nn.BCELoss()
+    loss_apply_sigmoid = True
     log_steps = 100
     sum_epoch_loss = np.inf
     early_stopping_best_loss = np.inf
@@ -602,7 +604,7 @@ def main(args):
                 sum_partial_loss = sum(epoch_loss[-100:])
                 sum_loss = sum(epoch_loss)
 
-                logger.info("Batch #%d: %s (last %d steps: %s)", batch_idx, sum_loss, log_steps, sum_partial_loss)
+                logger.info("Batch #%d: %s (last %d steps: %s)", batch_idx, sum_loss, log_steps * gradient_accumulation, sum_partial_loss)
 
                 sys.stdout.flush()
 
