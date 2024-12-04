@@ -1374,7 +1374,7 @@ def main(args):
                 epoch_loss.append(loss.cpu().detach().item())
 
                 loss.backward()
-
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 scheduler.step()
 
@@ -1386,6 +1386,8 @@ def main(args):
                 logger.info(f"Epoch loss (sum last 100 steps): step %d: %s", batch_idx, sum_partial_loss)
 
                 sys.stdout.flush()
+
+        assert batch_idx == training_steps_per_epoch, f"{batch_idx} vs {training_steps_per_epoch}"
 
         sum_epoch_loss = sum(epoch_loss)
 

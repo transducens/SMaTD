@@ -160,7 +160,10 @@ def read(fn, limit=None):
 
     return data
 
-def read_pickle(fn, k=None, limit=None):
+def read_pickle(fn, k=None, limit=None, max_split_size=None):
+    if max_split_size is not None:
+        assert k is not None, "Easier implementation"
+
     data = None
     open_func = gzip.open if fn.endswith(".gz") else open
 
@@ -180,14 +183,41 @@ def read_pickle(fn, k=None, limit=None):
 #            assert isinstance(data[_k1][_k2], list), type(data[_k1][_k2])
 #            assert isinstance(data[_k1][_k2][0], torch.Tensor), type(data[_k1][_k2][0])
 
-    if limit is not None:
-        for _k1 in data.keys():
-            data[_k1] = data[_k1][:limit]
-#            for _k2 in data[_k1].keys():
-#                data[_k1][_k2] = data[_k1][_k2][:limit]
-
     if k is not None:
         data = data[k]
+
+        if max_split_size:
+            _data = []
+
+            for data_idx, t in enumerate(data, 1):
+                if t.shape[0] <= max_split_size:
+                    _data.append(t)
+                else:
+                    n1 = max_split_size
+                    n2 = t.shape[0]
+                    idxs = [n1 * i for i in range(n2 // n1 + 1 + (0 if n2 % n1 == 0 else 1))]
+
+                    assert len(idxs) > 1, idxs
+                    n = 0
+
+                    for idx in range(len(idxs) - 1):
+                        _data.append(t[idxs[idx]:idxs[idx + 1]])
+
+                        n += idxs[idx + 1] - idxs[idx]
+
+                    if data_idx < len(data):
+                        assert n == t.shape[0], f"{n} vs {t.shape[0]}"
+                    else:
+                        assert n >= t.shape[0], f"{n} vs {t.shape[0]}"
+
+            data = _data
+
+    if limit is not None:
+        if k is not None:
+            data = data[:limit]
+        else:
+            for _k1 in data.keys():
+                data[_k1] = data[_k1][:limit]
 
     return data
 
@@ -204,7 +234,7 @@ def make_batches(data, bsz, pt_data=None):
             if pt_data is None:
                 yield (batch, None)
             else:
-                assert pt_data[idx].shape[0] == len(batch)
+                assert pt_data[idx].shape[0] == len(batch), f"{idx}: {pt_data[idx].shape[0]} vs {len(batch)}"
 
                 yield (batch, pt_data[idx])
 
@@ -215,7 +245,7 @@ def make_batches(data, bsz, pt_data=None):
         if pt_data is None:
             yield (batch, None)
         else:
-            assert pt_data[idx].shape[0] == len(batch)
+            assert pt_data[idx].shape[0] == len(batch), f"{idx}: {pt_data[idx].shape[0]} vs {len(batch)}"
 
             yield (batch, pt_data[idx])
 
@@ -363,26 +393,38 @@ def main(args):
     dropout_p = args.dropout
     ##lm_classifier_dropout = args.lm_classifier_dropout
     limit = args.data_limit
+    gradient_accumulation = args.gradient_accumulation
+    actual_batch_size = batch_size * gradient_accumulation
+
+    if gradient_accumulation > 1:
+        logger.info("Gradient accumulation enabled (i.e., >1): %d (note that if disabled, the same results would be obtained if dropout is disabled for both HT vs MT classifier and language model, train shuffle is disabled, and float precision errors are ignored)", gradient_accumulation)
+
+    logger.info("Batch size: %d (actual batch size: %d)", batch_size, actual_batch_size)
 
     # read data
-    train_data = read(train_fn, limit=None if limit is None else limit * batch_size)
-    dev_data = read(dev_fn, limit=None if limit is None else limit * batch_size)
-    test_data = read(test_fn, limit=None if limit is None else limit * batch_size)
-    train_pickle_data = read_pickle(train_pickle_fn, k="decoder_last_hidden_state", limit=limit) if train_pickle_fn is not None else None
-    dev_pickle_data = read_pickle(dev_pickle_fn, k="decoder_last_hidden_state", limit=limit) if dev_pickle_fn is not None else None
-    test_pickle_data = read_pickle(test_pickle_fn, k="decoder_last_hidden_state", limit=limit) if test_pickle_fn is not None else None
+    train_data = read(train_fn, limit=None if limit is None else (limit * batch_size))
+    dev_data = read(dev_fn, limit=None if limit is None else (limit * batch_size))
+    test_data = read(test_fn, limit=None if limit is None else (limit * batch_size))
+    train_pickle_data = read_pickle(train_pickle_fn, k="decoder_last_hidden_state", limit=limit, max_split_size=batch_size) if train_pickle_fn is not None else None
+    dev_pickle_data = read_pickle(dev_pickle_fn, k="decoder_last_hidden_state", limit=limit, max_split_size=batch_size) if dev_pickle_fn is not None else None
+    test_pickle_data = read_pickle(test_pickle_fn, k="decoder_last_hidden_state", limit=limit, max_split_size=batch_size) if test_pickle_fn is not None else None
     all_pickle_data_loaded = train_pickle_fn is not None and dev_pickle_fn is not None and test_pickle_fn is not None
 
-    for _p, _d in ((train_pickle_data, train_data), (dev_pickle_data, dev_data), (test_pickle_data, test_data)):
+    for idx, (_p, _d) in enumerate(((train_pickle_data, train_data), (dev_pickle_data, dev_data), (test_pickle_data, test_data))):
         if _p:
             s = 0
 
-            for d in _p:
+            for idx2, d in enumerate(_p, 1):
                 assert isinstance(d, torch.Tensor), type(d)
+
+                if idx2 == len(_p):
+                    assert d.shape[0] <= batch_size
+                else:
+                    assert d.shape[0] == batch_size
 
                 s += d.shape[0]
 
-            assert s == len(_d)
+            assert s == len(_d), f"{idx}: {s} vs {len(_d)}"
 
     for p in (train_pickle_data, dev_pickle_data, test_pickle_data):
         if p:
@@ -464,7 +506,7 @@ def main(args):
     current_patience = 0
     epoch = 0
     do_training = not do_inference and (epoch < epochs or train_until_patience)
-    loss_function = nn.BCEWithLogitsLoss()
+    loss_function = nn.BCEWithLogitsLoss(reduction="none")
     loss_apply_sigmoid = False # Should be True if loss_function = nn.BCELoss()
     log_steps = 100
     sum_epoch_loss = np.inf
@@ -510,8 +552,10 @@ def main(args):
             break # we need to force the break to avoid the training of the current epoch
 
         model.zero_grad()
+        final_loss = None
+        loss_elements = 0
 
-        for bsz_idx, (batch, batch_pt) in enumerate(make_batches(train_data, batch_size, pt_data=train_pickle_data), 1):
+        for batch_idx, (batch, batch_pt) in enumerate(make_batches(train_data, batch_size, pt_data=train_pickle_data), 1):
             src, trg, labels = zip(*batch)
 
             if direction == "trg2src":
@@ -528,27 +572,44 @@ def main(args):
                 data = batch_pt.to(device)
 
             target = torch.tensor(labels).to(device)
+            result = apply_inference(model, data, target=target, loss_function=loss_function, loss_apply_sigmoid=loss_apply_sigmoid, threshold=threshold)
+            _loss = result["loss"]
+
+            assert len(_loss.shape) == 1, _loss.shape
+
+            loss_elements += _loss.numel()
+
+            if final_loss is None:
+                final_loss = torch.sum(_loss)
+            else:
+                final_loss += torch.sum(_loss)
 
             # loss
-            model.zero_grad()
+            if batch_idx % gradient_accumulation == 0 or batch_idx == training_steps_per_epoch:
+                assert final_loss is not None
 
-            result = apply_inference(model, data, target=target, loss_function=loss_function, loss_apply_sigmoid=loss_apply_sigmoid, threshold=threshold)
-            loss = result["loss"]
+                loss = final_loss / loss_elements
+                final_loss = None
+                loss_elements = 0
 
-            epoch_loss.append(loss.cpu().detach().item())
+                epoch_loss.append(loss.cpu().detach().item())
 
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            scheduler.step()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                scheduler.step()
 
-            if (bsz_idx % log_steps) == 0:
+                model.zero_grad()
+
+            if (batch_idx % (log_steps * gradient_accumulation)) == 0:
                 sum_partial_loss = sum(epoch_loss[-100:])
                 sum_loss = sum(epoch_loss)
 
-                print(f"Batch #{bsz_idx}: {data.shape} -> {result['outputs'].shape}: {sum_loss} (last {log_steps} steps: {sum_partial_loss})")
+                print(f"Batch #{batch_idx}: {data.shape} -> {result['outputs'].shape}: {sum_loss} (last {log_steps} steps: {sum_partial_loss})")
 
                 sys.stdout.flush()
+
+        assert batch_idx == training_steps_per_epoch, f"{batch_idx} vs {training_steps_per_epoch}"
 
         sum_epoch_loss = sum(epoch_loss)
 
@@ -592,7 +653,7 @@ def main(args):
 
 def initialization():
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-                                     description="MTDetect using explainability matrices and vision classifier (+LM)")
+                                     description="MTDetect classifier using NLLB hidden states (+LM)")
 
     lr_scheduler_conf = utils.get_options_from_argv("--lr-scheduler", "inverse_sqrt_chichirau_et_al", utils.argparse_pytorch_conf.lr_scheduler_args)
     optimizer_conf = utils.get_options_from_argv("--optimizer", "adamw_no_wd", utils.argparse_pytorch_conf.optimizer_args)
@@ -637,7 +698,7 @@ def initialization():
     parser.add_argument('--lr-scheduler-args', **lr_scheduler_conf["options"],
                         help="Args. for LR scheduler (in order to see the specific configuration for a LR scheduler, "
                              "use -h and set --lr-scheduler)")
-#    parser.add_argument('--gradient-accumulation', type=int, default=1, help="Gradient accumulation steps")
+    parser.add_argument('--gradient-accumulation', type=int, default=1, help="Gradient accumulation steps")
 #    parser.add_argument('--multiplicative-inverse-temperature-sampling', type=float, default=0.3, help="See https://arxiv.org/pdf/1907.05019 (section 4.2). Default value has been set the one used in the NLLB paper")
     parser.add_argument('--dropout', type=float, default=0.1, help="Dropout applied to the classifier model (embedding, model, and head)")
 ##    parser.add_argument('--lm-classifier-dropout', type=float, default=0.1, help="Dropout applied to the classifier layer of the encoder-like model")
@@ -646,7 +707,7 @@ def initialization():
 #    parser.add_argument('--disable-vision-model', action="store_true", help="Do not train classifier. Debug purposes")
     parser.add_argument('--skip-training-set-during-inference', action="store_true", help="Skip training evaluation during inference to speed up result")
     parser.add_argument('--skip-test-set-eval', action="store_true", help="Skip test evaluation during training or inference")
-    parser.add_argument('--data-limit', type=int, default=None, help="Data limit reading (debug purposes)")
+    parser.add_argument('--data-limit', type=int, default=None, help="Data limit reading in batches (debug purposes)")
 
     parser.add_argument('--seed', type=int, default=71213,
                         help="Seed in order to have deterministic results (not fully guaranteed). "
