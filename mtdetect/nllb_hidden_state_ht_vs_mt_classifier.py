@@ -39,10 +39,11 @@ class PositionalEncoding(nn.Module):
 
 class TransformerModel(nn.Module):
 
-    def __init__(self, d_model, nhead, dim_feedforward, nlayers, projection_in=None, max_seq_len=512, embedding_dropout=0.5, dropout_p=0.5, classifier_dropout_p=0.5, num_labels=1):
+    def __init__(self, d_model, nhead, dim_feedforward, nlayers, projection_in=None, max_seq_len=512, embedding_dropout=0.5, dropout_p=0.5, classifier_dropout_p=0.5, num_labels=1, initial_layer_norm=False):
         super(TransformerModel, self).__init__()
 
         initial_dim = d_model if projection_in is None else projection_in
+        self.layer_norm = nn.LayerNorm(initial_dim) if initial_layer_norm else None
         self.pos_encoder = PositionalEncoding(initial_dim, embedding_dropout, max_seq_len=max_seq_len)
         encoder_layers = torch.nn.TransformerEncoderLayer(d_model, nhead, batch_first=True, dim_feedforward=dim_feedforward, dropout=dropout_p) #, activation="gelu", layer_norm_eps=1e-12)
         self.projection = None if projection_in is None else nn.Linear(projection_in, d_model)
@@ -81,6 +82,7 @@ class TransformerModel(nn.Module):
         src = src * math.sqrt(self.d_model)
         src = self.pos_encoder(src)
         proj = self.projection(src) if self.projection is not None else src
+        proj = self.layer_norm(proj) if self.layer_norm is not None else proj
         output = self.transformer_encoder(proj, mask=mask)
 
         # https://github.com/huggingface/transformers/blob/5523e38b553ff6c46b04d2376870fcd842feeecc/src/transformers/models/bert/modeling_bert.py#L1680
@@ -462,7 +464,8 @@ def main(args):
     d_model = translation_model.config.d_model
     model = TransformerModel(d_model, nhead, dim_feedforward, num_layers,
                             projection_in=projection_in, max_seq_len=max_seq_len,
-                            embedding_dropout=dropout_p, dropout_p=dropout_p, classifier_dropout_p=dropout_p)
+                            embedding_dropout=dropout_p, dropout_p=dropout_p, classifier_dropout_p=dropout_p,
+                            initial_layer_norm=True) # initial_layer_norm=True to avoid problem of layers != -1 because values are not normalized
 
     if load_model_path:
         logger.info("Loading init model: %s", load_model_path)
@@ -503,10 +506,10 @@ def main(args):
     current_patience = 0
     epoch = 0
     do_training = not do_inference and (epoch < epochs or train_until_patience)
-    #loss_function = nn.BCEWithLogitsLoss(reduction="none")
-    loss_function = nn.BCELoss(reduction="none")
-    #loss_apply_sigmoid = False # Should be True if loss_function = nn.BCELoss()
-    loss_apply_sigmoid = True
+    loss_function = nn.BCEWithLogitsLoss(reduction="none")
+    #loss_function = nn.BCELoss(reduction="none")
+    loss_apply_sigmoid = False # Should be True if loss_function = nn.BCELoss()
+    #loss_apply_sigmoid = True
     log_steps = 100
     sum_epoch_loss = np.inf
     early_stopping_best_loss = np.inf
