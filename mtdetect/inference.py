@@ -142,7 +142,8 @@ def inference_from_stdin(model, tokenizer, batch_size, loss_function=None, devic
     dataloader = _dataset.get_dataloader(batch_size, device, dataset_workers)
 
     for batch in dataloader:
-        total_tokens += sum([len(urls[urls != tokenizer.pad_token_id]) for urls in batch["url_tokens"]])
+        tokens = [len(urls[urls != tokenizer.pad_token_id]) for urls in batch["url_tokens"]]
+        total_tokens += sum(tokens)
         urls = [url[url != tokenizer.pad_token_id] for url in batch["url_tokens"]]
         urls = [tokenizer.decode(url, skip_special_tokens=False) for url in urls]
         urls = [url[len(tokenizer.bos_token):] for url in urls]
@@ -162,7 +163,9 @@ def inference_from_stdin(model, tokenizer, batch_size, loss_function=None, devic
         assert len(outputs_classification) == len(outputs) == len(labels) == len(urls), f"{len(outputs_classification)} vs {len(outputs)} vs {len(labels)} vs {len(urls)}"
 
         if print_results:
-            for url, output, output_classification, label in zip(urls, outputs, outputs_classification, labels):
+            assert len(tokens) == len(urls)
+
+            for url, output, output_classification, label, ntokens in zip(urls, outputs, outputs_classification, labels, tokens):
                 original_text = '\t'.join(url)
 
                 if not do_eval:
@@ -178,7 +181,7 @@ def inference_from_stdin(model, tokenizer, batch_size, loss_function=None, devic
                 else:
                     raise Exception(f"Unexpected values: {output_classification} vs {label}")
 
-                logger.info("inference: stdin (%s)\t%d\t%s\tlabel=%s\t%s\t%s", monolingual_str, print_idx, output, label if do_eval else 'fake', conf_mat_value, original_text)
+                logger.info("inference: stdin (%s)\t%d\t%s\tlabel=%s\t%s\t%s\t%d", monolingual_str, print_idx, output, label if do_eval else 'fake', conf_mat_value, original_text, ntokens)
 
                 print_idx += 1
 

@@ -150,7 +150,10 @@ def main(args):
         logger.warning("Test set evaluation is disabled")
 
     for _attention_matrix in attention_matrix:
-        assert _attention_matrix in ("encoder", "decoder", "cross"), attention_matrix
+        assert _attention_matrix in ("encoder", "decoder", "cross", "alti_plus_encoder", "alti_plus_decoder", "alti_plus_cross", "alti_plus_total"), attention_matrix
+
+    if "alti_plus" in attention_matrix:
+        assert explainability_normalization == "none", "Only option supported"
 
     for _cnn_pooling in cnn_pooling:
         assert _cnn_pooling in ("max", "avg"), cnn_pooling
@@ -203,9 +206,7 @@ def main(args):
         groups_balanced = [] # Data will be sampled according to NLLB and mBART papers temperature sampling
         uniq_groups = set()
         uniq_groups_balanced = set()
-        explainability_ee = []
-        explainability_dd = []
-        explainability_de = []
+        explainability_data = {}
         fd = open(filename)
         fn_pickle_array = None
         limit_data = np.inf if "MTDETECT_LIMIT_DATA" not in os.environ else int(os.environ["MTDETECT_LIMIT_DATA"])
@@ -248,9 +249,7 @@ def main(args):
 
         with open(fn_pickle_array, "rb") as pickle_fd:
             pickle_data = pickle.load(pickle_fd)
-            explainability_ee = pickle_data["explainability_encoder"][:None if limit_data == np.inf else limit_data]
-            explainability_dd = pickle_data["explainability_decoder"][:None if limit_data == np.inf else limit_data]
-            explainability_de = pickle_data["explainability_cross"][:None if limit_data == np.inf else limit_data]
+            explainability_data = {k: v[:None if limit_data == np.inf else limit_data] for k, v in pickle_data.items()}
 
         for idx, l in enumerate(fd):
             l = l.rstrip("\r\n").split('\t')
@@ -279,42 +278,32 @@ def main(args):
             groups_balanced.append(group_balanced)
             uniq_groups.add(group)
             uniq_groups_balanced.add(group_balanced)
-            r_ee = explainability_ee[idx]
-            r_dd = explainability_dd[idx]
-            r_de = explainability_de[idx]
+            r_data = {k: v[idx] for k, v in explainability_data.items()}
 
             ##### code from example_translation_nllb.py #####
             if self_attention_remove_diagonal:
-                np.fill_diagonal(r_ee, sys.float_info.epsilon)
-                np.fill_diagonal(r_dd, sys.float_info.epsilon)
+                np.fill_diagonal(r_data["explainability_encoder"], sys.float_info.epsilon)
+                np.fill_diagonal(r_data["explainability_decoder"], sys.float_info.epsilon)
 
             if explainability_normalization == "none":
                 pass
             elif explainability_normalization == "absolute":
-                r_ee = (r_ee - r_ee.min()) / (r_ee.max() - r_ee.min())
-                r_dd = (r_dd - r_dd.min()) / (r_dd.max() - r_dd.min())
-                r_de = (r_de - r_de.min()) / (r_de.max() - r_de.min()) # (target_text_seq_len, source_text_seq_len)
+                for k in r_data.keys():
+                    r_data[k] = (r_data[k] - r_data[k].min()) / (r_data[k].max() - r_data[k].min())
             elif explainability_normalization == "relative":
                 # "Relative" normalization (easier to analize per translated token)
-                r_ee = np.array([(r_ee[i] - r_ee[i].min()) / (r_ee[i].max() - r_ee[i].min()) for i in range(len(r_ee))])
-                r_dd = np.array([(r_dd[i] - r_dd[i].min()) / (r_dd[i].max() - r_dd[i].min()) for i in range(len(r_dd))])
-                r_de = np.array([(r_de[i] - r_de[i].min()) / (r_de[i].max() - r_de[i].min()) for i in range(len(r_de))])
-            ##### code from example_translation_nllb.py #####
+                for k in r_data.keys():
+                    r_data[k] = np.array([(r_data[k][i] - r_data[k][i].min()) / (r_data[k][i].max() - r_data[k][i].min()) for i in range(len(r_data[k]))])
 
-            #print(f"{loaded_samples + 1} pairs loaded! {r_de.shape}")
+            ##### code from example_translation_nllb.py #####
 
             width = -np.inf
             height = -np.inf
 
-            if "explainability_encoder" in focus:
-                width = max(width, r_ee.shape[0])
-                height = max(height, r_ee.shape[1])
-            if "explainability_decoder" in focus:
-                width = max(width, r_dd.shape[0])
-                height = max(height, r_dd.shape[1])
-            if "explainability_cross" in focus:
-                width = max(width, r_de.shape[0])
-                height = max(height, r_de.shape[1])
+            for k in r_data.keys():
+                if k in focus:
+                    width = max(width, r_data[k].shape[0])
+                    height = max(height, r_data[k].shape[1])
 
             assert width != -np.inf
             assert height != -np.inf
@@ -336,9 +325,8 @@ def main(args):
         # Explainability arrays were loaded
         expected_len = min(len(source_text), limit_data)
 
-        assert expected_len == len(explainability_ee), f"{expected_len} != {len(explainability_ee)}"
-        assert expected_len == len(explainability_dd), f"{expected_len} != {len(explainability_dd)}"
-        assert expected_len == len(explainability_de), f"{expected_len} != {len(explainability_de)}"
+        for k, v in explainability_data.items():
+            assert expected_len == len(v), f"{k}: {expected_len} != {len(v)}"
 
         logger.info("Samples: %d (limit: %s); Groups: %d; Balanced groups: %d", len(groups), limit_data, len(uniq_groups), len(uniq_groups_balanced))
 
@@ -357,7 +345,7 @@ def main(args):
             assert len(groups2groups_balanced[group]) == 1, f"Group {group} was found in more than one balanced group: {groups2groups_balanced[group]}. " \
                                                             "There can be multiple samples for the same group, but they must be in the same balanced group"
 
-        return {
+        r = {
             "matrix_width": matrix_width,
             "matrix_height": matrix_height,
             "loaded_samples": loaded_samples,
@@ -366,10 +354,11 @@ def main(args):
             "labels": labels,
             "groups": groups,
             "groups_balanced": groups_balanced,
-            "explainability_encoder": explainability_ee,
-            "explainability_decoder": explainability_dd,
-            "explainability_cross": explainability_de,
         }
+
+        r.update(explainability_data)
+
+        return r
 
     def get_data(explainability_matrix, labels, loaded_samples, matrix_width, matrix_height, device, convert_labels_to_tensor=True, attention_matrix_preprocess="crop_or_pad"):
         assert attention_matrix_preprocess in ("crop_or_pad", "resize"), attention_matrix_preprocess
@@ -536,17 +525,32 @@ def main(args):
                     else:
                         raise Exception("?")
 
-                    if _attention_matrix == "explainability_encoder":
+                    if _attention_matrix in ("explainability_encoder", "explainability_alti_plus_encoder"):
                         expected_shape = (len(_source_inputs), len(_source_inputs))
-                    elif _attention_matrix == "explainability_decoder":
+                    elif _attention_matrix in ("explainability_decoder", "explainability_alti_plus_decoder"):
                         expected_shape = (len(_target_inputs), len(_target_inputs))
-                    elif _attention_matrix == "explainability_cross":
+                    elif _attention_matrix in ("explainability_cross", "explainability_alti_plus_cross"):
                         expected_shape = (len(_target_inputs), len(_source_inputs))
+                    elif _attention_matrix in ("explainability_alti_plus_total",):
+                        expected_shape = (len(_target_inputs), len(_target_inputs) + len(_source_inputs))
                     else:
                         raise Exception(f"Unexpected matrix key: {_attention_matrix}")
 
                     if d[k][idx].shape[0] <= translation_max_length_encoder and d[k][idx].shape[1] <= translation_max_length_encoder:
-                        assert d[k][idx].shape == expected_shape, f"{k}: {direction}: {d[k][idx].shape} vs {expected_shape}: {_source_inputs} | {_target_inputs}"
+                        if d[k][idx].shape != expected_shape:
+                            _model = transformers.AutoModelForSeq2SeqLM.from_pretrained(pretrained_model)
+                            max_length = _model.config.max_length
+                            max_new_tokens = _model.generation_config.max_length
+
+                            del _model
+
+                            if _attention_matrix in ("explainability_alti_plus_total",):
+                                _expected_shape = (min(len(_target_inputs), expected_shape[0]), min(len(_target_inputs), expected_shape[1]) + min(len(_source_inputs), expected_shape[0]))
+                            else:
+                                _expected_shape = (min(max_length, expected_shape[0]), min(max_new_tokens, expected_shape[1]))
+
+                            if d[k][idx].shape != _expected_shape:
+                                logger.warning("Shape mismatch: %s: %s: %s: %s: %s vs %s (or %s): %s | %s", desc, idx, k, direction, d[k][idx].shape, expected_shape, _expected_shape, _source_inputs, _target_inputs)
                     else:
                         logger.warning("Different shape: %s: %s: %s != %s", k, direction, d[k][idx].shape, expected_shape)
 
@@ -593,9 +597,10 @@ def main(args):
             d["inputs_lm_inputs"] = inputs
 
     if not multichannel:
-        assert len(cnn_pooling) == 1, cnn_pooling
+        if vision_model == "cnn":
+            assert len(cnn_pooling) == 1, cnn_pooling
 
-        cnn_pooling *= len(data_input_all_keys)
+            cnn_pooling *= len(data_input_all_keys)
 
     len_data = len(data_input_all_keys)
 
@@ -1472,7 +1477,7 @@ def initialization():
     parser.add_argument('--source-lang', type=str, required=True, help="NLLB source language (e.g., eng_Latn)")
     parser.add_argument('--target-lang', type=str, required=True, help="NLLB target language")
     parser.add_argument('--direction', type=str, nargs='+', choices=["src2trg", "trg2src"], default=["src2trg"], help="Translation direction. Providing several values is supported")
-    parser.add_argument('--attention-matrix', type=str, nargs='+', choices=["encoder", "decoder", "cross"], default=["encoder", "decoder", "cross"], help="Explainability matrixes provided to the vision classifier. Providing several values is supported")
+    parser.add_argument('--attention-matrix', type=str, nargs='+', choices=["encoder", "decoder", "cross", "alti_plus_encoder", "alti_plus_decoder", "alti_plus_cross", "alti_plus_total"], default=["encoder", "decoder", "cross"], help="Explainability matrixes provided to the vision classifier. Providing several values is supported")
     parser.add_argument('--explainability-normalization', type=str, choices=["none", "absolute", "relative"], default="none", help="Normalization applied to --attention-matrix")
     parser.add_argument('--self-attention-do-not-remove-diagonal', action="store_true", help="Do not set 0s to the explainability self-attention matrices")
     parser.add_argument('--cnn-pooling', type=str, nargs='+', choices=["avg", "max"], default=["max"], help="CNN pooling. Providing several values is supported")
