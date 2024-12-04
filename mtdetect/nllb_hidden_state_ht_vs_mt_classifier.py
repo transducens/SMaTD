@@ -167,7 +167,7 @@ def read_pickle(fn, k=None, limit=None, max_split_size=None):
     data = None
     open_func = gzip.open if fn.endswith(".gz") else open
 
-    print(f"Loading pickle file: {fn} (key: {k})")
+    logger.info("Loading pickle file: %s (key: %s)", fn, k)
 
     with open_func(fn, "rb") as fd:
         data = pickle.load(fd)
@@ -431,9 +431,9 @@ def main(args):
             assert isinstance(p, list), type(p)
             assert isinstance(p[0], torch.Tensor), type(test_pickle_data[0])
 
-    print(f"Train: {len(train_data)}")
-    print(f"Dev: {len(dev_data)}")
-    print(f"test: {len(test_data)}")
+    logger.info("Train: %d", len(train_data))
+    logger.info("Dev: %d", len(dev_data))
+    logger.info("test: %d", len(test_data))
 
     #random.shuffle(train_data) # in-place shuffle
 
@@ -465,7 +465,7 @@ def main(args):
                             embedding_dropout=dropout_p, dropout_p=dropout_p, classifier_dropout_p=dropout_p)
 
     if load_model_path:
-        print(f"Loading init model: {load_model_path}")
+        logger.info("Loading init model: %s", load_model_path)
 
         model_state_dict = torch.load(load_model_path, weights_only=True, map_location=device)
 
@@ -480,7 +480,6 @@ def main(args):
 
     model = model.to(device)
 
-    #print(model)
     training_steps_per_epoch = len(train_data) // batch_size + (0 if len(train_data) % batch_size == 0 else 1) # number of batches
     training_steps = training_steps_per_epoch * epochs # BE AWARE! "epochs" might be fake due to --train-until-patience
 
@@ -497,8 +496,6 @@ def main(args):
 
         logger.info("Parameters with requires_grad=True: %d (LM: %d)", len(model_parameters), len(lm_model_parameters))
 
-        optimizer = torch.optim.AdamW(model_parameters, lr=learning_rate, betas=(0.9, 0.999), eps=1e-08, weight_decay=0.0)
-        scheduler = transformers.get_inverse_sqrt_schedule(optimizer, 400)
         optimizer, scheduler = \
                 utils.get_lr_scheduler_and_optimizer_using_argparse_values(optimizer_str, scheduler_str, optimizer_args, scheduler_args, optimizer_args_params, learning_rate, training_steps, training_steps_per_epoch, logger)
 
@@ -516,36 +513,36 @@ def main(args):
     while do_training:
         epoch_loss = []
 
-        print(f"Epoch #{epoch + 1}")
+        logger.info("Epoch #%d", epoch + 1)
 
         dev_results = eval(model, translation_model, make_batches(dev_data, batch_size, pt_data=dev_pickle_data), direction, device, source_lang_token, target_lang_token, decoder_start_token_token, eos_token_token, translation_tokenizer, max_length, max_new_tokens, threshold=threshold, layer=pretrained_model_layer)
 
         if len(epoch_loss) > 0 and sum_epoch_loss < early_stopping_best_loss:
-            print(f"Better loss result: {early_stopping_best_loss} -> {sum_epoch_loss}")
+            logger.info("Better loss result: %s -> %s", early_stopping_best_loss, sum_epoch_loss)
 
             early_stopping_best_loss = sum_epoch_loss
 
-        print(f"Dev eval: {dev_results}")
+        logger.info("Dev eval: %s")
 
         early_stopping_metric_dev = dev_results[patience_metric]
 
         if early_stopping_metric_dev > early_stopping_best_result_dev:
-            print(f"Patience better dev result (metric: {patience_metric}): {early_stopping_best_result_dev} -> {early_stopping_metric_dev}")
+            logger.info("Patience better dev result (metric: %s): %s -> %s", patience_metric, early_stopping_best_result_dev, early_stopping_metric_dev)
 
             current_patience = 0
             early_stopping_best_result_dev = early_stopping_metric_dev
 
             if save_model_path:
-                print(f"Saving best model: {save_model_path}")
+                logger.info("Saving best model: %s", save_model_path)
 
                 torch.save(model.state_dict(), save_model_path)
         elif patience > 0:
             current_patience += 1
 
-            print(f"Exhausting patience... {current_patience} / {patience}")
+            logger.info("Exhausting patience... %d / %d", current_patience, patience)
 
         if patience > 0 and current_patience >= patience:
-            print("Patience is over ...")
+            logger.info("Patience is over ...")
 
             do_training = False
 
@@ -605,7 +602,7 @@ def main(args):
                 sum_partial_loss = sum(epoch_loss[-100:])
                 sum_loss = sum(epoch_loss)
 
-                print(f"Batch #{batch_idx}: {data.shape} -> {result['outputs'].shape}: {sum_loss} (last {log_steps} steps: {sum_partial_loss})")
+                logger.info("Batch #%d: %s (last %d steps: %s)", batch_idx, sum_loss, log_steps, sum_partial_loss)
 
                 sys.stdout.flush()
 
@@ -613,7 +610,7 @@ def main(args):
 
         sum_epoch_loss = sum(epoch_loss)
 
-        print(f"Epoch loss: {sum_epoch_loss}")
+        logger.info("Epoch loss: %s", sum_epoch_loss)
 
         assert str(sum_epoch_loss) != "nan", "Some values in the input data are NaN"
 
@@ -623,7 +620,7 @@ def main(args):
         do_training = epoch < epochs or train_until_patience
 
     if not do_inference and save_model_path:
-        print(f"Loading best model: {save_model_path}")
+        logger.info("Loading best model: %s", save_model_path)
 
         model_state_dict = torch.load(save_model_path, weights_only=True, map_location=device)
 
@@ -636,20 +633,20 @@ def main(args):
     if not model_inference_skip_train:
         train_results = eval(model, translation_model, make_batches(train_data, batch_size, pt_data=train_pickle_data), direction, device, source_lang_token, target_lang_token, decoder_start_token_token, eos_token_token, translation_tokenizer, max_length, max_new_tokens, threshold=threshold, layer=pretrained_model_layer)
 
-        print(f"Final train eval: {train_results}")
+        logger.info("Final train eval: %s", train_results)
     else:
-        print("Final train eval: skip")
+        logger.info("Final train eval: skip")
 
     dev_results = eval(model, translation_model, make_batches(dev_data, batch_size, pt_data=dev_pickle_data), direction, device, source_lang_token, target_lang_token, decoder_start_token_token, eos_token_token, translation_tokenizer, max_length, max_new_tokens, threshold=threshold, layer=pretrained_model_layer)
 
-    print(f"Final dev eval: {dev_results}")
+    logger.info("Final dev eval: %s", dev_results)
 
     if not skip_test_eval:
         test_results = eval(model, translation_model, make_batches(test_data, batch_size, pt_data=test_pickle_data), direction, device, source_lang_token, target_lang_token, decoder_start_token_token, eos_token_token, translation_tokenizer, max_length, max_new_tokens, threshold=threshold, layer=pretrained_model_layer)
 
-        print(f"Final test eval: {test_results}")
+        logger.info("Final test eval: %s", test_results)
     else:
-        print(f"Final test eval: skip")
+        logger.info("Final test eval: skip")
 
 def initialization():
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -690,7 +687,7 @@ def initialization():
     parser.add_argument('--num-attention-heads', type=int, default=4, help="Classifier attention heads")
     parser.add_argument('--source-lang', type=str, required=True, help="NLLB source language (e.g., eng_Latn)")
     parser.add_argument('--target-lang', type=str, required=True, help="NLLB target language")
-    parser.add_argument('--direction', type=str, nargs='+', choices=["src2trg", "trg2src"], default=["src2trg"], help="Translation direction. Providing several values is supported")
+    parser.add_argument('--direction', type=str, choices=["src2trg", "trg2src"], default="src2trg", help="Translation direction. Providing several values is supported")
     parser.add_argument('--optimizer', choices=optimizer_conf["choices"], default=optimizer_conf["default"], help="Optimizer")
     parser.add_argument('--optimizer-args', **optimizer_conf["options"],
                         help="Args. for the optimizer (in order to see the specific configuration for a optimizer, use -h and set --optimizer)")
