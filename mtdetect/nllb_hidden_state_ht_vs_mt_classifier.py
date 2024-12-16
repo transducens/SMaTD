@@ -171,7 +171,40 @@ def read(fn, limit=None):
 
     return data
 
-def read_pickle(fn, k=None, limit=None, max_split_size=None):
+def read_pickle(fn, *args, **kwargs):
+    all_fns = fn.split(':')
+    data = []
+
+    for fn in all_fns:
+        result = _read_pickle(fn, *args, **kwargs)
+
+        assert isinstance(result, list), type(result)
+        assert isinstance(result[0], torch.Tensor), type(result[0])
+
+        data.append(result)
+
+    for idx in range(len(data) - 1):
+        assert isinstance(data[idx + 0], list)
+        assert isinstance(data[idx + 1], list)
+        assert len(data[idx + 0]) == len(data[idx + 1]) # same number of batches
+
+        for idx2 in range(len(data[idx])):
+            assert isinstance(data[idx + 0][idx2], torch.Tensor)
+            assert isinstance(data[idx + 1][idx2], torch.Tensor)
+            assert data[idx + 0][idx2].shape == data[idx + 1][idx2].shape
+
+    transposed = list(zip(*data))
+    result = [torch.cat(t, dim=-1) for t in transposed]
+
+    assert len(result) == len(data[0])
+
+    for idx in range(len(result)):
+        assert result[idx].shape[:-1] == data[0][idx].shape[:-1]
+        assert result[idx].shape[-1] == data[0][idx].shape[-1] * len(all_fns)
+
+    return result
+
+def _read_pickle(fn, k=None, limit=None, max_split_size=None):
     if max_split_size is not None:
         assert k is not None, "Easier implementation"
 
@@ -419,35 +452,17 @@ def main(args):
 
     logger.info("Batch size: %d (actual batch size: %d)", batch_size, actual_batch_size)
 
+    assert len(train_pickle_fn.split(':')) == len(dev_pickle_fn.split(':')) == len(test_pickle_fn.split(':'))
+
     # read data
+    n_pickle_files = train_pickle_fn.count(':') + 1
     train_data = read(train_fn, limit=None if limit is None else (limit * batch_size))
     dev_data = read(dev_fn, limit=None if limit is None else (limit * batch_size))
     test_data = read(test_fn, limit=None if limit is None else (limit * batch_size))
-    train_pickle_data = read_pickle(train_pickle_fn, k="decoder_last_hidden_state", limit=limit, max_split_size=batch_size) if train_pickle_fn is not None else None
-    dev_pickle_data = read_pickle(dev_pickle_fn, k="decoder_last_hidden_state", limit=limit, max_split_size=batch_size) if dev_pickle_fn is not None else None
-    test_pickle_data = read_pickle(test_pickle_fn, k="decoder_last_hidden_state", limit=limit, max_split_size=batch_size) if test_pickle_fn is not None else None
-    all_pickle_data_loaded = train_pickle_fn is not None and dev_pickle_fn is not None and test_pickle_fn is not None
-
-    for idx, (_p, _d) in enumerate(((train_pickle_data, train_data), (dev_pickle_data, dev_data), (test_pickle_data, test_data))):
-        if _p:
-            s = 0
-
-            for idx2, d in enumerate(_p, 1):
-                assert isinstance(d, torch.Tensor), type(d)
-
-                if idx2 == len(_p):
-                    assert d.shape[0] <= batch_size
-                else:
-                    assert d.shape[0] == batch_size
-
-                s += d.shape[0]
-
-            assert s == len(_d), f"{idx}: {s} vs {len(_d)}"
-
-    for p in (train_pickle_data, dev_pickle_data, test_pickle_data):
-        if p:
-            assert isinstance(p, list), type(p)
-            assert isinstance(p[0], torch.Tensor), type(test_pickle_data[0])
+    train_pickle_data = read_pickle(train_pickle_fn, k="decoder_last_hidden_state", limit=limit, max_split_size=batch_size) if bool(train_pickle_fn) else None
+    dev_pickle_data = read_pickle(dev_pickle_fn, k="decoder_last_hidden_state", limit=limit, max_split_size=batch_size) if bool(dev_pickle_fn) else None
+    test_pickle_data = read_pickle(test_pickle_fn, k="decoder_last_hidden_state", limit=limit, max_split_size=batch_size) if bool(test_pickle_fn) else None
+    all_pickle_data_loaded = bool(train_pickle_fn) and bool(dev_pickle_fn) and bool(test_pickle_fn)
 
     logger.info("Train: %d", len(train_data))
     logger.info("Dev: %d", len(dev_data))
@@ -473,11 +488,34 @@ def main(args):
     max_seq_len = max_new_tokens
 
     # classifier
-    projection_in = translation_model.config.d_model # 1024 for facebook/nllb-200-distilled-600M
+    projection_in = max(n_pickle_files, 1) * translation_model.config.d_model # 1024 for facebook/nllb-200-distilled-600M
     #projection_in = None
     d_model = 512
     #d_model = 128
     #d_model = translation_model.config.d_model
+
+    logger.info("Projection: %d * %d = %d -> %d", max(n_pickle_files, 1), translation_model.config.d_model, projection_in, d_model)
+
+    # sanity-check
+    for idx, (_p, _d) in enumerate(((train_pickle_data, train_data), (dev_pickle_data, dev_data), (test_pickle_data, test_data))):
+        if _p:
+            assert isinstance(_p, list), type(_p)
+
+            s = 0
+
+            for idx2, d in enumerate(_p, 1):
+                assert isinstance(d, torch.Tensor), type(d)
+                assert d.shape[-1] == projection_in, f"{d.shape}[-1] vs {projection_in}"
+
+                if idx2 == len(_p):
+                    assert d.shape[0] <= batch_size
+                else:
+                    assert d.shape[0] == batch_size
+
+                s += d.shape[0]
+
+            assert s == len(_d), f"{idx}: {s} vs {len(_d)}"
+
     model = TransformerModel(d_model, nhead, dim_feedforward, num_layers,
                             projection_in=projection_in, max_seq_len=max_seq_len,
                             embedding_dropout=dropout_p, dropout_p=dropout_p, classifier_dropout_p=dropout_p,
@@ -683,13 +721,13 @@ def initialization():
     parser.add_argument('dataset_test_filename', type=str, help="Filename with test data (TSV format)")
 
     # Optional params
-    parser.add_argument('--pickle-train-filename', type=str, default=None, help="Pickle filename with train data. The order and batch size is expected to match with the provided flags")
-    parser.add_argument('--pickle-dev-filename', type=str, default=None, help="Pickle filename with dev data. The order and batch size is expected to match with the provided flags")
-    parser.add_argument('--pickle-test-filename', type=str, default=None, help="Pickle filename with test data. The order and batch size is expected to match with the provided flags")
+    parser.add_argument('--pickle-train-filename', type=str, default='', help="Pickle filename with train data. The order and batch size is expected to match with the provided flags")
+    parser.add_argument('--pickle-dev-filename', type=str, default='', help="Pickle filename with dev data. The order and batch size is expected to match with the provided flags")
+    parser.add_argument('--pickle-test-filename', type=str, default='', help="Pickle filename with test data. The order and batch size is expected to match with the provided flags")
     parser.add_argument('--batch-size', type=int, default=32, help="Batch size. Elements which will be processed before proceed to train")
     parser.add_argument('--epochs', type=int, default=100, help="Epochs")
     parser.add_argument('--pretrained-model', default="facebook/nllb-200-distilled-600M", help="Pretrained translation model to calculate hidden states (not used if pickle files are provided)")
-    parser.add_argument('--pretrained-model-target-layer', type=int, default=-1,
+    parser.add_argument('--pretrained-model-target-layer', type=int, default=None,
                         help="Pretrained translation model hidden state layer to use in order to train the classifier (not used if pickle files are provided)")
 ##    parser.add_argument('--lm-pretrained-model', help="Pretrained language model (encoder-like) to train together with classifier") # default empty: means NO lm
     parser.add_argument('--max-length-tokens', type=int, default=512, help="Max. length for the generated tokens")
