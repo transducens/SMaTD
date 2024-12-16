@@ -80,7 +80,8 @@ def get_model_hidden_state(src_inputs, trg_inputs, layer=-1):
 
     assert layer == "all" or layer < 0, layer
 
-    for module, tokens in zip(("encoder", "decoder"), (src_inputs, trg_inputs)):
+    #for module, tokens in zip(("encoder", "decoder"), (src_inputs, trg_inputs)):
+    for module, tokens in zip(("decoder",), (trg_inputs,)):
         n_layers = getattr(model.config, f"{module}_layers") + 1 # +1 for the embedding layer (https://huggingface.co/docs/transformers/main_classes/output#transformers.modeling_outputs.Seq2SeqModelOutput)
 
         assert len(model_output[f"{module}_hidden_states"]) == n_layers, len(model_output[f"{module}_hidden_states"])
@@ -151,7 +152,8 @@ def run_and_store_last_hidden_layer_with_pickle(all_src, all_trg, extra_data, sr
     assert len(pickle_output_fn) > 0
 
     results = get_model_hidden_state(src_inputs, trg_inputs, layer=layer) # {key: torch.tensor(bsz, src|trg_tokens, d_model)}
-    modules = ("encoder", "decoder")
+    #modules = ("encoder", "decoder")
+    modules = ("decoder",)
     layers = [sorted(list(set(results[f"{module}_last_hidden_state"].keys()))) for module in modules]
 
     for i in range(len(layers) - 1):
@@ -252,13 +254,21 @@ def run_and_store_last_hidden_layer_with_pickle(all_src, all_trg, extra_data, sr
                 with gzip.open(_pickle_output_fn, "wb") as pickle_fd:
                     pickle.dump(_last_hidden_state, pickle_fd)
         else:
+            keys = {}
+
+            for module in modules:
+                assert len(last_hidden_state[f"{module}_last_hidden_state"].keys()) == 1, last_hidden_state[f"{module}_last_hidden_state"].keys()
+
+                keys[module] = list(last_hidden_state[f"{module}_last_hidden_state"].keys())[0]
+
             _pickle_output_fn = f"{pickle_output_fn}.gz"
+            _last_hidden_state = {f"{module}_last_hidden_state": last_hidden_state[f"{module}_last_hidden_state"][keys[module]] for module in modules}
 
             print(f"Pickle output: {_pickle_output_fn}")
             sys.stdout.flush()
 
             with gzip.open(_pickle_output_fn, "wb") as pickle_fd:
-                pickle.dump(last_hidden_state, pickle_fd)
+                pickle.dump(_last_hidden_state, pickle_fd)
 
     return last_hidden_state
 

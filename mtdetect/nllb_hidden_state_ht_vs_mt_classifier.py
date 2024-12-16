@@ -39,13 +39,15 @@ class PositionalEncoding(nn.Module):
 
 class TransformerModel(nn.Module):
 
-    def __init__(self, d_model, nhead, dim_feedforward, nlayers, projection_in=None, max_seq_len=512, embedding_dropout=0.5, dropout_p=0.5, classifier_dropout_p=0.5, num_labels=1, initial_layer_norm=False):
+    def __init__(self, d_model, nhead, dim_feedforward, nlayers, projection_in=None, max_seq_len=512, embedding_dropout=0.5, dropout_p=0.5, classifier_dropout_p=0.5, num_labels=1, initial_layer_norm=False, initial_layer_norm_first=False):
         super(TransformerModel, self).__init__()
 
         initial_dim = d_model if projection_in is None else projection_in
-        self.layer_norm = nn.LayerNorm(initial_dim) if initial_layer_norm else None
-        self.pos_encoder = PositionalEncoding(initial_dim, embedding_dropout, max_seq_len=max_seq_len)
-        encoder_layers = torch.nn.TransformerEncoderLayer(d_model, nhead, batch_first=True, dim_feedforward=dim_feedforward, dropout=dropout_p) #, activation="gelu", layer_norm_eps=1e-12)
+        initial_dim_layer_norm = initial_dim if initial_layer_norm_first else d_model
+        self.initial_layer_norm_first = initial_layer_norm_first
+        self.layer_norm = nn.LayerNorm(initial_dim_layer_norm) if initial_layer_norm else None
+        self.pos_encoder = PositionalEncoding(d_model, embedding_dropout, max_seq_len=max_seq_len)
+        encoder_layers = torch.nn.TransformerEncoderLayer(d_model, nhead, batch_first=True, dim_feedforward=dim_feedforward, dropout=dropout_p, norm_first=False) #, activation="gelu", layer_norm_eps=1e-12)
         self.projection = None if projection_in is None else nn.Linear(projection_in, d_model)
         self.transformer_encoder = torch.nn.TransformerEncoder(encoder_layers, nlayers)
         self.d_model = d_model
@@ -79,11 +81,18 @@ class TransformerModel(nn.Module):
                 module.weight.data.fill_(1.0)
 
     def forward(self, src, mask=None):
-        src = src * math.sqrt(self.d_model)
+        #src = src * math.sqrt(self.d_model)
+        #src = self.pos_encoder(src)
+
+        if self.initial_layer_norm_first:
+            src = self.layer_norm(src) if self.layer_norm is not None else src
+            src = self.projection(src) if self.projection is not None else src
+        else:
+            src = self.projection(src) if self.projection is not None else src
+            src = self.layer_norm(src) if self.layer_norm is not None else src
+
         src = self.pos_encoder(src)
-        proj = self.projection(src) if self.projection is not None else src
-        proj = self.layer_norm(proj) if self.layer_norm is not None else proj
-        output = self.transformer_encoder(proj, mask=mask)
+        output = self.transformer_encoder(src, mask=mask)
 
         # https://github.com/huggingface/transformers/blob/5523e38b553ff6c46b04d2376870fcd842feeecc/src/transformers/models/bert/modeling_bert.py#L1680
         output = output[:,0,:] # Only the first token (CLS)
@@ -177,6 +186,13 @@ def read_pickle(fn, k=None, limit=None, max_split_size=None):
     assert isinstance(data, dict), type(data)
 
     for _k1 in data.keys():
+        if isinstance(data[_k1], dict):
+            assert len(data[_k1].keys()) == 1, data[_k1].keys()
+
+            # workaround
+            key = list(data[_k1].keys())[0]
+            data[_k1] = data[_k1][key]
+
 #        assert isinstance(data[_k1], dict), type(data[_k1])
         assert isinstance(data[_k1], list), type(data[_k1])
         assert isinstance(data[_k1][0], torch.Tensor), type(data[_k1][0])
@@ -457,15 +473,16 @@ def main(args):
     max_seq_len = max_new_tokens
 
     # classifier
-    #projection_in = translation_model.config.d_model # 1024 for facebook/nllb-200-distilled-600M
-    projection_in = None
-    #d_model = 512
+    projection_in = translation_model.config.d_model # 1024 for facebook/nllb-200-distilled-600M
+    #projection_in = None
+    d_model = 512
     #d_model = 128
-    d_model = translation_model.config.d_model
+    #d_model = translation_model.config.d_model
     model = TransformerModel(d_model, nhead, dim_feedforward, num_layers,
                             projection_in=projection_in, max_seq_len=max_seq_len,
                             embedding_dropout=dropout_p, dropout_p=dropout_p, classifier_dropout_p=dropout_p,
-                            initial_layer_norm=True) # initial_layer_norm=True to avoid problem of layers != -1 because values are not normalized
+                            #initial_layer_norm=True, initial_layer_norm_first=False) # initial_layer_norm=True to avoid problem of layers != -1 because values are not normalized
+                            initial_layer_norm=False, initial_layer_norm_first=True) # TODO remove?
 
     if load_model_path:
         logger.info("Loading init model: %s", load_model_path)
@@ -685,10 +702,10 @@ def initialization():
                         help="Train until patience value is reached (--epochs will be ignored in order to stop, but will still be "
                              "used for other actions like LR scheduler)")
 ##    parser.add_argument('--lm-model-input', help="Encoder-like model input path where the model will be stored")
-    parser.add_argument('--learning-rate', type=float, default=5e-04, help="Classifier learning rate")
+    parser.add_argument('--learning-rate', type=float, default=1e-04, help="Classifier learning rate")
 ##    parser.add_argument('--lm-frozen-params', action='store_true', help="Freeze encoder-like model parameters (i.e., do not train)")
 ##    parser.add_argument('--lm-learning-rate', type=float, default=1e-5, help="Encoder-like model learning rate")
-    parser.add_argument('--num-layers', type=int, default=1, help="Classifier layers")
+    parser.add_argument('--num-layers', type=int, default=3, help="Classifier layers")
     parser.add_argument('--num-attention-heads', type=int, default=4, help="Classifier attention heads")
     parser.add_argument('--source-lang', type=str, required=True, help="NLLB source language (e.g., eng_Latn)")
     parser.add_argument('--target-lang', type=str, required=True, help="NLLB target language")
