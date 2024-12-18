@@ -641,6 +641,8 @@ def main(args):
             else:
                 final_loss += torch.sum(_loss)
 
+            logger.debug("asd: %d: %d: %s", epoch, batch_idx, final_loss)
+
             # loss
             if batch_idx % gradient_accumulation == 0 or batch_idx == training_steps_per_epoch:
                 assert final_loss is not None
@@ -648,6 +650,8 @@ def main(args):
                 loss = final_loss / loss_elements
                 final_loss = None
                 loss_elements = 0
+
+                logger.debug("asd2: %d: %d: %s", epoch, batch_idx, loss)
 
                 epoch_loss.append(loss.cpu().detach().item())
 

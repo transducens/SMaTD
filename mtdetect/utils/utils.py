@@ -396,6 +396,12 @@ class argparse_pytorch_conf:
             "default": (0.9, 0.999, 1e-08, 0.0),
             "type": argparse_nargs_type(float, float, float, float),
         },
+        "adamw_amsgrad_no_wd": { # amsgrad and no weight decay
+            "nargs": 5,
+            "metavar": ("beta1", "beta2", "eps", "weight_decay", "amsgrad"),
+            "default": (0.9, 0.999, 1e-08, 0.0, True),
+            "type": argparse_nargs_type(float, float, float, float, bool),
+        },
         "sgd": {
             "nargs": 2,
             "metavar": ("momentum", "weight_decay"),
@@ -458,12 +464,16 @@ def get_lr_scheduler_and_optimizer_using_argparse_values(optimizer_str, schedule
             "weight_decay": optimizer_args[3],
         }
         optimizer = torch.optim.Adam(optimizer_args_params, lr=learning_rate, **optimizer_kwargs)
-    elif optimizer_str in ("adamw", "adamw_no_wd"):
+    elif optimizer_str in ("adamw", "adamw_no_wd", "adamw_amsgrad_no_wd"):
         optimizer_kwargs = {
             "betas": tuple(optimizer_args[0:2]),
             "eps": optimizer_args[2],
             "weight_decay": optimizer_args[3],
         }
+
+        if optimizer_str == "adamw_amsgrad_no_wd":
+            optimizer_kwargs["amsgrad"] = optimizer_args[4]
+
         optimizer = torch.optim.AdamW(optimizer_args_params, lr=learning_rate, **optimizer_kwargs)
     elif optimizer_str == "sgd":
         optimizer_kwargs = {

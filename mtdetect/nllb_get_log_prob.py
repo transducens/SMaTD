@@ -3,6 +3,8 @@ import sys
 import gzip
 import pickle
 
+import normalizer
+
 import torch
 import torch.nn.functional as F
 import transformers
@@ -13,18 +15,21 @@ import numpy as np
 _src_lang = sys.argv[1]
 _trg_lang = sys.argv[2]
 direction = sys.argv[3]
-pickle_output_fn = sys.argv[4] if len(sys.argv) > 4 else None
-layer = sys.argv[5] if len(sys.argv) > 5 else -1
+pickle_output_fn = sys.argv[4] if len(sys.argv) > 4 and len(sys.argv[4]) > 0 else None
+layer = sys.argv[5] if len(sys.argv) > 5 and len(sys.argv[5]) > 0 else -1
 pretrained_model = sys.argv[6] if len(sys.argv) > 6 and len(sys.argv[6]) > 0 else "facebook/nllb-200-distilled-600M"
 bsz = int(sys.argv[7]) if len(sys.argv) > 7 else 32
+normalize = bool(int(sys.argv[8])) if len(sys.argv) > 8 else False
+run_method = sys.argv[9] if len(sys.argv) > 9 else "run_and_store_last_hidden_layer_with_pickle"
 
 assert direction in ("src2trg", "trg2src")
 
 if layer != "all":
     layer = int(layer)
 
-print(f"Pretrained model: {pretrained_model}")
-print(f"Batch size: {bsz}")
+print(f"Pretrained model: {pretrained_model}", file=sys.stderr)
+print(f"Batch size: {bsz}", file=sys.stderr)
+print(f"Normalize: {normalize}", file=sys.stderr)
 
 src_lang, trg_lang = (_src_lang, _trg_lang) if direction == "src2trg" else (_trg_lang, _src_lang)
 source_lang_token = src_lang
@@ -125,7 +130,7 @@ def preprocess(text, tokenizer, device, max_length):
 
     return inputs
 
-def run_and_print_results(all_src, all_trg, extra_data, src_inputs, trg_inputs, perplexity_skip_values=5, previous_results=None, last_execution=False):
+def run_and_print_results(all_src, all_trg, extra_data, src_inputs, trg_inputs, perplexity_skip_values=5):
     batch_log_probs, all_ntokens, batch_probs, batch_log_probs_all = get_log_prob(src_inputs, trg_inputs)
 
     assert len(all_src) == len(all_trg) == len(extra_data) == len(batch_log_probs) == len(all_ntokens) == len(batch_probs) == len(batch_log_probs_all)
@@ -273,10 +278,17 @@ def run_and_store_last_hidden_layer_with_pickle(all_src, all_trg, extra_data, sr
     return last_hidden_state
 
 if __name__ == "__main__":
-    #run = run_and_print_results
-    run = run_and_store_last_hidden_layer_with_pickle
+    if run_method == "run_and_store_last_hidden_layer_with_pickle":
+        run = run_and_store_last_hidden_layer_with_pickle
+        run_kwargs = {"previous_results": None, "pickle_output_fn": pickle_output_fn, "last_execution": False, "layer": layer}
+    elif run_method == "run_and_print_results":
+        run = run_and_print_results
+        run_kwargs = {}
+    else:
+        raise Exception(f"Unknown run method: {run_method}")
+
     #run_kwargs = {"previous_results": None, "last_execution": False}
-    run_kwargs = {"previous_results": None, "pickle_output_fn": pickle_output_fn, "last_execution": False, "layer": layer}
+
     all_src, all_trg, extra_data = [], [], []
 
     for l in sys.stdin:
@@ -286,13 +298,19 @@ if __name__ == "__main__":
 
             results = run(all_src, all_trg, extra_data, src_inputs, trg_inputs, **run_kwargs)
 
-            run_kwargs["previous_results"] = results
+            if run is run_and_store_last_hidden_layer_with_pickle:
+                run_kwargs["previous_results"] = results
+
             all_src, all_trg, extra_data = [], [], []
 
         _data = l.strip("\r\n").split('\t')
         _src = _data[0]
         _trg = _data[1]
         _extra_data = '|'.join(_data[2:])
+
+        if normalize:
+            _src = normalizer.get_clean_sentence(_src)
+            _trg = normalizer.get_clean_sentence(_trg)
 
         src, trg = (_src, _trg) if direction == "src2trg" else (_trg, _src)
         src = f"{source_lang_token} {src}{eos_token_token}"
@@ -306,9 +324,13 @@ if __name__ == "__main__":
 
     src_inputs = preprocess(all_src, tokenizer, device, max_length)
     trg_inputs = preprocess(all_trg, tokenizer, device, max_new_tokens)
-    run_kwargs["last_execution"] = True
+
+    if run is run_and_store_last_hidden_layer_with_pickle:
+        run_kwargs["last_execution"] = True
 
     run(all_src, all_trg, extra_data, src_inputs, trg_inputs, **run_kwargs)
 
-    run_kwargs["previous_results"] = results
+    if run is run_and_store_last_hidden_layer_with_pickle:
+        run_kwargs["previous_results"] = results
+
     all_src, all_trg, extra_data = [], [], []

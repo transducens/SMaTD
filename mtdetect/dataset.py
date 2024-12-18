@@ -515,7 +515,10 @@ class SelectGroupCollate:
 
         return result
 
-def tokenize_batch_from_iterator(iterator, tokenizer, batch_size, f=None, ignore_source_side=False, return_urls=False):
+def tokenize_batch_from_iterator(iterator, tokenizer, batch_size, f=None, ignore_source_side=False, swap_lang=False, return_urls=False):
+    if return_urls and swap_lang:
+        logger.warning("The returned URLs will not be in the same order as the batch data due to swap_lang=True")
+
     def reset():
         urls = {
             "urls": [],
@@ -566,9 +569,14 @@ def tokenize_batch_from_iterator(iterator, tokenizer, batch_size, f=None, ignore
 
                 continue
 
-            urls["urls"].append(f"{src_url}{tokenizer.sep_token}{trg_url}") # We don't need to add [CLS] and final [SEP]
-                                                                            #  (or other special tokens) since they are automatically added
-                                                                            #  by tokenizer.encode_plus / tokenizer.batch_encode_plus
+            _src_url, _trg_url = src_url, trg_url
+
+            if swap_lang:
+                _src_url, _trg_url = trg_url, src_url
+
+            urls["urls"].append(f"{_src_url}{tokenizer.sep_token}{_trg_url}") # We don't need to add [CLS] and final [SEP]
+                                                                              #  (or other special tokens) since they are automatically added
+                                                                              #  by tokenizer.encode_plus / tokenizer.batch_encode_plus
 
         urls["labels"].append(label)
         urls["groups"].append(group)
