@@ -390,12 +390,12 @@ def eval(model, translation_model, data_generator, direction, device, source_lan
 
         if batch_lm is not None:
             assert lang_model is not None
-            assert not lm_frozen_params
+            assert lm_frozen_params
 
             data_lm = batch_lm.to(device)
         else:
             if lang_model:
-                assert lm_frozen_params
+                assert not lm_frozen_params
 
                 batch = [f"{_src}{lang_model_tokenizer.sep_token}{_trg}" for _src, _trg in zip(src, trg)]
                 classifier_token = get_lang_model_cls_token(batch, lang_model, lang_model_tokenizer, device, max_length_encoder, to_cpu=False, detach=True)
@@ -538,7 +538,6 @@ def main(args):
     scheduler_str = args.lr_scheduler
     scheduler_args = args.lr_scheduler_args
     dropout_p = args.dropout
-    ##lm_classifier_dropout = args.lm_classifier_dropout
     limit = args.data_limit
     gradient_accumulation = args.gradient_accumulation
     actual_batch_size = batch_size * gradient_accumulation
@@ -602,9 +601,9 @@ def main(args):
     lang_model, lang_model_tokenizer = load_model(lm_model_input, lm_pretrained_model, None) if lm_pretrained_model else (None, None)
     _max_length_encoder = 512 # TODO use argument
     lang_model_batch_size = train_pickle_data[0].shape[0] # Same batch size as pickle files
-    train_lm_data = [] if lang_model else None
-    dev_lm_data = [] if lang_model else None
-    test_lm_data = [] if lang_model else None
+    train_lm_data = [] if lang_model and lm_frozen_params else None
+    dev_lm_data = [] if lang_model and lm_frozen_params else None
+    test_lm_data = [] if lang_model and lm_frozen_params else None
 
     if lang_model:
         # Add LM data to inputs
@@ -708,12 +707,22 @@ def main(args):
 
     if do_inference:
         model = model.eval()
-        lang_model = lang_model.eval() if lang_model else lang_model
     else:
         model = model.train()
-        lang_model = lang_model.train() if lang_model else lang_model
 
     model = model.to(device)
+
+    for p in model.parameters():
+        p.requires_grad_(not do_inference)
+
+    if lang_model:
+        if lm_frozen_params:
+            lang_model.eval()
+        else:
+            lang_model.train()
+
+        for p in lang_model.parameters():
+            p.requires_grad_(not lm_frozen_params)
 
     training_steps_per_epoch = len(train_data) // batch_size + (0 if len(train_data) % batch_size == 0 else 1) # number of batches
     training_steps = training_steps_per_epoch * epochs # BE AWARE! "epochs" might be fake due to --train-until-patience
@@ -798,9 +807,9 @@ def main(args):
             assert len(src) == len(trg) == len(labels)
 
             if batch_idx == training_steps_per_epoch:
-                assert len(src) == batch_size
+                assert len(src) <= batch_size, f"{len(src)} vs {batch_size}"
             else:
-                assert len(src) <= batch_size
+                assert len(src) == batch_size, f"{len(src)} vs {batch_size}"
 
             if batch_pt is None:
                 src_translation_model = [f"{source_lang_token} {_src}{eos_token_token}" for _src in src]
@@ -814,12 +823,12 @@ def main(args):
 
             if batch_lm is not None:
                 assert lang_model is not None
-                assert not lm_frozen_params
+                assert lm_frozen_params
 
                 data_lm = batch_lm.to(device)
             else:
                 if lang_model:
-                    assert lm_frozen_params
+                    assert not lm_frozen_params
 
                     batch = [f"{_src}{lang_model_tokenizer.sep_token}{_trg}" for _src, _trg in zip(src, trg)]
                     classifier_token = get_lang_model_cls_token(batch, lang_model, lang_model_tokenizer, device, max_length_encoder, to_cpu=False, detach=False)
