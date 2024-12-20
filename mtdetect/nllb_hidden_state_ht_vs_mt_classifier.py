@@ -40,7 +40,7 @@ class PositionalEncoding(nn.Module):
 class TransformerModel(nn.Module):
 
     def __init__(self, d_model, nhead, dim_feedforward, nlayers, projection_in=None, max_seq_len=512, embedding_dropout=0.5, dropout_p=0.5, classifier_dropout_p=0.5, num_labels=1,
-                 initial_layer_norm=False, initial_layer_norm_first=False, lm_projection_in=None):
+                 initial_layer_norm=False, initial_layer_norm_first=False, lm_projection_in=None, lang_model=None):
         super(TransformerModel, self).__init__()
 
         initial_dim = d_model if projection_in is None else projection_in
@@ -61,6 +61,9 @@ class TransformerModel(nn.Module):
         self.classifier = nn.Linear(d_model, num_labels)
 
         self.init_weights()
+
+        # Store lang model after weights initialization to avoid problems......
+        self.lang_model = lang_model
 
     # https://github.com/huggingface/transformers/blob/5523e38b553ff6c46b04d2376870fcd842feeecc/src/transformers/models/bert/modeling_bert.py#L836
     # https://huggingface.co/docs/transformers/model_doc/bert#transformers.BertConfig.initializer_range
@@ -448,8 +451,17 @@ def eval(model, translation_model, data_generator, direction, device, source_lan
     if training:
         model.train()
 
+        if not lang_model_training and model.lang_model:
+            # Previous .train() might have enabled the language model training...
+            model.lang_model.eval()
+
     if lang_model_training:
-        lang_model.train()
+        if hasattr(model, "lang_model"):
+            model.lang_model.train()
+
+            assert lang_model is model.lang_model
+        else:
+            lang_model.train()
 
     return results
 
@@ -694,7 +706,8 @@ def main(args):
     model = TransformerModel(d_model, nhead, dim_feedforward, num_layers,
                              projection_in=projection_in, max_seq_len=max_seq_len,
                              embedding_dropout=dropout_p, dropout_p=dropout_p, classifier_dropout_p=dropout_p,
-                             initial_layer_norm=False, lm_projection_in=lm_projection_in)
+                             initial_layer_norm=False, lm_projection_in=lm_projection_in,
+                             lang_model=lang_model if lang_model and not lm_frozen_params else None,)
 
     if load_model_path:
         logger.info("Loading init model: %s", load_model_path)
@@ -730,9 +743,13 @@ def main(args):
     logger.info("Batches per epoch: %d (total for %d epochs: %d)", training_steps_per_epoch, epochs, training_steps)
 
     if not do_inference:
-        model_parameters = list(filter(lambda p: p.requires_grad, model.parameters()))
+        model_parameters_data = list(filter(lambda d: d[1].requires_grad, [(k, p) for k, p in model.named_parameters() if not k.startswith("lang_model.")]))
+        model_parameters = [d[1] for d in model_parameters_data]
+        model_parameters_names = [d[0] for d in model_parameters_data]
         lm_model_parameters = list(filter(lambda p: p.requires_grad, lang_model.parameters())) if lang_model else []
         optimizer_args_params = [{"params": model_parameters, "lr": learning_rate}]
+
+        assert len(model_parameters_data) == len(model_parameters) == len(model_parameters_names)
 
         if lm_model_parameters:
             optimizer_args_params.append({"params": lm_model_parameters, "lr": lm_learning_rate})
