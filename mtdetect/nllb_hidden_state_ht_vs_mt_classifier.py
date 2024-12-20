@@ -39,7 +39,8 @@ class PositionalEncoding(nn.Module):
 
 class TransformerModel(nn.Module):
 
-    def __init__(self, d_model, nhead, dim_feedforward, nlayers, projection_in=None, max_seq_len=512, embedding_dropout=0.5, dropout_p=0.5, classifier_dropout_p=0.5, num_labels=1, initial_layer_norm=False, initial_layer_norm_first=False):
+    def __init__(self, d_model, nhead, dim_feedforward, nlayers, projection_in=None, max_seq_len=512, embedding_dropout=0.5, dropout_p=0.5, classifier_dropout_p=0.5, num_labels=1,
+                 initial_layer_norm=False, initial_layer_norm_first=False, lm_projection_in=None):
         super(TransformerModel, self).__init__()
 
         initial_dim = d_model if projection_in is None else projection_in
@@ -49,6 +50,7 @@ class TransformerModel(nn.Module):
         self.pos_encoder = PositionalEncoding(d_model, embedding_dropout, max_seq_len=max_seq_len)
         encoder_layers = torch.nn.TransformerEncoderLayer(d_model, nhead, batch_first=True, dim_feedforward=dim_feedforward, dropout=dropout_p, norm_first=False) #, activation="gelu", layer_norm_eps=1e-12)
         self.projection = None if projection_in is None else nn.Linear(projection_in, d_model)
+        self.lm_projection = None if lm_projection_in is None else nn.Linear(lm_projection_in, d_model)
         self.transformer_encoder = torch.nn.TransformerEncoder(encoder_layers, nlayers)
         self.d_model = d_model
         self.initializer_range = 0.02
@@ -80,7 +82,7 @@ class TransformerModel(nn.Module):
                 module.bias.data.zero_()
                 module.weight.data.fill_(1.0)
 
-    def forward(self, src, mask=None):
+    def forward(self, src, mask=None, lm_src=None):
         #src = src * math.sqrt(self.d_model)
         #src = self.pos_encoder(src)
 
@@ -90,6 +92,21 @@ class TransformerModel(nn.Module):
         else:
             src = self.projection(src) if self.projection is not None else src
             src = self.layer_norm(src) if self.layer_norm is not None else src
+
+        assert len(src.shape) == 3
+
+        if lm_src is not None:
+            assert mask is None, "Not supported"
+            assert self.lm_projection is not None
+
+            lm_src = self.lm_projection(lm_src)
+
+            assert len(lm_src.shape) == 2
+            assert src.shape[0] == lm_src.shape[0]
+            assert src.shape[2] == lm_src.shape[1]
+
+            lm_src = lm_src.unsqueeze(1)
+            src = torch.cat((lm_src, src), dim=1) # add lm_src as a "new" token in the first position
 
         src = self.pos_encoder(src)
         output = self.transformer_encoder(src, mask=mask)
@@ -272,39 +289,50 @@ def _read_pickle(fn, k=None, limit=None, max_split_size=None):
 
     return data
 
-def make_batches(data, bsz, pt_data=None):
+def make_batches(data, bsz, pt_data=None, lm_data=None):
     assert bsz > 0
 
     idx = 0
     batch = []
 
+    def get_result():
+        assert len(batch) > 0
+
+        result = [batch]
+
+        if pt_data is not None:
+            assert pt_data[idx].shape[0] == len(batch), f"{idx}: {pt_data[idx].shape[0]} vs {len(batch)}"
+
+            result.append(pt_data[idx])
+        else:
+            result.append(None)
+
+        if lm_data is not None:
+            assert lm_data[idx].shape[0] == len(batch), f"{idx}: {lm_data[idx].shape[0]} vs {len(batch)}"
+
+            result.append(lm_data[idx])
+        else:
+            result.append(None)
+
+        return result
+
     for d in data:
         batch.append(d)
 
         if len(batch) >= bsz:
-            if pt_data is None:
-                yield (batch, None)
-            else:
-                assert pt_data[idx].shape[0] == len(batch), f"{idx}: {pt_data[idx].shape[0]} vs {len(batch)}"
-
-                yield (batch, pt_data[idx])
+            yield tuple(get_result())
 
             idx += 1
             batch = []
 
     if len(batch) > 0:
-        if pt_data is None:
-            yield (batch, None)
-        else:
-            assert pt_data[idx].shape[0] == len(batch), f"{idx}: {pt_data[idx].shape[0]} vs {len(batch)}"
-
-            yield (batch, pt_data[idx])
+        yield tuple(get_result())
 
         idx += 1
         batch = []
 
-def apply_inference(model, data, mask=None, target=None, loss_function=None, threshold=0.5, loss_apply_sigmoid=False):
-    model_outputs = model(data, mask=mask)
+def apply_inference(model, data, mask=None, target=None, loss_function=None, threshold=0.5, loss_apply_sigmoid=False, data_lm=None):
+    model_outputs = model(data, mask=mask, lm_src=data_lm)
     outputs = model_outputs
     outputs = outputs.squeeze(1)
     loss = None
@@ -325,19 +353,27 @@ def apply_inference(model, data, mask=None, target=None, loss_function=None, thr
 
     return results
 
-def eval(model, translation_model, data_generator, direction, device, source_lang_token, target_lang_token, decoder_start_token_token, eos_token_token, translation_tokenizer, max_length, max_new_tokens, print_result=False, print_desc='-', threshold=0.5, layer=-1):
+def eval(model, translation_model, data_generator, direction, device, source_lang_token, target_lang_token, decoder_start_token_token, eos_token_token, translation_tokenizer,
+         max_length, max_new_tokens, print_result=False, print_desc='-', threshold=0.5, layer=-1, lang_model=None, lang_model_tokenizer=None, lm_frozen_params=False, max_length_encoder=512):
     assert not print_result, "Code not working"
 
     training = model.training
+    lang_model_training = False
 
     model.eval()
+
+    if lang_model:
+        lang_model_training = lang_model.training
+
+        lang_model.eval()
 
     all_outputs = []
     all_labels = []
     print_idx = 0
 
-    for batch, batch_pt in data_generator:
+    for batch, batch_pt, batch_lm in data_generator:
         src, trg, labels = zip(*batch)
+        data_lm = None
 
         if direction == "trg2src":
             src, trg = trg, src
@@ -352,8 +388,21 @@ def eval(model, translation_model, data_generator, direction, device, source_lan
         else:
             data = batch_pt.to(device)
 
+        if batch_lm is not None:
+            assert lang_model is not None
+            assert not lm_frozen_params
+
+            data_lm = batch_lm.to(device)
+        else:
+            if lang_model:
+                assert lm_frozen_params
+
+                batch = [f"{_src}{lang_model_tokenizer.sep_token}{_trg}" for _src, _trg in zip(src, trg)]
+                classifier_token = get_lang_model_cls_token(batch, lang_model, lang_model_tokenizer, device, max_length_encoder, to_cpu=False, detach=True)
+                data_lm = classifier_token.to(device)
+
         target = torch.tensor(labels).to(device)
-        results = apply_inference(model, data, target=None, loss_function=None, threshold=threshold, loss_apply_sigmoid=False)
+        results = apply_inference(model, data, target=None, loss_function=None, threshold=threshold, loss_apply_sigmoid=False, data_lm=data_lm)
         outputs_classification = results["outputs_classification_detach_list"]
         outputs = results["outputs"]
         outputs = torch.sigmoid(outputs).cpu().detach().tolist()
@@ -399,7 +448,54 @@ def eval(model, translation_model, data_generator, direction, device, source_lan
     if training:
         model.train()
 
+    if lang_model_training:
+        lang_model.train()
+
     return results
+
+def load_model(model_input, pretrained_model, device):
+    local_model = bool(model_input)
+    config = transformers.AutoConfig.from_pretrained(pretrained_model, num_labels=1)
+    model = transformers.AutoModelForSequenceClassification.from_pretrained(pretrained_model, config=config)
+    tokenizer = utils.get_tokenizer(pretrained_model)
+
+    if local_model:
+        state_dict = torch.load(model_input, weights_only=True, map_location=device) # weights_only: https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models
+                                                                                     # map_location: avoid creating a new process and using additional and useless memory
+
+        model.load_state_dict(state_dict)
+
+    model = model.to(device)
+
+    return model, tokenizer
+
+def get_lang_model_cls_token(batch, lang_model, lang_model_tokenizer, device, max_length_encoder, to_cpu=True, detach=True):
+    assert isinstance(batch, list)
+    assert isinstance(batch[0], str)
+
+    inputs = lang_model_tokenizer.batch_encode_plus(batch, return_tensors=None, add_special_tokens=True, max_length=max_length_encoder,
+                                                    return_attention_mask=False, truncation=True, padding="longest")
+    lm_input_ids = inputs["input_ids"]
+    lm_input_ids = torch.tensor(lm_input_ids)
+    lm_attention_mask = utils.get_attention_mask(lang_model_tokenizer, lm_input_ids)
+    lm_input_ids = lm_input_ids.to(device)
+    lm_attention_mask = lm_attention_mask.to(device)
+
+    assert lm_attention_mask.shape == lm_input_ids.shape
+
+    output = lang_model(input_ids=lm_input_ids, attention_mask=lm_attention_mask, output_hidden_states=True)
+    last_hidden_state = output["hidden_states"][-1]
+    classifier_token = last_hidden_state[:,0,:]
+
+    if to_cpu:
+        classifier_token = classifier_token.cpu()
+
+    if detach:
+        classifier_token = classifier_token.detach()
+
+    assert classifier_token.shape == (len(batch), lang_model.config.hidden_size)
+
+    return classifier_token
 
 def main(args):
     seed = args.seed
@@ -446,6 +542,13 @@ def main(args):
     limit = args.data_limit
     gradient_accumulation = args.gradient_accumulation
     actual_batch_size = batch_size * gradient_accumulation
+    lm_pretrained_model = args.lm_pretrained_model
+    lm_model_input = args.lm_model_input
+    lm_frozen_params = args.lm_frozen_params
+    lm_learning_rate = args.lm_learning_rate
+
+    if lm_pretrained_model:
+        logger.info("LM is going to be used: %s (local file: %s)", lm_pretrained_model, lm_model_input)
 
     if gradient_accumulation > 1:
         logger.info("Gradient accumulation enabled (i.e., >1): %d (note that if disabled, the same results would be obtained if dropout is disabled for both HT vs MT classifier and language model, train shuffle is disabled, and float precision errors are ignored)", gradient_accumulation)
@@ -455,7 +558,7 @@ def main(args):
     assert len(train_pickle_fn.split(':')) == len(dev_pickle_fn.split(':')) == len(test_pickle_fn.split(':'))
 
     # read data
-    n_pickle_files = train_pickle_fn.count(':') + 1
+    n_pickle_files = train_pickle_fn.count(':') + (0 if len(train_pickle_fn) == 0 else 1)
     train_data = read(train_fn, limit=None if limit is None else (limit * batch_size))
     dev_data = read(dev_fn, limit=None if limit is None else (limit * batch_size))
     test_data = read(test_fn, limit=None if limit is None else (limit * batch_size))
@@ -467,6 +570,14 @@ def main(args):
     logger.info("Train: %d", len(train_data))
     logger.info("Dev: %d", len(dev_data))
     logger.info("test: %d", len(test_data))
+
+    train_pickle_data_n = sum([t.shape[0] for t in train_pickle_data]) if bool(train_pickle_fn) else len(train_data)
+    dev_pickle_data_n = sum([t.shape[0] for t in dev_pickle_data]) if bool(dev_pickle_fn) else len(dev_data)
+    test_pickle_data_n = sum([t.shape[0] for t in test_pickle_data]) if bool(test_pickle_fn) else len(test_data)
+
+    assert len(train_data) == train_pickle_data_n, f"{len(train_data)} vs {train_pickle_data_n}"
+    assert len(dev_data) == dev_pickle_data_n
+    assert len(test_data) == test_pickle_data_n
 
     #random.shuffle(train_data) # in-place shuffle
 
@@ -487,14 +598,79 @@ def main(args):
     decoder_start_token_token = translation_tokenizer.convert_ids_to_tokens(translation_model.generation_config.decoder_start_token_id)
     max_seq_len = max_new_tokens
 
+    # LM
+    lang_model, lang_model_tokenizer = load_model(lm_model_input, lm_pretrained_model, None) if lm_pretrained_model else (None, None)
+    _max_length_encoder = 512 # TODO use argument
+    lang_model_batch_size = train_pickle_data[0].shape[0] # Same batch size as pickle files
+    train_lm_data = [] if lang_model else None
+    dev_lm_data = [] if lang_model else None
+    test_lm_data = [] if lang_model else None
+
+    if lang_model:
+        # Add LM data to inputs
+        lang_model = lang_model.eval()
+        lang_model = lang_model.to(device)
+
+        assert n_pickle_files > 0, "LM is only supported with pickle files (easier implementation)"
+
+        max_length_encoder = utils.get_encoder_max_length(lang_model, lang_model_tokenizer, max_length_tokens=_max_length_encoder)
+        max_length_encoder = min(max_length_encoder, _max_length_encoder)
+
+        logger.debug("Max length: %d", max_length_encoder)
+
+        if lm_frozen_params:
+            logger.info("LM parameters are frozen: computing embeddings just once")
+
+            for desc, data_str, data_pickle, data_lm in (("train", train_data, train_pickle_data, train_lm_data), ("dev", dev_data, dev_pickle_data, dev_lm_data), ("test", test_data, test_pickle_data, test_lm_data)):
+                logger.info("Generating LM data: %s", desc)
+
+                all_texts = []
+                idx = 0
+
+                for source_text, target_text, label in data_str:
+                    all_texts.append(f"{source_text}{lang_model_tokenizer.sep_token}{target_text}")
+
+                while len(all_texts) > 0:
+                    batch = all_texts[:lang_model_batch_size]
+
+                    assert isinstance(data_pickle[idx], torch.Tensor), type(data_pickle[idx])
+                    assert len(batch) == data_pickle[idx].shape[0], f"{data_pickle[idx].shape} vs {len(batch)}"
+                    assert data_pickle[idx].shape[2] == translation_model.config.d_model, data_pickle[idx].shape
+
+                    classifier_token = get_lang_model_cls_token(batch, lang_model, lang_model_tokenizer, device, max_length_encoder)
+
+                    data_lm.append(classifier_token)
+
+                    # update remaining data to process
+                    all_texts = all_texts[lang_model_batch_size:]
+                    idx += 1
+
+                    if idx % 100 == 0:
+                        logger.debug("Batches of data processed using the LM: %s: %d", desc, idx)
+
+                assert idx == len(data_pickle) # last batch of data
+                assert len(data_str) == sum([t.shape[0] for t in data_lm]), desc
+
+                logger.debug("Total batches of data processed using the LM: %s: %d", desc, idx)
+
     # classifier
-    projection_in = max(n_pickle_files, 1) * translation_model.config.d_model # 1024 for facebook/nllb-200-distilled-600M
+    #projection_in = []
+    #projection_in.append(max(n_pickle_files, 1) * translation_model.config.d_model)  # 1024 for facebook/nllb-200-distilled-600M
+    #projection_in.append(lang_model.config.hidden_size if lang_model else 0)
+    projection_in = max(n_pickle_files, 1) * translation_model.config.d_model  # 1024 for facebook/nllb-200-distilled-600M
     #projection_in = None
-    d_model = 512
+    lm_projection_in = lang_model.config.hidden_size if lang_model else None
+    d_model = 512 # TODO use argument
     #d_model = 128
     #d_model = translation_model.config.d_model
 
-    logger.info("Projection: %d * %d = %d -> %d", max(n_pickle_files, 1), translation_model.config.d_model, projection_in, d_model)
+    #logger.info("Projection: %d * %d + %d = %s -> %d", max(n_pickle_files, 1), translation_model.config.d_model, projection_in[1], " + ".join(map(str, projection_in)), d_model)
+    logger.info("Projection for the MT model: %d * %d = %d -> %d", max(n_pickle_files, 1), translation_model.config.d_model, projection_in, d_model)
+
+    if lang_model:
+        logger.info("Projection for the LM: %d -> %d", lm_projection_in, d_model)
+
+    #projection_in = sum(projection_in)
 
     # sanity-check
     for idx, (_p, _d) in enumerate(((train_pickle_data, train_data), (dev_pickle_data, dev_data), (test_pickle_data, test_data))):
@@ -517,10 +693,9 @@ def main(args):
             assert s == len(_d), f"{idx}: {s} vs {len(_d)}"
 
     model = TransformerModel(d_model, nhead, dim_feedforward, num_layers,
-                            projection_in=projection_in, max_seq_len=max_seq_len,
-                            embedding_dropout=dropout_p, dropout_p=dropout_p, classifier_dropout_p=dropout_p,
-                            #initial_layer_norm=True, initial_layer_norm_first=False) # initial_layer_norm=True to avoid problem of layers != -1 because values are not normalized
-                            initial_layer_norm=False, initial_layer_norm_first=True) # TODO remove?
+                             projection_in=projection_in, max_seq_len=max_seq_len,
+                             embedding_dropout=dropout_p, dropout_p=dropout_p, classifier_dropout_p=dropout_p,
+                             initial_layer_norm=False, lm_projection_in=lm_projection_in)
 
     if load_model_path:
         logger.info("Loading init model: %s", load_model_path)
@@ -533,8 +708,10 @@ def main(args):
 
     if do_inference:
         model = model.eval()
+        lang_model = lang_model.eval() if lang_model else lang_model
     else:
         model = model.train()
+        lang_model = lang_model.train() if lang_model else lang_model
 
     model = model.to(device)
 
@@ -545,12 +722,11 @@ def main(args):
 
     if not do_inference:
         model_parameters = list(filter(lambda p: p.requires_grad, model.parameters()))
-        #lm_model_parameters = list(filter(lambda p: p.requires_grad, lang_model.parameters())) if lang_model else []
-        lm_model_parameters = []
+        lm_model_parameters = list(filter(lambda p: p.requires_grad, lang_model.parameters())) if lang_model else []
         optimizer_args_params = [{"params": model_parameters, "lr": learning_rate}]
 
-        #if lm_model_parameters:
-        #    optimizer_args_params.append({"params": lm_model_parameters, "lr": lm_learning_rate})
+        if lm_model_parameters:
+            optimizer_args_params.append({"params": lm_model_parameters, "lr": lm_learning_rate})
 
         logger.info("Parameters with requires_grad=True: %d (LM: %d)", len(model_parameters), len(lm_model_parameters))
 
@@ -575,7 +751,7 @@ def main(args):
 
         logger.info("Epoch #%d", epoch + 1)
 
-        dev_results = eval(model, translation_model, make_batches(dev_data, batch_size, pt_data=dev_pickle_data), direction, device, source_lang_token, target_lang_token, decoder_start_token_token, eos_token_token, translation_tokenizer, max_length, max_new_tokens, threshold=threshold, layer=pretrained_model_layer)
+        dev_results = eval(model, translation_model, make_batches(dev_data, batch_size, pt_data=dev_pickle_data, lm_data=dev_lm_data), direction, device, source_lang_token, target_lang_token, decoder_start_token_token, eos_token_token, translation_tokenizer, max_length, max_new_tokens, threshold=threshold, layer=pretrained_model_layer, lang_model=lang_model, lang_model_tokenizer=lang_model_tokenizer, lm_frozen_params=lm_frozen_params, max_length_encoder=max_length_encoder)
 
         if len(epoch_loss) > 0 and sum_epoch_loss < early_stopping_best_loss:
             logger.info("Better loss result: %s -> %s", early_stopping_best_loss, sum_epoch_loss)
@@ -612,24 +788,45 @@ def main(args):
         final_loss = None
         loss_elements = 0
 
-        for batch_idx, (batch, batch_pt) in enumerate(make_batches(train_data, batch_size, pt_data=train_pickle_data), 1):
+        for batch_idx, (batch, batch_pt, batch_lm) in enumerate(make_batches(train_data, batch_size, pt_data=train_pickle_data, lm_data=train_lm_data), 1):
             src, trg, labels = zip(*batch)
+            data_lm = None
 
             if direction == "trg2src":
                 src, trg = trg, src
 
+            assert len(src) == len(trg) == len(labels)
+
+            if batch_idx == training_steps_per_epoch:
+                assert len(src) == batch_size
+            else:
+                assert len(src) <= batch_size
+
             if batch_pt is None:
-                src = [f"{source_lang_token} {_src}{eos_token_token}" for _src in src]
-                trg = [f"{decoder_start_token_token}{target_lang_token} {_trg}{eos_token_token}" for _trg in trg]
-                src_inputs = preprocess(src, translation_tokenizer, device, max_length)
-                trg_inputs = preprocess(trg, translation_tokenizer, device, max_new_tokens)
+                src_translation_model = [f"{source_lang_token} {_src}{eos_token_token}" for _src in src]
+                trg_translation_model = [f"{decoder_start_token_token}{target_lang_token} {_trg}{eos_token_token}" for _trg in trg]
+                src_inputs = preprocess(src_translation_model, translation_tokenizer, device, max_length)
+                trg_inputs = preprocess(trg_translation_model, translation_tokenizer, device, max_new_tokens)
                 translation_output = get_model_last_hidden_state(translation_model, src_inputs, trg_inputs, skip_modules=("encoder",), to_cpu=False, layer=pretrained_model_layer)
                 data = translation_output["decoder_last_hidden_state"]
             else:
                 data = batch_pt.to(device)
 
+            if batch_lm is not None:
+                assert lang_model is not None
+                assert not lm_frozen_params
+
+                data_lm = batch_lm.to(device)
+            else:
+                if lang_model:
+                    assert lm_frozen_params
+
+                    batch = [f"{_src}{lang_model_tokenizer.sep_token}{_trg}" for _src, _trg in zip(src, trg)]
+                    classifier_token = get_lang_model_cls_token(batch, lang_model, lang_model_tokenizer, device, max_length_encoder, to_cpu=False, detach=False)
+                    data_lm = classifier_token.to(device)
+
             target = torch.tensor(labels).to(device)
-            result = apply_inference(model, data, target=target, loss_function=loss_function, loss_apply_sigmoid=loss_apply_sigmoid, threshold=threshold)
+            result = apply_inference(model, data, target=target, loss_function=loss_function, loss_apply_sigmoid=loss_apply_sigmoid, threshold=threshold, data_lm=data_lm)
             _loss = result["loss"]
 
             assert len(_loss.shape) == 1, _loss.shape
@@ -641,8 +838,6 @@ def main(args):
             else:
                 final_loss += torch.sum(_loss)
 
-            logger.debug("asd: %d: %d: %s", epoch, batch_idx, final_loss)
-
             # loss
             if batch_idx % gradient_accumulation == 0 or batch_idx == training_steps_per_epoch:
                 assert final_loss is not None
@@ -650,8 +845,6 @@ def main(args):
                 loss = final_loss / loss_elements
                 final_loss = None
                 loss_elements = 0
-
-                logger.debug("asd2: %d: %d: %s", epoch, batch_idx, loss)
 
                 epoch_loss.append(loss.cpu().detach().item())
 
@@ -695,18 +888,18 @@ def main(args):
         model = model.to(device)
 
     if not model_inference_skip_train:
-        train_results = eval(model, translation_model, make_batches(train_data, batch_size, pt_data=train_pickle_data), direction, device, source_lang_token, target_lang_token, decoder_start_token_token, eos_token_token, translation_tokenizer, max_length, max_new_tokens, threshold=threshold, layer=pretrained_model_layer)
+        train_results = eval(model, translation_model, make_batches(train_data, batch_size, pt_data=train_pickle_data, lm_data=train_lm_data), direction, device, source_lang_token, target_lang_token, decoder_start_token_token, eos_token_token, translation_tokenizer, max_length, max_new_tokens, threshold=threshold, layer=pretrained_model_layer, lang_model=lang_model, lang_model_tokenizer=lang_model_tokenizer, lm_frozen_params=lm_frozen_params, max_length_encoder=max_length_encoder)
 
         logger.info("Final train eval: %s", train_results)
     else:
         logger.info("Final train eval: skip")
 
-    dev_results = eval(model, translation_model, make_batches(dev_data, batch_size, pt_data=dev_pickle_data), direction, device, source_lang_token, target_lang_token, decoder_start_token_token, eos_token_token, translation_tokenizer, max_length, max_new_tokens, threshold=threshold, layer=pretrained_model_layer)
+    dev_results = eval(model, translation_model, make_batches(dev_data, batch_size, pt_data=dev_pickle_data, lm_data=dev_lm_data), direction, device, source_lang_token, target_lang_token, decoder_start_token_token, eos_token_token, translation_tokenizer, max_length, max_new_tokens, threshold=threshold, layer=pretrained_model_layer, lang_model=lang_model, lang_model_tokenizer=lang_model_tokenizer, lm_frozen_params=lm_frozen_params, max_length_encoder=max_length_encoder)
 
     logger.info("Final dev eval: %s", dev_results)
 
     if not skip_test_eval:
-        test_results = eval(model, translation_model, make_batches(test_data, batch_size, pt_data=test_pickle_data), direction, device, source_lang_token, target_lang_token, decoder_start_token_token, eos_token_token, translation_tokenizer, max_length, max_new_tokens, threshold=threshold, layer=pretrained_model_layer)
+        test_results = eval(model, translation_model, make_batches(test_data, batch_size, pt_data=test_pickle_data, lm_data=test_lm_data), direction, device, source_lang_token, target_lang_token, decoder_start_token_token, eos_token_token, translation_tokenizer, max_length, max_new_tokens, threshold=threshold, layer=pretrained_model_layer, lang_model=lang_model, lang_model_tokenizer=lang_model_tokenizer, lm_frozen_params=lm_frozen_params, max_length_encoder=max_length_encoder)
 
         logger.info("Final test eval: %s", test_results)
     else:
@@ -733,7 +926,7 @@ def initialization():
     parser.add_argument('--pretrained-model', default="facebook/nllb-200-distilled-600M", help="Pretrained translation model to calculate hidden states (not used if pickle files are provided)")
     parser.add_argument('--pretrained-model-target-layer', type=int, default=None,
                         help="Pretrained translation model hidden state layer to use in order to train the classifier (not used if pickle files are provided)")
-##    parser.add_argument('--lm-pretrained-model', help="Pretrained language model (encoder-like) to train together with classifier") # default empty: means NO lm
+    parser.add_argument('--lm-pretrained-model', help="Pretrained language model (encoder-like) to train together with classifier") # default empty: means NO lm
     parser.add_argument('--max-length-tokens', type=int, default=512, help="Max. length for the generated tokens")
     parser.add_argument('--model-input', type=str, default='', help="Classifier input path which will be loaded")
     parser.add_argument('--model-output', type=str, default='', help="Classifier output path where the model will be stored")
@@ -743,10 +936,10 @@ def initialization():
     parser.add_argument('--train-until-patience', action="store_true",
                         help="Train until patience value is reached (--epochs will be ignored in order to stop, but will still be "
                              "used for other actions like LR scheduler)")
-##    parser.add_argument('--lm-model-input', help="Encoder-like model input path where the model will be stored")
+    parser.add_argument('--lm-model-input', help="Encoder-like model input path where the model will be stored")
     parser.add_argument('--learning-rate', type=float, default=1e-04, help="Classifier learning rate")
-##    parser.add_argument('--lm-frozen-params', action='store_true', help="Freeze encoder-like model parameters (i.e., do not train)")
-##    parser.add_argument('--lm-learning-rate', type=float, default=1e-5, help="Encoder-like model learning rate")
+    parser.add_argument('--lm-frozen-params', action='store_true', help="Freeze encoder-like model parameters (i.e., do not train)")
+    parser.add_argument('--lm-learning-rate', type=float, default=1e-5, help="Encoder-like model learning rate")
     parser.add_argument('--num-layers', type=int, default=3, help="Classifier layers")
     parser.add_argument('--num-attention-heads', type=int, default=4, help="Classifier attention heads")
     parser.add_argument('--source-lang', type=str, required=True, help="NLLB source language (e.g., eng_Latn)")
@@ -762,10 +955,8 @@ def initialization():
     parser.add_argument('--gradient-accumulation', type=int, default=1, help="Gradient accumulation steps")
 #    parser.add_argument('--multiplicative-inverse-temperature-sampling', type=float, default=0.3, help="See https://arxiv.org/pdf/1907.05019 (section 4.2). Default value has been set the one used in the NLLB paper")
     parser.add_argument('--dropout', type=float, default=0.1, help="Dropout applied to the classifier model (embedding, model, and head)")
-##    parser.add_argument('--lm-classifier-dropout', type=float, default=0.1, help="Dropout applied to the classifier layer of the encoder-like model")
     parser.add_argument('--threshold', type=float, default=0.5, help="Threshold to consider a given text to be HT")
     parser.add_argument('--dev-patience-metric', type=str, choices=["acc", "macro_f1"], default="acc", help="Metric to calculate patience using the dev set")
-#    parser.add_argument('--disable-vision-model', action="store_true", help="Do not train classifier. Debug purposes")
     parser.add_argument('--skip-training-set-during-inference', action="store_true", help="Skip training evaluation during inference to speed up result")
     parser.add_argument('--skip-test-set-eval', action="store_true", help="Skip test evaluation during training or inference")
     parser.add_argument('--data-limit', type=int, default=None, help="Data limit reading in batches (debug purposes)")
