@@ -39,7 +39,7 @@ class PositionalEncoding(nn.Module):
 
 class TransformerModel(nn.Module):
 
-    def __init__(self, d_model, nhead, dim_feedforward, nlayers, projection_in=None, max_seq_len=512, embedding_dropout=0.5, dropout_p=0.5, classifier_dropout_p=0.5, lm_dropout_p=0.5,
+    def __init__(self, d_model, nhead, dim_feedforward, nlayers, projection_in=None, max_seq_len=512, embedding_dropout=0.5, dropout_p=0.5, classifier_dropout_p=0.5, lm_classifier_dropout_p=0.5,
                  num_labels=1, initial_layer_norm=False, initial_layer_norm_first=False, lm_projection_in=None, lang_model=None, debug_labels=False):
         super(TransformerModel, self).__init__()
 
@@ -60,7 +60,7 @@ class TransformerModel(nn.Module):
         self.classifier_dropout = nn.Dropout(classifier_dropout_p)
         self.classifier = nn.Linear(d_model + (lm_projection_in if lm_projection_in is not None else 0) + (1 if debug_labels else 0), num_labels)
         self.lm_projection_in = lm_projection_in
-        self.lm_dropout = nn.Dropout(lm_dropout_p)
+        self.lm_classifier_dropout = nn.Dropout(lm_classifier_dropout_p)
 
         self.init_weights()
 
@@ -131,7 +131,7 @@ class TransformerModel(nn.Module):
             #output.zero_() # TODO remove (debug)
             #lm_src.zero_() # TODO remove (debug)
 
-            lm_src = self.lm_dropout(lm_src)
+            lm_src = self.lm_classifier_dropout(lm_src)
             output = torch.cat((lm_src, output), dim=1)
 
         if debug_labels is not None:
@@ -397,7 +397,7 @@ def apply_inference(model, data, mask=None, target=None, loss_function=None, thr
 
 def eval(model, translation_model, data_generator, direction, device, source_lang_token, target_lang_token, decoder_start_token_token, eos_token_token, translation_tokenizer,
          max_length, max_new_tokens, print_result=False, print_desc='-', threshold=0.5, layer=-1, lang_model=None, lang_model_tokenizer=None, lm_frozen_params=False, max_length_encoder=512,
-         debug=False):
+         lm_ensemble_approach=False, debug=False):
     assert not print_result, "Code not working"
 
     training = model.training
@@ -445,10 +445,30 @@ def eval(model, translation_model, data_generator, direction, device, source_lan
                 data_lm = classifier_token.to(device)
 
         target = torch.tensor(labels).to(device)
-        results = apply_inference(model, data, target=None, loss_function=None, threshold=threshold, loss_apply_sigmoid=False, data_lm=data_lm) #, debug_labels=target if debug else None)
+        results = apply_inference(model, data, target=None, loss_function=None, threshold=threshold, loss_apply_sigmoid=False, data_lm=data_lm if not lm_ensemble_approach else None) #, debug_labels=target if debug else None)
         outputs_classification = results["outputs_classification_detach_list"]
         outputs = results["outputs"]
         outputs = torch.sigmoid(outputs).cpu().detach().tolist()
+
+        if lm_ensemble_approach:
+            assert data_lm is not None
+            assert hasattr(lang_model, "classifier")
+
+            data_lm = lang_model.classifier(data_lm) # logits
+
+            assert len(data_lm.shape) == 2
+            assert data_lm.shape[1] == 1
+
+            data_lm = data_lm.squeeze(1) # (batch_size, 1) -> (batch_size,)
+            lm_outputs = torch.sigmoid(data_lm).cpu().detach().tolist()
+
+            assert len(lm_outputs) == len(outputs)
+
+            # TODO use param to support different approaches to combine the results (e.g., multiplication, mean, geometric mean, ...)
+            outputs = [(o1 + o2) / 2 for o1, o2 in zip(outputs, lm_outputs)]
+            #outputs = [2 * o1 * o2 / (o1 + o2) for o1, o2 in zip(outputs, lm_outputs)] # biased towards 0 (i.e., MT)
+            #outputs = [o1 * o2 for o1, o2 in zip(outputs, lm_outputs)] # biased towards 0 (i.e., MT)
+
         labels = target.cpu()
         labels = torch.round(labels).type(torch.long)
 
@@ -496,7 +516,7 @@ def eval(model, translation_model, data_generator, direction, device, source_lan
             model.lang_model.eval()
 
     if lang_model_training:
-        if hasattr(model, "lang_model"):
+        if model.lang_model is not None:
             model.lang_model.train()
 
             assert lang_model is model.lang_model
@@ -505,9 +525,9 @@ def eval(model, translation_model, data_generator, direction, device, source_lan
 
     return results
 
-def load_model(model_input, pretrained_model, device):
+def load_model(model_input, pretrained_model, device, classifier_dropout=0.1):
     local_model = bool(model_input)
-    config = transformers.AutoConfig.from_pretrained(pretrained_model, num_labels=1)
+    config = transformers.AutoConfig.from_pretrained(pretrained_model, num_labels=1, classifier_dropout=classifier_dropout)
     model = transformers.AutoModelForSequenceClassification.from_pretrained(pretrained_model, config=config)
     tokenizer = utils.get_tokenizer(pretrained_model)
 
@@ -611,14 +631,21 @@ def main(args):
     scheduler_str = args.lr_scheduler
     scheduler_args = args.lr_scheduler_args
     dropout_p = args.dropout
-    lm_dropout_p = args.lm_dropout
+    lm_classifier_dropout_p = args.lm_classifier_dropout
     limit = args.data_limit
     gradient_accumulation = args.gradient_accumulation
     actual_batch_size = batch_size * gradient_accumulation
     lm_pretrained_model = args.lm_pretrained_model
     lm_model_input = args.lm_model_input
+    lm_model_output = args.lm_model_output
     lm_frozen_params = args.lm_frozen_params
     lm_learning_rate = args.lm_learning_rate
+    lm_ensemble_approach = args.lm_ensemble_approach
+    lm_ensemble_loss_weight = args.lm_ensemble_loss_weight
+    loss_weight = args.loss_weight
+
+    if lm_ensemble_approach:
+        assert lm_pretrained_model, "LM is mandatory to apply ensemble learning"
 
     if lm_pretrained_model:
         logger.info("LM is going to be used: %s (local file: %s)", lm_pretrained_model, lm_model_input)
@@ -672,7 +699,7 @@ def main(args):
     max_seq_len = max_new_tokens
 
     # LM
-    lang_model, lang_model_tokenizer = load_model(lm_model_input, lm_pretrained_model, None) if lm_pretrained_model else (None, None)
+    lang_model, lang_model_tokenizer = load_model(lm_model_input, lm_pretrained_model, None, classifier_dropout=lm_classifier_dropout_p) if lm_pretrained_model else (None, None)
     max_length_encoder = 512 # TODO use argument
     _max_length_encoder = max_length_encoder
     lang_model_batch_size = train_pickle_data[0].shape[0] # Same batch size as pickle files
@@ -769,8 +796,9 @@ def main(args):
     model = TransformerModel(d_model, nhead, dim_feedforward, num_layers,
                              projection_in=projection_in, max_seq_len=max_seq_len,
                              embedding_dropout=dropout_p, dropout_p=dropout_p, classifier_dropout_p=dropout_p,
-                             lm_dropout_p=lm_dropout_p, initial_layer_norm=False, lm_projection_in=lm_projection_in,
-                             lang_model=lang_model if lang_model and not lm_frozen_params else None,
+                             lm_classifier_dropout_p=lm_classifier_dropout_p, initial_layer_norm=False,
+                             lm_projection_in=lm_projection_in if not lm_ensemble_approach else None,
+                             lang_model=lang_model if lang_model and not lm_frozen_params and not lm_ensemble_approach else None,
                             )
 #                             debug_labels=True if debug else False)
 
@@ -800,11 +828,6 @@ def main(args):
 
         logger.debug("Model keys (current: %d; load: %d; intersection: %d): load - current: %s: current - load: %s",
                      len(current_model_state_dict_keys), len(load_model_state_dict_keys), len(model_state_dict_keys_intersection), model_state_dict_keys_load_current_diff, model_state_dict_keys_current_load_diff)
-
-        lang_model_dict_keys = set([f"lang_model.{k}" for k in lang_model.state_dict().keys()])
-
-        assert current_model_state_dict_keys != load_model_state_dict_keys
-        assert current_model_state_dict_keys == set.union(load_model_state_dict_keys, lang_model_dict_keys)
 
         model.load_state_dict(model_state_dict, strict=False)
 
@@ -874,10 +897,12 @@ def main(args):
             logger.debug("LM signature: %s", s1)
 
         epoch_loss = []
+        epoch_loss1 = []
+        epoch_loss2 = []
 
         logger.info("Epoch #%d", epoch + 1)
 
-        dev_results = eval(model, translation_model, make_batches(dev_data, batch_size, pt_data=dev_pickle_data, lm_data=dev_lm_data), direction, device, source_lang_token, target_lang_token, decoder_start_token_token, eos_token_token, translation_tokenizer, max_length, max_new_tokens, threshold=threshold, layer=pretrained_model_layer, lang_model=lang_model, lang_model_tokenizer=lang_model_tokenizer, lm_frozen_params=lm_frozen_params, max_length_encoder=max_length_encoder, debug=debug)
+        dev_results = eval(model, translation_model, make_batches(dev_data, batch_size, pt_data=dev_pickle_data, lm_data=dev_lm_data), direction, device, source_lang_token, target_lang_token, decoder_start_token_token, eos_token_token, translation_tokenizer, max_length, max_new_tokens, threshold=threshold, layer=pretrained_model_layer, lang_model=lang_model, lang_model_tokenizer=lang_model_tokenizer, lm_frozen_params=lm_frozen_params, max_length_encoder=max_length_encoder, lm_ensemble_approach=lm_ensemble_approach, debug=debug)
 
         if len(epoch_loss) > 0 and sum_epoch_loss < early_stopping_best_loss:
             logger.info("Better loss result: %s -> %s", early_stopping_best_loss, sum_epoch_loss)
@@ -894,10 +919,14 @@ def main(args):
             current_patience = 0
             early_stopping_best_result_dev = early_stopping_metric_dev
 
-            if save_model_path:
-                logger.info("Saving best model: %s", save_model_path)
+            if save_model_path or lm_model_output:
+                logger.info("Saving best model: %s (LM: %s)", save_model_path, lm_model_output)
 
+            if save_model_path:
                 torch.save(model.state_dict(), save_model_path)
+
+            if lm_model_output and lang_model is not None:
+                torch.save(lang_model.state_dict(), lm_model_output)
         elif patience > 0:
             current_patience += 1
 
@@ -912,7 +941,10 @@ def main(args):
 
         model.zero_grad()
         final_loss = None
-        loss_elements = 0
+        final_loss1 = 0.0
+        final_loss2 = 0.0
+        loss_elements1 = 0
+        loss_elements2 = 0
 
         for batch_idx, (batch, batch_pt, batch_lm) in enumerate(make_batches(train_data, batch_size, pt_data=train_pickle_data, lm_data=train_lm_data), 1):
             src, trg, labels = zip(*batch)
@@ -971,12 +1003,37 @@ def main(args):
                     data_lm = classifier_token.to(device)
 
             target = torch.tensor(labels).to(device)
-            result = apply_inference(model, data, target=target, loss_function=loss_function, loss_apply_sigmoid=loss_apply_sigmoid, threshold=threshold, data_lm=data_lm) #, debug_labels=target if debug else None)
+            result = apply_inference(model, data, target=target, loss_function=loss_function, loss_apply_sigmoid=loss_apply_sigmoid, threshold=threshold, data_lm=data_lm if not lm_ensemble_approach else None) #, debug_labels=target if debug else None)
             _loss = result["loss"]
+            _loss *= loss_weight
+            loss_elements1 += _loss.numel()
 
             assert len(_loss.shape) == 1, _loss.shape
 
-            loss_elements += _loss.numel()
+            final_loss1 += torch.sum(_loss).cpu().detach().item()
+
+            if lm_ensemble_approach:
+                assert data_lm is not None
+                assert hasattr(lang_model, "classifier")
+
+                lm_outputs = lang_model.classifier(data_lm) # logits
+
+                assert len(lm_outputs.shape) == 2
+                assert lm_outputs.shape[1] == 1
+
+                lm_outputs = lm_outputs.squeeze(1) # (batch_size, 1) -> (batch_size,)
+
+                if loss_function is not None and target is not None:
+                    ensemble_loss = loss_function(torch.sigmoid(lm_outputs) if loss_apply_sigmoid else lm_outputs, target)
+                    ensemble_loss *= lm_ensemble_loss_weight
+                    loss_elements2 += ensemble_loss.numel()
+                    final_loss2 += torch.sum(ensemble_loss).cpu().detach().item()
+
+                    assert ensemble_loss.shape == _loss.shape
+
+                    _loss += ensemble_loss
+
+            assert len(_loss.shape) == 1, _loss.shape
 
             if final_loss is None:
                 final_loss = torch.sum(_loss)
@@ -987,11 +1044,18 @@ def main(args):
             if batch_idx % gradient_accumulation == 0 or batch_idx == training_steps_per_epoch:
                 assert final_loss is not None
 
-                loss = final_loss / loss_elements
+                loss = final_loss / (loss_elements1 + loss_elements2)
+                loss1 = final_loss1 / loss_elements1
+                loss2 = final_loss2 / loss_elements2
                 final_loss = None
-                loss_elements = 0
+                loss_elements1 = 0
+                loss_elements2 = 0
+                final_loss1 = 0.0
+                final_loss2 = 0.0
 
                 epoch_loss.append(loss.cpu().detach().item())
+                epoch_loss1.append(loss1)
+                epoch_loss2.append(loss2)
 
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -1030,6 +1094,16 @@ def main(args):
 
                 logger.info("Batch #%d: %s (last %d steps: %s)", batch_idx, sum_loss, log_steps * gradient_accumulation, sum_partial_loss)
 
+                if lm_ensemble_approach:
+                    # sum_loss1 + sum_loss2 may be different to sum_loss because of "/ (loss_elements1 + loss_elements2)"
+                    sum_partial_loss1 = sum(epoch_loss1[-1 * log_steps:])
+                    sum_loss1 = sum(epoch_loss1)
+                    sum_partial_loss2 = sum(epoch_loss2[-1 * log_steps:])
+                    sum_loss2 = sum(epoch_loss2)
+
+                    logger.debug("Ensemble: our classifier: Batch #%d: %s (last %d steps: %s)", batch_idx, sum_loss1, log_steps * gradient_accumulation, sum_partial_loss1)
+                    logger.debug("Ensemble: LM: Batch #%d: %s (last %d steps: %s)", batch_idx, sum_loss2, log_steps * gradient_accumulation, sum_partial_loss2)
+
                 sys.stdout.flush()
 
         assert batch_idx == training_steps_per_epoch, f"{batch_idx} vs {training_steps_per_epoch}"
@@ -1057,18 +1131,18 @@ def main(args):
         model = model.to(device)
 
     if not model_inference_skip_train:
-        train_results = eval(model, translation_model, make_batches(train_data, batch_size, pt_data=train_pickle_data, lm_data=train_lm_data), direction, device, source_lang_token, target_lang_token, decoder_start_token_token, eos_token_token, translation_tokenizer, max_length, max_new_tokens, threshold=threshold, layer=pretrained_model_layer, lang_model=lang_model, lang_model_tokenizer=lang_model_tokenizer, lm_frozen_params=lm_frozen_params, max_length_encoder=max_length_encoder, debug=debug)
+        train_results = eval(model, translation_model, make_batches(train_data, batch_size, pt_data=train_pickle_data, lm_data=train_lm_data), direction, device, source_lang_token, target_lang_token, decoder_start_token_token, eos_token_token, translation_tokenizer, max_length, max_new_tokens, threshold=threshold, layer=pretrained_model_layer, lang_model=lang_model, lang_model_tokenizer=lang_model_tokenizer, lm_frozen_params=lm_frozen_params, max_length_encoder=max_length_encoder, lm_ensemble_approach=lm_ensemble_approach, debug=debug)
 
         logger.info("Final train eval: %s", train_results)
     else:
         logger.info("Final train eval: skip")
 
-    dev_results = eval(model, translation_model, make_batches(dev_data, batch_size, pt_data=dev_pickle_data, lm_data=dev_lm_data), direction, device, source_lang_token, target_lang_token, decoder_start_token_token, eos_token_token, translation_tokenizer, max_length, max_new_tokens, threshold=threshold, layer=pretrained_model_layer, lang_model=lang_model, lang_model_tokenizer=lang_model_tokenizer, lm_frozen_params=lm_frozen_params, max_length_encoder=max_length_encoder, debug=debug)
+    dev_results = eval(model, translation_model, make_batches(dev_data, batch_size, pt_data=dev_pickle_data, lm_data=dev_lm_data), direction, device, source_lang_token, target_lang_token, decoder_start_token_token, eos_token_token, translation_tokenizer, max_length, max_new_tokens, threshold=threshold, layer=pretrained_model_layer, lang_model=lang_model, lang_model_tokenizer=lang_model_tokenizer, lm_frozen_params=lm_frozen_params, max_length_encoder=max_length_encoder, lm_ensemble_approach=lm_ensemble_approach, debug=debug)
 
     logger.info("Final dev eval: %s", dev_results)
 
     if not skip_test_eval:
-        test_results = eval(model, translation_model, make_batches(test_data, batch_size, pt_data=test_pickle_data, lm_data=test_lm_data), direction, device, source_lang_token, target_lang_token, decoder_start_token_token, eos_token_token, translation_tokenizer, max_length, max_new_tokens, threshold=threshold, layer=pretrained_model_layer, lang_model=lang_model, lang_model_tokenizer=lang_model_tokenizer, lm_frozen_params=lm_frozen_params, max_length_encoder=max_length_encoder, debug=debug)
+        test_results = eval(model, translation_model, make_batches(test_data, batch_size, pt_data=test_pickle_data, lm_data=test_lm_data), direction, device, source_lang_token, target_lang_token, decoder_start_token_token, eos_token_token, translation_tokenizer, max_length, max_new_tokens, threshold=threshold, layer=pretrained_model_layer, lang_model=lang_model, lang_model_tokenizer=lang_model_tokenizer, lm_frozen_params=lm_frozen_params, max_length_encoder=max_length_encoder, lm_ensemble_approach=lm_ensemble_approach, debug=debug)
 
         logger.info("Final test eval: %s", test_results)
     else:
@@ -1105,7 +1179,8 @@ def initialization():
     parser.add_argument('--train-until-patience', action="store_true",
                         help="Train until patience value is reached (--epochs will be ignored in order to stop, but will still be "
                              "used for other actions like LR scheduler)")
-    parser.add_argument('--lm-model-input', help="Encoder-like model input path where the model will be stored")
+    parser.add_argument('--lm-model-input', help="Encoder-like model input path to load the model")
+    parser.add_argument('--lm-model-output', help="Encoder-like model input path where the model will be stored")
     parser.add_argument('--learning-rate', type=float, default=1e-04, help="Classifier learning rate")
     parser.add_argument('--lm-frozen-params', action='store_true', help="Freeze encoder-like model parameters (i.e., do not train)")
     parser.add_argument('--lm-learning-rate', type=float, default=1e-5, help="Encoder-like model learning rate")
@@ -1124,12 +1199,15 @@ def initialization():
     parser.add_argument('--gradient-accumulation', type=int, default=1, help="Gradient accumulation steps")
 #    parser.add_argument('--multiplicative-inverse-temperature-sampling', type=float, default=0.3, help="See https://arxiv.org/pdf/1907.05019 (section 4.2). Default value has been set the one used in the NLLB paper")
     parser.add_argument('--dropout', type=float, default=0.1, help="Dropout applied to the classifier model (embedding, model, and head)")
-    parser.add_argument('--lm-dropout', type=float, default=0.5, help="Dropout applied to the LM")
+    parser.add_argument('--lm-classifier-dropout', type=float, default=0.1, help="Dropout applied to the LM")
     parser.add_argument('--threshold', type=float, default=0.5, help="Threshold to consider a given text to be HT")
     parser.add_argument('--dev-patience-metric', type=str, choices=["acc", "macro_f1"], default="acc", help="Metric to calculate patience using the dev set")
     parser.add_argument('--skip-training-set-during-inference', action="store_true", help="Skip training evaluation during inference to speed up result")
     parser.add_argument('--skip-test-set-eval', action="store_true", help="Skip test evaluation during training or inference")
     parser.add_argument('--data-limit', type=int, default=None, help="Data limit reading in batches (debug purposes)")
+    parser.add_argument('--lm-ensemble-approach', action="store_true", help="When LM is provided, a multi-task learning approach is applied instead of concatenation of layers")
+    parser.add_argument('--loss-weight', type=float, default=1.0, help="Classifier loss weight")
+    parser.add_argument('--lm-ensemble-loss-weight', type=float, default=1.0, help="Ensemble learning loss weight")
 
     parser.add_argument('--seed', type=int, default=71213,
                         help="Seed in order to have deterministic results (not fully guaranteed). "
