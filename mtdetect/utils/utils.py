@@ -448,6 +448,7 @@ def get_lr_scheduler(scheduler, optimizer, *args, **kwargs):
 
 def get_lr_scheduler_and_optimizer_using_argparse_values(optimizer_str, scheduler_str, optimizer_args, lr_scheduler_args, optimizer_args_params, learning_rate, training_steps, training_steps_per_epoch, logger):
     # Expected: optimizer_args and lr_scheduler_args have been processed through argparse using argparse_pytorch_conf
+    # learning_rate: "used when a parameter group doesn't specify them" (class Optimizer: https://pytorch.org/docs/stable/_modules/torch/optim/optimizer.html)
 
     # Get optimizer
     logger.debug("Optimizer args: %s", optimizer_args)

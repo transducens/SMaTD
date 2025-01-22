@@ -1206,7 +1206,7 @@ def main(args):
 
             nn.init.xavier_normal_(vision_model_state_dict["fc1.weight"])
 
-            vision_model_state_dict["fc1.bias"] = nn.Parameter(fc1_bias, requires_grad=True)
+            vision_model_state_dict["fc1.bias"] = nn.Parameter(fc1_bias, requires_grad=not model_inference)
             vision_model_state_dict["fc1.weight"][:,:fc1_weight.shape[1]] = fc1_weight.clone().detach()
 
             vision_model_state_dict["fc1.weight"].requires_grad_(not model_inference)

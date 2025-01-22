@@ -36,10 +36,16 @@ source_lang_token = src_lang
 target_lang_token = trg_lang
 
 # Load model
+tokenizer_kwargs = {}
+
+if "nllb-200" in pretrained_model:
+    tokenizer_kwargs["src_lang"] = src_lang
+    tokenizer_kwargs["trg_lang"] = trg_lang
+
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model = transformers.AutoModelForSeq2SeqLM.from_pretrained(pretrained_model)
 model = model.to(device).eval()
-tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model, src_lang=src_lang, tgt_lang=trg_lang)
+tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model, **tokenizer_kwargs)
 max_length = model.config.max_length
 max_new_tokens = model.generation_config.max_length
 eos_token_token = tokenizer.convert_ids_to_tokens(model.generation_config.eos_token_id)
@@ -313,8 +319,13 @@ if __name__ == "__main__":
             _trg = normalizer.get_clean_sentence(_trg)
 
         src, trg = (_src, _trg) if direction == "src2trg" else (_trg, _src)
-        src = f"{source_lang_token} {src}{eos_token_token}"
-        trg = f"{decoder_start_token_token}{target_lang_token} {trg}{eos_token_token}"
+
+        if "nllb-200" in pretrained_model:
+            src = f"{source_lang_token} {src}{eos_token_token}"
+            trg = f"{decoder_start_token_token}{target_lang_token} {trg}{eos_token_token}"
+        else:
+            src = f"{src}{eos_token_token}"
+            trg = f"{decoder_start_token_token} {trg}{eos_token_token}"
 
         all_src.append(src)
         all_trg.append(trg)

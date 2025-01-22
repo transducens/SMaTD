@@ -10,7 +10,7 @@ import transformers
 target_lang = sys.argv[1] # e.g., ha (check https://huggingface.co/google/madlad400-10b-mt/discussions/2)
 batch_size = int(sys.argv[2]) if len(sys.argv) > 2 and len(sys.argv[2]) > 0 else 16
 pretrained_model = sys.argv[3] if len(sys.argv) > 3 else "google/madlad400-3b-mt"
-beam_size = int(sys.argv[4]) if len(sys.argv) > 4 and len(sys.argv[4]) > 0 else 1
+beam_size = int(sys.argv[4]) if len(sys.argv) > 4 and len(sys.argv[4]) > 0 else 4
 
 assert batch_size > 0, batch_size
 assert beam_size > 0, beam_size
