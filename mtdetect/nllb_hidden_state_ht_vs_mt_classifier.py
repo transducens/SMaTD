@@ -35,6 +35,9 @@ class StochasticDepth(nn.Module):
     def forward(self, t):
         survival_rate = 1.0 - self.p
 
+        if not self.training or self.p == 0.0:
+            return t
+
         if self.mode == "row":
             size = [t.shape[0]] + [1] * (t.ndim - 1)
         elif self.mode == "batch":
@@ -961,7 +964,7 @@ def main(args):
             current_patience = 0
             early_stopping_best_result_dev = early_stopping_metric_dev
 
-            if save_model_path or lm_model_output:
+            if save_model_path or (lm_model_output and lang_model is not None):
                 logger.info("Saving best model: %s (LM: %s)", save_model_path, lm_model_output)
 
             if save_model_path:
@@ -1161,16 +1164,24 @@ def main(args):
         epoch += 1
         do_training = epoch < epochs or train_until_patience
 
-    if not do_inference and save_model_path:
-        logger.info("Loading best model: %s", save_model_path)
+    if not do_inference:
+        if save_model_path or (lm_model_output and lang_model is not None):
+            logger.info("Loading best model: %s (LM: %s)", save_model_path, lm_model_output)
 
-        model_state_dict = torch.load(save_model_path, weights_only=True, map_location=device)
+        if save_model_path:
+            model_state_dict = torch.load(save_model_path, weights_only=True, map_location=device)
 
-        assert model.state_dict().keys() == model_state_dict.keys()
+            assert model.state_dict().keys() == model_state_dict.keys()
 
-        model.load_state_dict(model_state_dict)
+            model.load_state_dict(model_state_dict)
 
-        model = model.to(device)
+            model = model.eval()
+            model = model.to(device)
+
+        if lm_model_output and lang_model is not None:
+            lang_model, lang_model_tokenizer = load_model(lm_model_output, lm_pretrained_model, None, classifier_dropout=lm_classifier_dropout_p)
+            lang_model = lang_model.eval()
+            lang_model = lang_model.to(device)
 
     if not model_inference_skip_train:
         train_results = eval(model, translation_model, make_batches(train_data, batch_size, pt_data=train_pickle_data, lm_data=train_lm_data), direction, device, source_lang_token, target_lang_token, decoder_start_token_token, eos_token_token, translation_tokenizer, max_length, max_new_tokens, threshold=threshold, layer=pretrained_model_layer, lang_model=lang_model, lang_model_tokenizer=lang_model_tokenizer, lm_frozen_params=lm_frozen_params, max_length_encoder=max_length_encoder, lm_ensemble_approach=lm_ensemble_approach, debug=debug)
