@@ -19,6 +19,37 @@ import numpy as np
 
 logger = logging.getLogger("mtdetect.nllb_hidden_state_ht_vs_mt_classifier")
 
+class StochasticDepth(nn.Module):
+    # https://arxiv.org/abs/1603.09382
+    # https://pytorch.org/vision/main/generated/torchvision.ops.stochastic_depth.html
+
+    def __init__(self, p, mode="row"):
+        super().__init__()
+
+        assert p >= 0.0 and p <= 1.0
+        assert mode in ("row", "batch"), mode
+
+        self.p = p
+        self.mode = mode
+
+    def forward(self, t):
+        survival_rate = 1.0 - self.p
+
+        if self.mode == "row":
+            size = [t.shape[0]] + [1] * (t.ndim - 1)
+        elif self.mode == "batch":
+            size = [1] * t.ndim
+        else:
+            raise Exception(f"Unknown mode: {self.mode}")
+
+        noise = torch.empty(size, dtype=t.dtype, device=t.device)
+        noise = noise.bernoulli_(survival_rate)
+
+        if survival_rate > 0.0:
+            noise.div_(survival_rate)
+
+        return t * noise
+
 class PositionalEncoding(nn.Module):
 
     def __init__(self, d_model, dropout=0.1, max_seq_len=512):
@@ -40,7 +71,8 @@ class PositionalEncoding(nn.Module):
 class TransformerModel(nn.Module):
 
     def __init__(self, d_model, nhead, dim_feedforward, nlayers, projection_in=None, max_seq_len=512, embedding_dropout=0.5, dropout_p=0.5, classifier_dropout_p=0.5, lm_classifier_dropout_p=0.5,
-                 num_labels=1, initial_layer_norm=False, initial_layer_norm_first=False, lm_projection_in=None, lang_model=None, debug_labels=False):
+                 num_labels=1, initial_layer_norm=False, initial_layer_norm_first=False, lm_projection_in=None, lang_model=None, debug_labels=False,
+                 lm_ensemble_approach='', lm_stochastic_depth=0.0):
         super(TransformerModel, self).__init__()
 
         initial_dim = d_model if projection_in is None else projection_in
@@ -50,7 +82,7 @@ class TransformerModel(nn.Module):
         self.pos_encoder = PositionalEncoding(d_model, embedding_dropout, max_seq_len=max_seq_len)
         encoder_layers = torch.nn.TransformerEncoderLayer(d_model, nhead, batch_first=True, dim_feedforward=dim_feedforward, dropout=dropout_p, norm_first=False) #, activation="gelu", layer_norm_eps=1e-12)
         self.projection = None if projection_in is None else nn.Linear(projection_in, d_model)
-        #self.lm_projection = None if lm_projection_in is None else nn.Linear(lm_projection_in, d_model)
+        self.lm_projection = nn.Linear(lm_projection_in, d_model) if lm_projection_in is not None and lm_ensemble_approach == "token" else None
         self.transformer_encoder = torch.nn.TransformerEncoder(encoder_layers, nlayers)
         self.d_model = d_model
         self.initializer_range = 0.02
@@ -58,9 +90,11 @@ class TransformerModel(nn.Module):
         self.pooler = nn.Linear(d_model, d_model) # https://github.com/huggingface/transformers/blob/5523e38b553ff6c46b04d2376870fcd842feeecc/src/transformers/models/bert/modeling_bert.py#L737
         self.pooler_activation = nn.Tanh()
         self.classifier_dropout = nn.Dropout(classifier_dropout_p)
-        self.classifier = nn.Linear(d_model + (lm_projection_in if lm_projection_in is not None else 0) + (1 if debug_labels else 0), num_labels)
+        self.classifier = nn.Linear(d_model + (lm_projection_in if lm_projection_in is not None and lm_ensemble_approach == "classifier" else 0) + (1 if debug_labels else 0), num_labels)
         self.lm_projection_in = lm_projection_in
         self.lm_classifier_dropout = nn.Dropout(lm_classifier_dropout_p)
+        self.lm_ensemble_approach = lm_ensemble_approach
+        self.lm_classifier_stochastic_depth = StochasticDepth(lm_stochastic_depth)
 
         self.init_weights()
 
@@ -101,18 +135,28 @@ class TransformerModel(nn.Module):
         assert len(src.shape) == 3
 
         if lm_src is not None:
+            assert self.lm_ensemble_approach != "independent"
             assert mask is None, "Not supported"
-            #assert self.lm_projection is not None
 
-            #lm_src = self.lm_projection(lm_src)
+            lm_src = self.lm_classifier_stochastic_depth(lm_src)
+            lm_src = self.lm_classifier_dropout(lm_src)
+
+            if self.lm_ensemble_approach == "token":
+                assert self.lm_projection is not None
+
+                lm_src = self.lm_projection(lm_src)
 
             assert len(lm_src.shape) == 2
             assert src.shape[0] == lm_src.shape[0]
-            #assert src.shape[2] == lm_src.shape[1]
-            assert self.lm_projection_in == lm_src.shape[1]
 
-            #lm_src = lm_src.unsqueeze(1)
-            #src = torch.cat((lm_src, src), dim=1) # add lm_src as a "new" token in the first position
+            if self.lm_ensemble_approach == "classifier":
+                assert self.lm_projection_in == lm_src.shape[1]
+
+            if self.lm_ensemble_approach == "token":
+                assert src.shape[2] == lm_src.shape[1]
+
+                lm_src = lm_src.unsqueeze(1)
+                src = torch.cat((lm_src, src), dim=1) # add lm_src as a "new" token in the first position
 
         src = self.pos_encoder(src)
         output = self.transformer_encoder(src, mask=mask)
@@ -125,13 +169,12 @@ class TransformerModel(nn.Module):
         output = self.pooler_activation(output)
         output = self.classifier_dropout(output)
 
-        if lm_src is not None:
+        if lm_src is not None and self.lm_ensemble_approach == "classifier":
             assert lm_src.shape[1] + output.shape[1] == self.d_model + self.lm_projection_in
 
             #output.zero_() # TODO remove (debug)
             #lm_src.zero_() # TODO remove (debug)
 
-            lm_src = self.lm_classifier_dropout(lm_src)
             output = torch.cat((lm_src, output), dim=1)
 
         if debug_labels is not None:
@@ -397,7 +440,7 @@ def apply_inference(model, data, mask=None, target=None, loss_function=None, thr
 
 def eval(model, translation_model, data_generator, direction, device, source_lang_token, target_lang_token, decoder_start_token_token, eos_token_token, translation_tokenizer,
          max_length, max_new_tokens, print_result=False, print_desc='-', threshold=0.5, layer=-1, lang_model=None, lang_model_tokenizer=None, lm_frozen_params=False, max_length_encoder=512,
-         lm_ensemble_approach=False, debug=False):
+         lm_ensemble_approach='', debug=False):
     assert not print_result, "Code not working"
 
     training = model.training
@@ -445,12 +488,12 @@ def eval(model, translation_model, data_generator, direction, device, source_lan
                 data_lm = classifier_token.to(device)
 
         target = torch.tensor(labels).to(device)
-        results = apply_inference(model, data, target=None, loss_function=None, threshold=threshold, loss_apply_sigmoid=False, data_lm=data_lm if not lm_ensemble_approach else None) #, debug_labels=target if debug else None)
+        results = apply_inference(model, data, target=None, loss_function=None, threshold=threshold, loss_apply_sigmoid=False, data_lm=data_lm if lm_ensemble_approach != "independent" else None) #, debug_labels=target if debug else None)
         outputs_classification = results["outputs_classification_detach_list"]
         outputs = results["outputs"]
         outputs = torch.sigmoid(outputs).cpu().detach().tolist()
 
-        if lm_ensemble_approach:
+        if lm_ensemble_approach == "independent" and lang_model:
             assert data_lm is not None
             assert hasattr(lang_model, "classifier")
 
@@ -643,9 +686,7 @@ def main(args):
     lm_ensemble_approach = args.lm_ensemble_approach
     lm_ensemble_loss_weight = args.lm_ensemble_loss_weight
     loss_weight = args.loss_weight
-
-    if lm_ensemble_approach:
-        assert lm_pretrained_model, "LM is mandatory to apply ensemble learning"
+    lm_stochastic_depth = args.lm_stochastic_depth
 
     if lm_pretrained_model:
         logger.info("LM is going to be used: %s (local file: %s)", lm_pretrained_model, lm_model_input)
@@ -768,8 +809,8 @@ def main(args):
     #logger.info("Projection: %d * %d + %d = %s -> %d", max(n_pickle_files, 1), translation_model.config.d_model, projection_in[1], " + ".join(map(str, projection_in)), d_model)
     logger.info("Projection for the MT model: %d * %d = %d -> %d", max(n_pickle_files, 1), translation_model.config.d_model, projection_in, d_model)
 
-    #if lang_model:
-    #    logger.info("Projection for the LM: %d -> %d", lm_projection_in, d_model)
+    if lang_model and lm_ensemble_approach == "token":
+        logger.info("Projection for the LM: %d -> %d", lm_projection_in, d_model)
 
     #projection_in = sum(projection_in)
 
@@ -797,8 +838,9 @@ def main(args):
                              projection_in=projection_in, max_seq_len=max_seq_len,
                              embedding_dropout=dropout_p, dropout_p=dropout_p, classifier_dropout_p=dropout_p,
                              lm_classifier_dropout_p=lm_classifier_dropout_p, initial_layer_norm=False,
-                             lm_projection_in=lm_projection_in if not lm_ensemble_approach else None,
-                             lang_model=lang_model if lang_model and not lm_frozen_params and not lm_ensemble_approach else None,
+                             lm_projection_in=lm_projection_in if lm_ensemble_approach != "independent" else None,
+                             lang_model=lang_model if lang_model and not lm_frozen_params and lm_ensemble_approach != "independent" else None,
+                             lm_ensemble_approach=lm_ensemble_approach, lm_stochastic_depth=lm_stochastic_depth,
                             )
 #                             debug_labels=True if debug else False)
 
@@ -1003,7 +1045,7 @@ def main(args):
                     data_lm = classifier_token.to(device)
 
             target = torch.tensor(labels).to(device)
-            result = apply_inference(model, data, target=target, loss_function=loss_function, loss_apply_sigmoid=loss_apply_sigmoid, threshold=threshold, data_lm=data_lm if not lm_ensemble_approach else None) #, debug_labels=target if debug else None)
+            result = apply_inference(model, data, target=target, loss_function=loss_function, loss_apply_sigmoid=loss_apply_sigmoid, threshold=threshold, data_lm=data_lm if lm_ensemble_approach != "independent" else None) #, debug_labels=target if debug else None)
             _loss = result["loss"]
             _loss *= loss_weight
             loss_elements1 += _loss.numel()
@@ -1012,7 +1054,7 @@ def main(args):
 
             final_loss1 += torch.sum(_loss).cpu().detach().item()
 
-            if lm_ensemble_approach:
+            if lm_ensemble_approach == "independent" and lang_model:
                 assert data_lm is not None
                 assert hasattr(lang_model, "classifier")
 
@@ -1045,8 +1087,8 @@ def main(args):
                 assert final_loss is not None
 
                 loss = final_loss / (loss_elements1 + loss_elements2)
-                loss1 = final_loss1 / loss_elements1
-                loss2 = final_loss2 / loss_elements2
+                loss1 = final_loss1 / (loss_elements1 if loss_elements1 > 0. else 1.)
+                loss2 = final_loss2 / (loss_elements2 if loss_elements2 > 0. else 1.)
                 final_loss = None
                 loss_elements1 = 0
                 loss_elements2 = 0
@@ -1094,7 +1136,7 @@ def main(args):
 
                 logger.info("Batch #%d: %s (last %d steps: %s)", batch_idx, sum_loss, log_steps * gradient_accumulation, sum_partial_loss)
 
-                if lm_ensemble_approach:
+                if lm_ensemble_approach == "independent" and lang_model:
                     # sum_loss1 + sum_loss2 may be different to sum_loss because of "/ (loss_elements1 + loss_elements2)"
                     sum_partial_loss1 = sum(epoch_loss1[-1 * log_steps:])
                     sum_loss1 = sum(epoch_loss1)
@@ -1205,9 +1247,14 @@ def initialization():
     parser.add_argument('--skip-training-set-during-inference', action="store_true", help="Skip training evaluation during inference to speed up result")
     parser.add_argument('--skip-test-set-eval', action="store_true", help="Skip test evaluation during training or inference")
     parser.add_argument('--data-limit', type=int, default=None, help="Data limit reading in batches (debug purposes)")
-    parser.add_argument('--lm-ensemble-approach', action="store_true", help="When LM is provided, a multi-task learning approach is applied instead of concatenation of layers")
+    parser.add_argument('--lm-ensemble-approach', type=str, choices=["token", "classifier", "independent"], default="token",
+                        help="When LM is provided, an ensemble learning approach is applied instead of concatenation of layers. "
+                             "token: the first token of the classifier is the LM output. "
+                             "classifier: in the classifier output the result of our classifier and from the LM are combined. "
+                             "independent: final scores are combined.")
     parser.add_argument('--loss-weight', type=float, default=1.0, help="Classifier loss weight")
-    parser.add_argument('--lm-ensemble-loss-weight', type=float, default=1.0, help="Ensemble learning loss weight")
+    parser.add_argument('--lm-ensemble-loss-weight', type=float, default=1.0, help="Ensemble learning loss weight when approach=independent")
+    parser.add_argument('--lm-stochastic-depth', type=float, default=0.0, help="Stochastic depth probability (https://arxiv.org/abs/1603.09382). Randomly disables whole layers at batch level")
 
     parser.add_argument('--seed', type=int, default=71213,
                         help="Seed in order to have deterministic results (not fully guaranteed). "
