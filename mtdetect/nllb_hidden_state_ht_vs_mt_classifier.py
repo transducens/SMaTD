@@ -589,7 +589,6 @@ def load_model(model_input, pretrained_model, device, classifier_dropout=0.1):
 
 pooler_warning = False
 
-# TODO apply_pooler=False ? previous models were not applying the pooler layer
 def get_lang_model_cls_token(batch, lang_model, lang_model_tokenizer, device, max_length_encoder, to_cpu=True, detach=True, apply_pooler=True):
     if not apply_pooler:
         global pooler_warning
@@ -743,7 +742,7 @@ def main(args):
     max_seq_len = max_new_tokens
 
     # LM
-    lang_model, lang_model_tokenizer = load_model(lm_model_input, lm_pretrained_model, None, classifier_dropout=lm_classifier_dropout_p) if lm_pretrained_model else (None, None)
+    lang_model, lang_model_tokenizer = load_model(lm_model_input, lm_pretrained_model, None, classifier_dropout=lm_classifier_dropout_p if lm_stochastic_depth == "independent" else 0.0) if lm_pretrained_model else (None, None)
     max_length_encoder = 512 # TODO use argument
     _max_length_encoder = max_length_encoder
     lang_model_batch_size = train_pickle_data[0].shape[0] # Same batch size as pickle files
@@ -1179,7 +1178,7 @@ def main(args):
             model = model.to(device)
 
         if lm_model_output and lang_model is not None:
-            lang_model, lang_model_tokenizer = load_model(lm_model_output, lm_pretrained_model, None, classifier_dropout=lm_classifier_dropout_p)
+            lang_model, lang_model_tokenizer = load_model(lm_model_output, lm_pretrained_model, None, classifier_dropout=lm_classifier_dropout_p if lm_stochastic_depth == "independent" else 0.0)
             lang_model = lang_model.eval()
             lang_model = lang_model.to(device)
 
