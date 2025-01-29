@@ -708,9 +708,9 @@ def main(args):
     train_data = [] if do_inference and skip_train_eval else read(train_fn, limit=None if limit is None else (limit * batch_size))
     dev_data = read(dev_fn, limit=None if limit is None else (limit * batch_size))
     test_data = [] if do_inference and skip_test_eval else read(test_fn, limit=None if limit is None else (limit * batch_size))
-    train_pickle_data = [] if do_inference and skip_train_eval else read_pickle(train_pickle_fn, k="decoder_last_hidden_state", limit=limit, max_split_size=batch_size) if bool(train_pickle_fn) else None
+    train_pickle_data = [] if bool(train_pickle_fn) and do_inference and skip_train_eval else (read_pickle(train_pickle_fn, k="decoder_last_hidden_state", limit=limit, max_split_size=batch_size) if bool(train_pickle_fn) else None)
     dev_pickle_data = read_pickle(dev_pickle_fn, k="decoder_last_hidden_state", limit=limit, max_split_size=batch_size) if bool(dev_pickle_fn) else None
-    test_pickle_data = [] if do_inference and skip_test_eval else read_pickle(test_pickle_fn, k="decoder_last_hidden_state", limit=limit, max_split_size=batch_size) if bool(test_pickle_fn) else None
+    test_pickle_data = [] if bool(test_pickle_fn) and do_inference and skip_test_eval else (read_pickle(test_pickle_fn, k="decoder_last_hidden_state", limit=limit, max_split_size=batch_size) if bool(test_pickle_fn) else None)
     all_pickle_data_loaded = bool(train_pickle_fn) and bool(dev_pickle_fn) and bool(test_pickle_fn)
 
     logger.info("Train: %d", len(train_data))
