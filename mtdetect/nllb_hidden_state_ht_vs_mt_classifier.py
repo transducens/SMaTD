@@ -75,7 +75,7 @@ class TransformerModel(nn.Module):
 
     def __init__(self, d_model, nhead, dim_feedforward, nlayers, projection_in=None, max_seq_len=512, embedding_dropout=0.5, dropout_p=0.5, classifier_dropout_p=0.5, lm_classifier_dropout_p=0.5,
                  num_labels=1, initial_layer_norm=False, initial_layer_norm_first=False, lm_projection_in=None, lang_model=None, debug_labels=False,
-                 lm_ensemble_approach='', lm_stochastic_depth=0.0):
+                 lm_ensemble_approach='', lm_stochastic_depth=0.0, stochastic_depth=0.0):
         super(TransformerModel, self).__init__()
 
         initial_dim = d_model if projection_in is None else projection_in
@@ -98,6 +98,7 @@ class TransformerModel(nn.Module):
         self.lm_classifier_dropout = nn.Dropout(lm_classifier_dropout_p)
         self.lm_ensemble_approach = lm_ensemble_approach
         self.lm_classifier_stochastic_depth = StochasticDepth(lm_stochastic_depth)
+        self.classifier_stochastic_depth = StochasticDepth(stochastic_depth)
 
         self.init_weights()
 
@@ -136,6 +137,8 @@ class TransformerModel(nn.Module):
             src = self.layer_norm(src) if self.layer_norm is not None else src
 
         assert len(src.shape) == 3
+
+        src = self.classifier_stochastic_depth(src)
 
         if lm_src is not None:
             assert self.lm_ensemble_approach != "independent"
@@ -484,8 +487,6 @@ def eval(model, translation_model, data_generator, direction, device, source_lan
             data_lm = batch_lm.to(device)
         else:
             if lang_model:
-                assert not lm_frozen_params
-
                 batch = [f"{_src}{lang_model_tokenizer.sep_token}{_trg}" for _src, _trg in zip(src, trg)]
                 classifier_token = get_lang_model_cls_token(batch, lang_model, lang_model_tokenizer, device, max_length_encoder, to_cpu=False, detach=True)
                 data_lm = classifier_token.to(device)
@@ -663,7 +664,7 @@ def main(args):
     do_inference = args.inference
     pretrained_model = args.pretrained_model
     pretrained_model_layer = args.pretrained_model_target_layer
-    model_inference_skip_train = args.skip_training_set_during_inference
+    skip_train_eval = args.skip_train_set_eval
     skip_test_eval = args.skip_test_set_eval
     patience = args.patience
     patience_metric = args.dev_patience_metric
@@ -689,6 +690,8 @@ def main(args):
     lm_ensemble_loss_weight = args.lm_ensemble_loss_weight
     loss_weight = args.loss_weight
     lm_stochastic_depth = args.lm_stochastic_depth
+    stochastic_depth = args.stochastic_depth
+    frozen_params = args.frozen_params
 
     if lm_pretrained_model:
         logger.info("LM is going to be used: %s (local file: %s)", lm_pretrained_model, lm_model_input)
@@ -702,12 +705,12 @@ def main(args):
 
     # read data
     n_pickle_files = train_pickle_fn.count(':') + (0 if len(train_pickle_fn) == 0 else 1)
-    train_data = read(train_fn, limit=None if limit is None else (limit * batch_size))
+    train_data = [] if do_inference and skip_train_eval else read(train_fn, limit=None if limit is None else (limit * batch_size))
     dev_data = read(dev_fn, limit=None if limit is None else (limit * batch_size))
-    test_data = read(test_fn, limit=None if limit is None else (limit * batch_size))
-    train_pickle_data = read_pickle(train_pickle_fn, k="decoder_last_hidden_state", limit=limit, max_split_size=batch_size) if bool(train_pickle_fn) else None
+    test_data = [] if do_inference and skip_test_eval else read(test_fn, limit=None if limit is None else (limit * batch_size))
+    train_pickle_data = [] if do_inference and skip_train_eval else read_pickle(train_pickle_fn, k="decoder_last_hidden_state", limit=limit, max_split_size=batch_size) if bool(train_pickle_fn) else None
     dev_pickle_data = read_pickle(dev_pickle_fn, k="decoder_last_hidden_state", limit=limit, max_split_size=batch_size) if bool(dev_pickle_fn) else None
-    test_pickle_data = read_pickle(test_pickle_fn, k="decoder_last_hidden_state", limit=limit, max_split_size=batch_size) if bool(test_pickle_fn) else None
+    test_pickle_data = [] if do_inference and skip_test_eval else read_pickle(test_pickle_fn, k="decoder_last_hidden_state", limit=limit, max_split_size=batch_size) if bool(test_pickle_fn) else None
     all_pickle_data_loaded = bool(train_pickle_fn) and bool(dev_pickle_fn) and bool(test_pickle_fn)
 
     logger.info("Train: %d", len(train_data))
@@ -745,10 +748,9 @@ def main(args):
     lang_model, lang_model_tokenizer = load_model(lm_model_input, lm_pretrained_model, None, classifier_dropout=lm_classifier_dropout_p if lm_stochastic_depth == "independent" else 0.0) if lm_pretrained_model else (None, None)
     max_length_encoder = 512 # TODO use argument
     _max_length_encoder = max_length_encoder
-    lang_model_batch_size = train_pickle_data[0].shape[0] # Same batch size as pickle files
-    train_lm_data = [] if lang_model and lm_frozen_params else None
-    dev_lm_data = [] if lang_model and lm_frozen_params else None
-    test_lm_data = [] if lang_model and lm_frozen_params else None
+    train_lm_data = [] if lang_model and lm_frozen_params and not do_inference else None
+    dev_lm_data = [] if lang_model and lm_frozen_params and not do_inference else None
+    test_lm_data = [] if lang_model and lm_frozen_params and not do_inference else None
 
     if lang_model:
         # Add LM data to inputs
@@ -762,7 +764,9 @@ def main(args):
 
         logger.debug("Max length: %d", max_length_encoder)
 
-        if lm_frozen_params:
+        if lm_frozen_params and not do_inference:
+            lang_model_batch_size = train_pickle_data[0].shape[0] # Same batch size as pickle files
+
             logger.info("LM parameters are frozen: computing embeddings just once")
 
             for desc, data_str, data_pickle, data_lm in (("train", train_data, train_pickle_data, train_lm_data), ("dev", dev_data, dev_pickle_data, dev_lm_data), ("test", test_data, test_pickle_data, test_lm_data)):
@@ -841,8 +845,9 @@ def main(args):
                              embedding_dropout=dropout_p, dropout_p=dropout_p, classifier_dropout_p=dropout_p,
                              lm_classifier_dropout_p=lm_classifier_dropout_p, initial_layer_norm=False,
                              lm_projection_in=lm_projection_in if lm_ensemble_approach != "independent" else None,
-                             lang_model=lang_model if lang_model and not lm_frozen_params and lm_ensemble_approach != "independent" else None,
+                             #lang_model=lang_model if lang_model and not lm_frozen_params and lm_ensemble_approach != "independent" else None,
                              lm_ensemble_approach=lm_ensemble_approach, lm_stochastic_depth=lm_stochastic_depth,
+                             stochastic_depth=stochastic_depth,
                             )
 #                             debug_labels=True if debug else False)
 
@@ -875,7 +880,7 @@ def main(args):
 
         model.load_state_dict(model_state_dict, strict=False)
 
-    if do_inference:
+    if do_inference or frozen_params:
         model = model.eval()
     else:
         model = model.train()
@@ -883,7 +888,7 @@ def main(args):
     model = model.to(device)
 
     for p in model.parameters():
-        p.requires_grad_(not do_inference)
+        p.requires_grad_(not do_inference and not frozen_params)
 
     if lang_model:
         if lm_frozen_params:
@@ -892,7 +897,7 @@ def main(args):
             lang_model.train()
 
         for p in lang_model.parameters():
-            p.requires_grad_(not lm_frozen_params)
+            p.requires_grad_(not do_inference and not lm_frozen_params)
 
     training_steps_per_epoch = len(train_data) // batch_size + (0 if len(train_data) % batch_size == 0 else 1) # number of batches
     training_steps = training_steps_per_epoch * epochs # BE AWARE! "epochs" might be fake due to --train-until-patience
@@ -1182,7 +1187,7 @@ def main(args):
             lang_model = lang_model.eval()
             lang_model = lang_model.to(device)
 
-    if not model_inference_skip_train:
+    if not skip_train_eval:
         train_results = eval(model, translation_model, make_batches(train_data, batch_size, pt_data=train_pickle_data, lm_data=train_lm_data), direction, device, source_lang_token, target_lang_token, decoder_start_token_token, eos_token_token, translation_tokenizer, max_length, max_new_tokens, threshold=threshold, layer=pretrained_model_layer, lang_model=lang_model, lang_model_tokenizer=lang_model_tokenizer, lm_frozen_params=lm_frozen_params, max_length_encoder=max_length_encoder, lm_ensemble_approach=lm_ensemble_approach, debug=debug)
 
         logger.info("Final train eval: %s", train_results)
@@ -1254,7 +1259,7 @@ def initialization():
     parser.add_argument('--lm-classifier-dropout', type=float, default=0.1, help="Dropout applied to the LM")
     parser.add_argument('--threshold', type=float, default=0.5, help="Threshold to consider a given text to be HT")
     parser.add_argument('--dev-patience-metric', type=str, choices=["acc", "macro_f1"], default="acc", help="Metric to calculate patience using the dev set")
-    parser.add_argument('--skip-training-set-during-inference', action="store_true", help="Skip training evaluation during inference to speed up result")
+    parser.add_argument('--skip-train-set-eval', action="store_true", help="Skip training evaluation during training or inference")
     parser.add_argument('--skip-test-set-eval', action="store_true", help="Skip test evaluation during training or inference")
     parser.add_argument('--data-limit', type=int, default=None, help="Data limit reading in batches (debug purposes)")
     parser.add_argument('--lm-ensemble-approach', type=str, choices=["token", "classifier", "independent"], default="token",
@@ -1264,7 +1269,9 @@ def initialization():
                              "independent: final scores are combined.")
     parser.add_argument('--loss-weight', type=float, default=1.0, help="Classifier loss weight")
     parser.add_argument('--lm-ensemble-loss-weight', type=float, default=1.0, help="Ensemble learning loss weight when approach=independent")
-    parser.add_argument('--lm-stochastic-depth', type=float, default=0.0, help="Stochastic depth probability (https://arxiv.org/abs/1603.09382). Randomly disables whole layers at batch level")
+    parser.add_argument('--lm-stochastic-depth', type=float, default=0.0, help="LM stochastic depth probability (https://arxiv.org/abs/1603.09382). Randomly disables whole layers at batch level")
+    parser.add_argument('--stochastic-depth', type=float, default=0.0, help="Stochastic depth probability (https://arxiv.org/abs/1603.09382). Randomly disables whole layers at batch level")
+    parser.add_argument('--frozen-params', action='store_true', help="Freeze classifier parameters (i.e., do not train)")
 
     parser.add_argument('--seed', type=int, default=71213,
                         help="Seed in order to have deterministic results (not fully guaranteed). "
