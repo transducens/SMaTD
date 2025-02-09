@@ -342,8 +342,9 @@ class GroupBalancedSampler(Sampler):
             assert self.group_balanced_n_elements[uniq_group_balanced] >= self.total_elements
             assert self.group_balanced_n_elements[uniq_group_balanced] - initial_n < self.total_elements
 
-            self.group_balanced2groups[uniq_group_balanced] = self.group_balanced2groups[uniq_group_balanced][:self.total_elements] # remove extra (unnecessary) elements
-            self.group_balanced_n_elements[uniq_group_balanced] = len(self.group_balanced2groups[uniq_group_balanced]) # adjust count
+            # The following commented code sets different probability to the data, so we should avoid it
+            #self.group_balanced2groups[uniq_group_balanced] = self.group_balanced2groups[uniq_group_balanced][:self.total_elements] # remove extra (unnecessary) elements
+            #self.group_balanced_n_elements[uniq_group_balanced] = len(self.group_balanced2groups[uniq_group_balanced]) # adjust count
 
         assert len(set(self.group_balanced_n_elements.values())) == 1
         assert list(self.group_balanced_n_elements.values())[0] == self.total_elements
