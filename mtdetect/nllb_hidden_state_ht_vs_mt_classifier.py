@@ -255,30 +255,43 @@ def get_model_last_hidden_state(model, src_inputs, trg_inputs, skip_modules=(), 
 
     return results
 
-def realign_sentences_tensors(sentences, tensors, batch_size):
+def realign_sentences_tensors(sentences, tensors, batch_size, force_batch_level=False):
     realigned_sentences = []
     sentence_index = 0
+    no_tensors = tensors is None or len(tensors) == 0
 
-    if len(sentences) == 0 or len(tensors) == 0:
-        return realigned_sentences
+    assert isinstance(sentences, list)
 
-    for idx, tensor in enumerate(tensors):
-        current_batch_size = tensor.shape[0]
+    if no_tensors:
+        for _ in range((len(sentences) // batch_size) + (0 if len(sentences) % batch_size == 0 else 1)):
+            realigned_sentences.append(sentences[sentence_index:sentence_index + batch_size])
 
-        realigned_sentences.append(sentences[sentence_index:sentence_index + current_batch_size])
+            sentence_index += batch_size
+    else:
+        for idx, tensor in enumerate(tensors):
+            current_batch_size = tensor.shape[0]
 
-        sentence_index += current_batch_size
+            realigned_sentences.append(sentences[sentence_index:sentence_index + current_batch_size])
 
-        if idx + 1 == len(tensors):
-            assert current_batch_size <= batch_size
-        else:
-            assert current_batch_size == batch_size
+            sentence_index += current_batch_size
 
-    assert len(realigned_sentences) == len(tensors)
+            if idx + 1 == len(tensors):
+                assert current_batch_size <= batch_size
+            else:
+                assert current_batch_size == batch_size
+
+        assert len(realigned_sentences) == len(tensors)
+        assert [len(d) for d in realigned_sentences] == [t.shape[0] for t in tensors]
+
+    assert sum([len(d) for d in realigned_sentences]) == len(sentences)
+    assert [d[i] for d in realigned_sentences for i in range(len(d))] == sentences
+
+    if no_tensors and not force_batch_level:
+        return sentences
 
     return realigned_sentences
 
-def read(fn, limit=None, return_groups=False):
+def read(fn, _src_lang, _trg_lang, limit=None, return_groups=False):
     all_fns = fn.split(':')
     #data = {"src": [], "trg": [], "labels": []}
     data = []
@@ -296,8 +309,15 @@ def read(fn, limit=None, return_groups=False):
                 l = l.rstrip("\r\n").split('\t')
                 src, trg, label = l[:3]
                 group = l[3] if len(l) > 3 else str(total_idx)
+                group = group.split(':')[0] # remove "optional" part
                 group_balanced = l[4] if len(l) > 4 else "none"
+                group_balanced = group_balanced.split(':')[0] # remove "optional" part
+                src_lang = l[5] if len(l) > 5 else _src_lang
+                trg_lang = l[6] if len(l) > 6 else _trg_lang
                 label = float(label)
+
+                assert '_' in src_lang, f"{idx}: {src_lang}"
+                assert '_' in trg_lang, f"{idx}: {trg_lang}"
 
                 if len(l) > 4:
                     group_balanced_provided = True
@@ -305,9 +325,9 @@ def read(fn, limit=None, return_groups=False):
                     group_balanced_default += 1
 
                 if return_groups:
-                    data.append((src, trg, label, group, group_balanced))
+                    data.append((src, trg, label, src_lang, trg_lang, group, group_balanced))
                 else:
-                    data.append((src, trg, label))
+                    data.append((src, trg, label, src_lang, trg_lang))
 
                 total_idx += 1
 
@@ -421,6 +441,25 @@ def _read_pickle(fn, k=None, limit=None, max_split_size=None):
 
     return data
 
+def get_all_idxs_from_list(l, v):
+    result = []
+    idx = 0
+
+    assert isinstance(l, list), type(l)
+    assert isinstance(l[0], type(v)), f"{type(l[0])} | {type(v)}"
+
+    while True:
+        try:
+            result.append(l.index(v, idx))
+
+            idx = result[-1] + 1
+        except ValueError:
+            break
+
+    assert l.count(v) == len(result)
+
+    return result
+
 def make_batches(data, bsz, pt_data=None, lm_data=None, temperature_sampling=1, groups=None, groups_balanced=None):
     assert bsz > 0
 
@@ -440,19 +479,23 @@ def make_batches(data, bsz, pt_data=None, lm_data=None, temperature_sampling=1, 
             assert len(groups) == len(groups_balanced)
 
             gp_groups_balanced_aligned_with_uniq_groups = []
-            tmp = set()
+            uniq_groups = []
 
             for idx in range(len(groups)):
                 group = groups[idx]
                 group_balanced = groups_balanced[idx]
 
-                if group not in tmp:
-                    tmp.add(group)
-
+                if group not in uniq_groups:
+                    uniq_groups.append(group)
                     gp_groups_balanced_aligned_with_uniq_groups.append(group_balanced)
 
             assert len(gp_groups_balanced_aligned_with_uniq_groups) == len(uniq_groups)
 
+            _uniq_groups_balanced = set(gp_groups_balanced_aligned_with_uniq_groups)
+
+            assert _uniq_groups_balanced == uniq_groups_balanced
+
+            uniq_groups_balanced = _uniq_groups_balanced
             gp_total_elements = len(uniq_groups)
             gp_pre = {uniq_group_balanced: len(set([group for group, group_balanced in zip(groups, groups_balanced) if group_balanced == uniq_group_balanced])) for uniq_group_balanced in uniq_groups_balanced}
             gp_p = {k: (p / gp_total_elements) ** (1 / temperature_sampling) for k, p in gp_pre.items()}
@@ -487,8 +530,8 @@ def make_batches(data, bsz, pt_data=None, lm_data=None, temperature_sampling=1, 
                 #gp_group_balanced2groups[uniq_group_balanced] = gp_group_balanced2groups[uniq_group_balanced][:gp_total_elements] # remove extra (unnecessary) elements
                 #gp_group_balanced_n_elements[uniq_group_balanced] = len(gp_group_balanced2groups[uniq_group_balanced]) # adjust count
 
-            assert len(set(gp_group_balanced_n_elements.values())) == 1
-            assert list(gp_group_balanced_n_elements.values())[0] == gp_total_elements
+            #assert len(set(gp_group_balanced_n_elements.values())) == 1
+            #assert list(gp_group_balanced_n_elements.values())[0] == gp_total_elements
 
             # code from dataset.py: GroupBalancedSampler.__iter__
 
@@ -505,7 +548,9 @@ def make_batches(data, bsz, pt_data=None, lm_data=None, temperature_sampling=1, 
                 idx = sampled_elements[group_balanced]
                 group = gp_group_balanced2groups[group_balanced][idx]
                 sampled_elements[group_balanced] += 1
-                group_idx = uniq_groups.index(group)
+                # Take the actual indices from all the groups and select randomly
+                group_idxs = get_all_idxs_from_list(groups, group)
+                group_idx = group_idxs[np.random.randint(len(group_idxs))]
 
                 indices.append(group_idx)
 
@@ -514,7 +559,7 @@ def make_batches(data, bsz, pt_data=None, lm_data=None, temperature_sampling=1, 
 
             logger.debug("Group processing: new indices have been created. Sampled elements: %s (total: %s; perc: %s)", sampled_elements, sampled_elements_total, sampled_elements_p)
 
-            assert len(indices) == len(data)
+            assert len(data) == len(indices) + len(data) - gp_total_elements
 
     idx = 0
     batch = []
@@ -546,8 +591,8 @@ def make_batches(data, bsz, pt_data=None, lm_data=None, temperature_sampling=1, 
         assert pt_data is None
         assert lm_data is None
 
-        while idx < len(data):
-            d = data[idx]
+        while idx < len(indices):
+            d = data[indices[idx]]
 
             assert isinstance(d, tuple)
 
@@ -565,7 +610,7 @@ def make_batches(data, bsz, pt_data=None, lm_data=None, temperature_sampling=1, 
 
             batch = []
 
-        assert idx == len(data)
+        assert idx == len(indices)
     else:
         for d in data:
             assert isinstance(d, tuple)
@@ -575,9 +620,9 @@ def make_batches(data, bsz, pt_data=None, lm_data=None, temperature_sampling=1, 
             _bsz = [pt_data[idx].shape[0] if pt_data is not None else None, lm_data[idx].shape[0] if lm_data is not None else None]
             _bsz = set(list(filter(lambda b: b is not None, _bsz)))
 
-            assert len(_bsz) == 1, _bsz
+            assert len(_bsz) in (0, 1), _bsz
 
-            _bsz = list(_bsz)[0]
+            _bsz = list(_bsz)[0] if len(_bsz) == 1 else None
             _bsz = bsz if _bsz is None else _bsz
 
             if len(batch) >= _bsz:
@@ -620,7 +665,7 @@ def apply_inference(model, data, mask=None, target=None, loss_function=None, thr
 
     return results
 
-def eval(model, translation_model, data_generator, direction, device, source_lang_token, target_lang_token, decoder_start_token_token,
+def eval(model, translation_model, data_generator, direction, device, decoder_start_token_token,
          eos_token_token, translation_tokenizer, max_length, max_new_tokens, **kwargs):
     print_result = kwargs["print_result"]
     print_desc = kwargs["print_desc"]
@@ -651,11 +696,14 @@ def eval(model, translation_model, data_generator, direction, device, source_lan
     print_idx = 0
 
     for batch, batch_pt, batch_lm in data_generator:
-        src, trg, labels = list(zip(*batch))[0:3]
+        src, trg, labels, source_lang_token, target_lang_token = list(zip(*batch))[0:5]
         data_lm = None
 
         if direction == "trg2src":
             src, trg = trg, src
+            source_lang_token, target_lang_token = target_lang_token, source_lang_token
+
+        assert len(src) == len(trg) == len(labels) == len(source_lang_token) == len(target_lang_token)
 
         if print_desc == "train" and train_groups_processing:
             assert batch_pt is None
@@ -901,9 +949,9 @@ def main(args):
 
     # read data
     n_pickle_files = train_pickle_fn.count(':') + (0 if len(train_pickle_fn) == 0 else 1)
-    train_data = [] if do_inference and skip_train_eval else read(train_fn, limit=None if limit is None else (limit * batch_size), return_groups=True)
-    dev_data = read(dev_fn, limit=None if limit is None else (limit * batch_size))
-    test_data = [] if do_inference and skip_test_eval else read(test_fn, limit=None if limit is None else (limit * batch_size))
+    train_data = [] if do_inference and skip_train_eval else read(train_fn, _src_lang, _trg_lang, limit=None if limit is None else (limit * batch_size), return_groups=True)
+    dev_data = read(dev_fn, _src_lang, _trg_lang, limit=None if limit is None else (limit * batch_size))
+    test_data = [] if do_inference and skip_test_eval else read(test_fn, _src_lang, _trg_lang, limit=None if limit is None else (limit * batch_size))
     train_pickle_data = [] if bool(train_pickle_fn) and do_inference and skip_train_eval else (read_pickle(train_pickle_fn, concat_layers=concat_layers, k="decoder_last_hidden_state", limit=limit, max_split_size=batch_size) if bool(train_pickle_fn) else None)
     dev_pickle_data = read_pickle(dev_pickle_fn, concat_layers=concat_layers, k="decoder_last_hidden_state", limit=limit, max_split_size=batch_size) if bool(dev_pickle_fn) else None
     test_pickle_data = [] if bool(test_pickle_fn) and do_inference and skip_test_eval else (read_pickle(test_pickle_fn, concat_layers=concat_layers, k="decoder_last_hidden_state", limit=limit, max_split_size=batch_size) if bool(test_pickle_fn) else None)
@@ -921,75 +969,13 @@ def main(args):
     assert len(dev_data) == dev_pickle_data_n
     assert len(test_data) == test_pickle_data_n
 
-    # training set groups
-    train_data_groups = [d[3] for d in train_data]
-    train_data_groups_balanced = [d[4] for d in train_data]
-
-    assert len(train_data_groups) == len(train_data_groups_balanced)
-
-    uniq_train_data_groups = set(train_data_groups)
-    uniq_train_data_groups_balanced = set(train_data_groups_balanced)
-    groups_balanced2group = {group_balanced: [group for group, gb2 in zip(train_data_groups, train_data_groups_balanced) if gb2 == group_balanced] for group_balanced in uniq_train_data_groups_balanced}
-    groups_balanced2uniq_groups = {group_balanced: set(groups_balanced2group[group_balanced]) for group_balanced in uniq_train_data_groups_balanced}
-    train_groups_processing = len(train_data_groups) != len(uniq_train_data_groups) or len(uniq_train_data_groups_balanced) > 1
-
-    if train_groups_processing:
-        assert not bool(train_pickle_fn), "Pickle files are not supported with groups: in-place tensors will be calculated"
-
-    logging.info("Train groups: %d (%d total samples)", len(uniq_train_data_groups), len(train_data))
-    logging.info("Train groups (balanced): %d (%d total samples): groups | uniq groups: %s | %s",
-                 len(uniq_train_data_groups_balanced), len(train_data),
-                 ' '.join([f"{k}:{len(v)}" for k, v in groups_balanced2group.items()]),
-                 ' '.join([f"{k}:{len(v)}" for k, v in groups_balanced2uniq_groups.items()]))
-
-    # variables
-    src_lang, trg_lang = (_src_lang, _trg_lang) if direction == "src2trg" else (_trg_lang, _src_lang)
-    source_lang_token = src_lang
-    target_lang_token = trg_lang
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    dim_feedforward = 2048
-
-    # translation model
-    translation_tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model, src_lang=src_lang, tgt_lang=trg_lang)
-    translation_model = transformers.AutoModelForSeq2SeqLM.from_pretrained(pretrained_model)
-    translation_model = translation_model.to(device if not all_pickle_data_loaded else "cpu").eval()
-    max_length = min(translation_model.config.max_length, max_length_tokens)
-    max_new_tokens = min(translation_model.generation_config.max_length, max_length_tokens)
-    eos_token_token = translation_tokenizer.convert_ids_to_tokens(translation_model.generation_config.eos_token_id)
-    decoder_start_token_token = translation_tokenizer.convert_ids_to_tokens(translation_model.generation_config.decoder_start_token_id)
-    max_seq_len = max_new_tokens
-
-    # sanity-check
-    projection_in = max(n_pickle_files, 1) * translation_model.config.d_model if concat_layers else translation_model.config.d_model # 1024 for facebook/nllb-200-distilled-600M
-
-    for idx, (_p, _d) in enumerate(((train_pickle_data, train_data), (dev_pickle_data, dev_data), (test_pickle_data, test_data))):
-        assert isinstance(_d, list), type(_d)
-        assert isinstance(_d[0], tuple), type(_d[0])
-        assert isinstance(_d[0][0], str), type(_d[0][0])
-
-        if _p:
-            assert isinstance(_p, list), type(_p)
-
-            s = 0
-
-            for idx2, d in enumerate(_p, 1):
-                assert isinstance(d, torch.Tensor), type(d)
-                assert d.shape[-1] == projection_in, f"{d.shape}[-1] vs {projection_in}"
-
-                if idx2 == len(_p):
-                    assert d.shape[0] <= batch_size
-                else:
-                    assert d.shape[0] == batch_size
-
-                s += d.shape[0]
-
-            assert s == len(_d), f"{idx}: {s} vs {len(_d)}"
-
     # shuffle training set (batch-level if pickle files are loaded)
     assert isinstance(train_data, list), type(train_data)
-    assert isinstance(train_pickle_data, list), type(train_pickle_data)
 
-    train_data = realign_sentences_tensors(train_data, train_pickle_data, batch_size) # create batches (if pickle data is loaded)
+    if bool(train_pickle_fn):
+        assert isinstance(train_pickle_data, list), type(train_pickle_data)
+
+    train_data = realign_sentences_tensors(train_data, train_pickle_data, batch_size, force_batch_level=False) # create batches (if pickle data is loaded)
     train_idxs = [idx for idx in range(len(train_data))]
 
     random.shuffle(train_idxs)
@@ -1002,13 +988,115 @@ def main(args):
         if bool(train_pickle_fn):
             train_pickle_data[idx1], train_pickle_data[idx2] = train_pickle_data[idx2].clone(), train_pickle_data[idx1].clone() # .clone() because in-place swapping doesn't work in pytorch: it smashes previous values
 
+    min_bsz_idx = None
+    min_bsz = None
+
     if bool(train_pickle_fn):
+        all_bsz = [len(d) for d in train_data]
+        all_bsz_pickle = [t.shape[0] for t in train_pickle_data]
+
+        assert len(all_bsz) == len(all_bsz_pickle)
+        assert all_bsz == all_bsz_pickle
+
+        all_bsz_count = {k: all_bsz.count(k) for k in set(all_bsz)}
+
+        assert len(all_bsz_count) in (1, 2), all_bsz_count
+        assert batch_size in all_bsz_count.keys()
+
+        if len(all_bsz_count) == 2:
+            all_bsz_count_keys = list(all_bsz_count.keys())
+
+            all_bsz_count_keys.remove(batch_size)
+
+            assert len(all_bsz_count_keys) == 1
+            assert all_bsz_count[all_bsz_count_keys[0]] == 1
+
+            min_bsz = all_bsz_count_keys[0]
+            min_bsz_idx = all_bsz.index(min_bsz)
+        else:
+            min_bsz = batch_size
+            min_bsz_idx = len(train_data) - 1
+
         # batch-size -> flat (expected format)
         train_data = [d[i] for d in train_data for i in range(len(d))]
 
     assert isinstance(train_data, list), type(train_data)
     assert isinstance(train_data[0], tuple), type(train_data[0])
     assert isinstance(train_data[0][0], str), type(train_data[0][0])
+
+    # training set groups
+    train_data_groups = [d[5] for d in train_data]
+    train_data_groups_balanced = [d[6] for d in train_data]
+
+    assert len(train_data_groups) == len(train_data_groups_balanced)
+
+    uniq_train_data_groups = set(train_data_groups)
+    uniq_train_data_groups_balanced = set(train_data_groups_balanced)
+    groups_balanced2group = {group_balanced: [group for group, gb2 in zip(train_data_groups, train_data_groups_balanced) if gb2 == group_balanced] for group_balanced in uniq_train_data_groups_balanced}
+    groups_balanced2uniq_groups = {group_balanced: set(groups_balanced2group[group_balanced]) for group_balanced in uniq_train_data_groups_balanced}
+    train_groups_processing = len(train_data_groups) != len(uniq_train_data_groups) or len(uniq_train_data_groups_balanced) > 1
+
+    if train_groups_processing:
+        assert not bool(train_pickle_fn), "Pickle files are not supported with groups: in-place tensors will be calculated"
+
+        min_bsz = len(uniq_train_data_groups) % batch_size
+        min_bsz = batch_size if min_bsz == 0 else min_bsz
+        min_bsz_idx = (len(uniq_train_data_groups) - 1) // batch_size
+
+    logger.info("Train groups: %d (%d total samples)", len(uniq_train_data_groups), len(train_data))
+    logger.info("Train groups (balanced): %d (%d total samples): groups | uniq groups: %s | %s",
+                len(uniq_train_data_groups_balanced), len(train_data),
+                ' '.join([f"{k}:{len(v)}" for k, v in groups_balanced2group.items()]),
+                ' '.join([f"{k}:{len(v)}" for k, v in groups_balanced2uniq_groups.items()]))
+
+    # variables
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dim_feedforward = 2048
+
+    # translation model
+    translation_tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model)
+    translation_model = transformers.AutoModelForSeq2SeqLM.from_pretrained(pretrained_model)
+    translation_model = translation_model.to(device if not all_pickle_data_loaded else "cpu").eval()
+    max_length = min(translation_model.config.max_length, max_length_tokens)
+    max_new_tokens = min(translation_model.generation_config.max_length, max_length_tokens)
+    eos_token_token = translation_tokenizer.convert_ids_to_tokens(translation_model.generation_config.eos_token_id)
+    decoder_start_token_token = translation_tokenizer.convert_ids_to_tokens(translation_model.generation_config.decoder_start_token_id)
+    max_seq_len = max_new_tokens
+
+    # sanity-check
+    projection_in = max(n_pickle_files, 1) * translation_model.config.d_model if concat_layers else translation_model.config.d_model # 1024 for facebook/nllb-200-distilled-600M
+
+    for idx, (desc, _p, _d) in enumerate((("train", train_pickle_data, train_data), ("dev", dev_pickle_data, dev_data), ("test", test_pickle_data, test_data))):
+        assert isinstance(_d, list), type(_d)
+        assert isinstance(_d[0], tuple), type(_d[0])
+        assert isinstance(_d[0][0], str), type(_d[0][0])
+
+        if _p:
+            assert isinstance(_p, list), type(_p)
+
+            s = 0
+
+            for idx2, d in enumerate(_p):
+                assert isinstance(d, torch.Tensor), type(d)
+                assert d.shape[-1] == projection_in, f"{d.shape}[-1] vs {projection_in}"
+
+                if desc == "train":
+                    if idx2 == min_bsz_idx:
+                        assert d.shape[0] == min_bsz, f"{min_bsz} {min_bsz_idx} {d.shape}"
+                    else:
+                        assert d.shape[0] == batch_size
+                else:
+                    if idx2 + 1 == len(_p):
+                        _bsz = len(_d) % batch_size
+                        _bsz = batch_size if _bsz == 0 else _bsz
+
+                        assert d.shape[0] == _bsz
+                    else:
+                        assert d.shape[0] == batch_size
+
+                s += d.shape[0]
+
+            assert s == len(_d), f"{idx}: {s} vs {len(_d)}"
 
     # LM
     lang_model, lang_model_tokenizer = load_model(lm_model_input, lm_pretrained_model, None, classifier_dropout=lm_classifier_dropout_p if lm_stochastic_depth == "independent" else 0.0) if lm_pretrained_model else (None, None)
@@ -1213,7 +1301,7 @@ def main(args):
 
         logger.info("Epoch #%d", epoch + 1)
 
-        dev_results = eval(model, translation_model, make_batches(dev_data, batch_size, pt_data=dev_pickle_data, lm_data=dev_lm_data), direction, device, source_lang_token, target_lang_token, decoder_start_token_token, eos_token_token, translation_tokenizer, max_length, max_new_tokens, print_desc="dev", **eval_kwargs)
+        dev_results = eval(model, translation_model, make_batches(dev_data, batch_size, pt_data=dev_pickle_data, lm_data=dev_lm_data), direction, device, decoder_start_token_token, eos_token_token, translation_tokenizer, max_length, max_new_tokens, print_desc="dev", **eval_kwargs)
 
         if len(epoch_loss) > 0 and sum_epoch_loss < early_stopping_best_loss:
             logger.info("Better loss result: %s -> %s", early_stopping_best_loss, sum_epoch_loss)
@@ -1258,14 +1346,19 @@ def main(args):
         loss_elements2 = 0
 
         for batch_idx, (batch, batch_pt, batch_lm) in enumerate(make_batches(train_data, batch_size, pt_data=train_pickle_data, lm_data=train_lm_data, temperature_sampling=temperature_sampling, groups=train_data_groups, groups_balanced=train_data_groups_balanced), 1):
-            src, trg, labels = list(zip(*batch))[0:3]
+            src, trg, labels, source_lang_token, target_lang_token = list(zip(*batch))[0:5]
             data_lm = None
 
             if direction == "trg2src":
                 src, trg = trg, src
+                source_lang_token, target_lang_token = target_lang_token, source_lang_token
 
-            assert len(src) == len(trg) == len(labels)
-            assert len(src) <= batch_size, f"{len(src)} vs {batch_size}"
+            assert len(src) == len(trg) == len(labels) == len(source_lang_token) == len(target_lang_token)
+
+            if batch_idx - 1 == min_bsz_idx:
+                assert len(src) == min_bsz, f"{len(src)} vs {min_bsz}"
+            else:
+                assert len(src) == batch_size, f"{len(src)} vs {batch_size}"
 
             if train_groups_processing:
                 assert batch_lm is None
@@ -1450,18 +1543,18 @@ def main(args):
             lang_model = lang_model.to(device)
 
     if not skip_train_eval:
-        train_results = eval(model, translation_model, make_batches(train_data, batch_size, pt_data=train_pickle_data, lm_data=train_lm_data), direction, device, source_lang_token, target_lang_token, decoder_start_token_token, eos_token_token, translation_tokenizer, max_length, max_new_tokens, print_desc="train", **eval_kwargs)
+        train_results = eval(model, translation_model, make_batches(train_data, batch_size, pt_data=train_pickle_data, lm_data=train_lm_data), direction, device, decoder_start_token_token, eos_token_token, translation_tokenizer, max_length, max_new_tokens, print_desc="train", **eval_kwargs)
 
         logger.info("Final train eval%s: %s", " (warning: all training data has been evaluated regarless the group configuration)" if train_groups_processing else '', train_results)
     else:
         logger.info("Final train eval: skip")
 
-    dev_results = eval(model, translation_model, make_batches(dev_data, batch_size, pt_data=dev_pickle_data, lm_data=dev_lm_data), direction, device, source_lang_token, target_lang_token, decoder_start_token_token, eos_token_token, translation_tokenizer, max_length, max_new_tokens, print_desc="dev", **eval_kwargs)
+    dev_results = eval(model, translation_model, make_batches(dev_data, batch_size, pt_data=dev_pickle_data, lm_data=dev_lm_data), direction, device, decoder_start_token_token, eos_token_token, translation_tokenizer, max_length, max_new_tokens, print_desc="dev", **eval_kwargs)
 
     logger.info("Final dev eval: %s", dev_results)
 
     if not skip_test_eval:
-        test_results = eval(model, translation_model, make_batches(test_data, batch_size, pt_data=test_pickle_data, lm_data=test_lm_data), direction, device, source_lang_token, target_lang_token, decoder_start_token_token, eos_token_token, translation_tokenizer, max_length, max_new_tokens, print_desc="test", **eval_kwargs)
+        test_results = eval(model, translation_model, make_batches(test_data, batch_size, pt_data=test_pickle_data, lm_data=test_lm_data), direction, device, decoder_start_token_token, eos_token_token, translation_tokenizer, max_length, max_new_tokens, print_desc="test", **eval_kwargs)
 
         logger.info("Final test eval: %s", test_results)
     else:

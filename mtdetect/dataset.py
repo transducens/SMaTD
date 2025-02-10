@@ -346,8 +346,8 @@ class GroupBalancedSampler(Sampler):
             #self.group_balanced2groups[uniq_group_balanced] = self.group_balanced2groups[uniq_group_balanced][:self.total_elements] # remove extra (unnecessary) elements
             #self.group_balanced_n_elements[uniq_group_balanced] = len(self.group_balanced2groups[uniq_group_balanced]) # adjust count
 
-        assert len(set(self.group_balanced_n_elements.values())) == 1
-        assert list(self.group_balanced_n_elements.values())[0] == self.total_elements
+        #assert len(set(self.group_balanced_n_elements.values())) == 1
+        #assert list(self.group_balanced_n_elements.values())[0] == self.total_elements
 
         set_data = {k: set(v) for k, v in self.group_balanced2groups.items()}
         list_uniq_groups_balanced = list(self.uniq_groups_balanced)
@@ -541,15 +541,9 @@ def tokenize_batch_from_iterator(iterator, tokenizer, batch_size, f=None, ignore
 
         src_url, trg_url, label = f(url[0]), f(url[1]), int(url[2])
         group = url[3] if len(url) > 3 else str(idx)
-        group_data = group.split(':')
-        group = group_data[0] # remove "optional" part of the group
-        group_balanced = "none"
-
-        if len(group_data) > 1:
-            group_data_balanced = ':'.join(group_data[1:]) # get the "other" group to balance different datasets from the "optional" part of the group
-
-            if '#' in group_data_balanced:
-                group_balanced = group_data_balanced.split('#')[-1]
+        group = group.split(':')[0] # remove "optional" part
+        group_balanced = url[4] if len(url) > 4 else "none"
+        group_balanced = group_balanced.split(':')[0] # remove "optional" part
 
         if isinstance(src_url, list):
             assert len(src_url) == 1, src_url
