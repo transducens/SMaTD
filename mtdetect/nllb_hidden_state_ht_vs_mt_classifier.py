@@ -678,6 +678,8 @@ def eval(model, translation_model, data_generator, direction, device, decoder_st
     lm_ensemble_approach = kwargs["lm_ensemble_approach"]
     debug = kwargs["debug"]
     train_groups_processing = kwargs["train_groups_processing"]
+    pt_data_update = kwargs["pt_data_update"] if "pt_data_update" in kwargs else None
+    lm_data_update = kwargs["lm_data_update"] if "lm_data_update" in kwargs else None
 
     assert not print_result, "Code not working"
 
@@ -694,10 +696,19 @@ def eval(model, translation_model, data_generator, direction, device, decoder_st
     all_outputs = []
     all_labels = []
     print_idx = 0
+    data_generator_hash = 0
+    data_generator_hash_pt = 0
+    data_generator_hash_lm = 0
 
     for batch, batch_pt, batch_lm in data_generator:
         src, trg, labels, source_lang_token, target_lang_token = list(zip(*batch))[0:5]
         data_lm = None
+
+        data_generator_hash += [hash(s) for s in src]
+        data_generator_hash += [hash(s) for s in trg]
+        data_generator_hash += [hash(s) for s in labels]
+        data_generator_hash += [hash(s) for s in source_lang_token]
+        data_generator_hash += [hash(s) for s in target_lang_token]
 
         if direction == "trg2src":
             src, trg = trg, src
@@ -715,20 +726,44 @@ def eval(model, translation_model, data_generator, direction, device, decoder_st
             src_inputs = preprocess(src, translation_tokenizer, device, max_length)
             trg_inputs = preprocess(trg, translation_tokenizer, device, max_new_tokens)
             translation_output = get_model_last_hidden_state(translation_model, src_inputs, trg_inputs, skip_modules=("encoder",), to_cpu=False, layer=layer)
-            data = translation_output["decoder_last_hidden_state"].to(device)
+            data = translation_output["decoder_last_hidden_state"]
+
+            if pt_data_update is not None:
+                # Assumption: no shuffle will be performed on the given data in the rest of the execution
+                assert isinstance(pt_data_update, list)
+
+                pt_data_update.append(data)
+
+            data_generator_hash_pt += hash(data)
+
+            data = data.to(device)
         else:
+            data_generator_hash_pt += hash(batch_pt)
+
             data = batch_pt.to(device)
 
         if batch_lm is not None:
             assert lang_model is not None
             assert lm_frozen_params
 
+            data_generator_hash_lm += hash(batch_lm)
+
             data_lm = batch_lm.to(device)
         else:
             if lang_model:
                 batch = [f"{_src}{lang_model_tokenizer.sep_token}{_trg}" for _src, _trg in zip(src, trg)]
                 classifier_token = get_lang_model_cls_token(batch, lang_model, lang_model_tokenizer, device, max_length_encoder, to_cpu=False, detach=True)
-                data_lm = classifier_token.to(device)
+                data_lm = classifier_token
+
+                if lm_data_update is not None:
+                    # Assumption: no shuffle will be performed on the given data in the rest of the execution
+                    assert isinstance(lm_data_update, list)
+
+                    lm_data_update.append(data_lm)
+
+                data_generator_hash_lm += hash(data_lm)
+
+                data_lm = data_lm.to(device)
 
         target = torch.tensor(labels).to(device)
         results = apply_inference(model, data, target=None, loss_function=None, threshold=threshold, loss_apply_sigmoid=False, data_lm=data_lm if lm_ensemble_approach != "independent" else None) #, debug_labels=target if debug else None)
@@ -808,6 +843,8 @@ def eval(model, translation_model, data_generator, direction, device, decoder_st
             assert lang_model is model.lang_model
         else:
             lang_model.train()
+
+    logger.debug("Data hash (str, pt, lm): %d %d %d", data_generator_hash, data_generator_hash_pt, data_generator_hash_lm)
 
     return results
 
@@ -1301,7 +1338,33 @@ def main(args):
 
         logger.info("Epoch #%d", epoch + 1)
 
-        dev_results = eval(model, translation_model, make_batches(dev_data, batch_size, pt_data=dev_pickle_data, lm_data=dev_lm_data), direction, device, decoder_start_token_token, eos_token_token, translation_tokenizer, max_length, max_new_tokens, print_desc="dev", **eval_kwargs)
+        aux_dev_pickle_data = None if dev_pickle_data is not None else []
+        aux_dev_lm_data = None if dev_lm_data is not None else []
+        dev_results = eval(model, translation_model, make_batches(dev_data, batch_size, pt_data=dev_pickle_data, lm_data=dev_lm_data),
+                           direction, device, decoder_start_token_token, eos_token_token, translation_tokenizer, max_length, max_new_tokens,
+                           print_desc="dev", pt_data_update=aux_dev_pickle_data, lm_data_update=aux_dev_lm_data, **eval_kwargs)
+
+        if aux_dev_pickle_data is not None:
+            # Avoid recalculating the dev set MT representation next time
+
+            assert dev_pickle_data is None
+            assert len(aux_dev_pickle_data) > 0
+
+            dev_pickle_data = aux_dev_pickle_data
+
+            logger.debug("Dev pickle data stored in memory")
+
+        if aux_dev_lm_data is not None:
+            # Avoid recalculating the dev set LM representation next time
+
+            assert dev_lm_data is None
+
+            if lang_model:
+                assert len(aux_dev_lm_data) > 0
+
+            dev_lm_data = aux_dev_lm_data
+
+            logger.debug("Dev LM data stored in memory")
 
         if len(epoch_loss) > 0 and sum_epoch_loss < early_stopping_best_loss:
             logger.info("Better loss result: %s -> %s", early_stopping_best_loss, sum_epoch_loss)
