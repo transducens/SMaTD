@@ -704,11 +704,11 @@ def eval(model, translation_model, data_generator, direction, device, decoder_st
         src, trg, labels, source_lang_token, target_lang_token = list(zip(*batch))[0:5]
         data_lm = None
 
-        data_generator_hash += [hash(s) for s in src]
-        data_generator_hash += [hash(s) for s in trg]
-        data_generator_hash += [hash(s) for s in labels]
-        data_generator_hash += [hash(s) for s in source_lang_token]
-        data_generator_hash += [hash(s) for s in target_lang_token]
+        data_generator_hash += sum([hash(s) for s in src])
+        data_generator_hash += sum([hash(s) for s in trg])
+        data_generator_hash += sum([hash(s) for s in labels])
+        data_generator_hash += sum([hash(s) for s in source_lang_token])
+        data_generator_hash += sum([hash(s) for s in target_lang_token])
 
         if direction == "trg2src":
             src, trg = trg, src
@@ -1338,8 +1338,8 @@ def main(args):
 
         logger.info("Epoch #%d", epoch + 1)
 
-        aux_dev_pickle_data = None if dev_pickle_data is not None else []
-        aux_dev_lm_data = None if dev_lm_data is not None else []
+        aux_dev_pickle_data = [] if dev_pickle_data is None else None
+        aux_dev_lm_data = [] if dev_lm_data is None and lang_model and lm_frozen_params else None
         dev_results = eval(model, translation_model, make_batches(dev_data, batch_size, pt_data=dev_pickle_data, lm_data=dev_lm_data),
                            direction, device, decoder_start_token_token, eos_token_token, translation_tokenizer, max_length, max_new_tokens,
                            print_desc="dev", pt_data_update=aux_dev_pickle_data, lm_data_update=aux_dev_lm_data, **eval_kwargs)
