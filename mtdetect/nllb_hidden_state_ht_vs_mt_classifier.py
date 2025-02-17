@@ -1086,6 +1086,12 @@ def main(args):
                 ' '.join([f"{k}:{len(v)}" for k, v in groups_balanced2group.items()]),
                 ' '.join([f"{k}:{len(v)}" for k, v in groups_balanced2uniq_groups.items()]))
 
+    for balanced_group1_k, balanced_group1_set in groups_balanced2uniq_groups.items():
+        for balanced_group2_k, balanced_group2_set in groups_balanced2uniq_groups.items():
+            if balanced_group1_k != balanced_group2_k:
+                # same group across different balanced groups is not supported
+                assert len(set.intersection(balanced_group1_set, balanced_group2_set)) == 0, f"{balanced_group1_k} - {balanced_group2_k}"
+
     # variables
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dim_feedforward = 2048
@@ -1273,7 +1279,7 @@ def main(args):
         for p in lang_model.parameters():
             p.requires_grad_(not do_inference and not lm_frozen_params)
 
-    training_steps_per_epoch = len(train_data) // batch_size + (0 if len(train_data) % batch_size == 0 else 1) # number of batches
+    training_steps_per_epoch = len(uniq_train_data_groups) // batch_size + (0 if len(uniq_train_data_groups) % batch_size == 0 else 1) # number of batches
     training_steps = training_steps_per_epoch * epochs # BE AWARE! "epochs" might be fake due to --train-until-patience
 
     logger.info("Batches per epoch: %d (total for %d epochs: %d)", training_steps_per_epoch, epochs, training_steps)
