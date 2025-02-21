@@ -993,9 +993,16 @@ def main(args):
     dev_pickle_data = read_pickle(dev_pickle_fn, concat_layers=concat_layers, k="decoder_last_hidden_state", limit=limit, max_split_size=batch_size) if bool(dev_pickle_fn) else None
     test_pickle_data = [] if bool(test_pickle_fn) and do_inference and skip_test_eval else (read_pickle(test_pickle_fn, concat_layers=concat_layers, k="decoder_last_hidden_state", limit=limit, max_split_size=batch_size) if bool(test_pickle_fn) else None)
     all_pickle_data_loaded = bool(train_pickle_fn) and bool(dev_pickle_fn) and bool(test_pickle_fn)
+    dev_data_labels = {k: sum([1 if d[2] == k else 0 for d in dev_data]) for k in set([d[2] for d in dev_data])}
+    dev_data_balanced = True
+
+    for v1 in dev_data_labels.values():
+        for v2 in dev_data_labels.values():
+            if v1 != v2:
+                dev_data_balanced = False
 
     logger.info("Train: %d", len(train_data))
-    logger.info("Dev: %d", len(dev_data))
+    logger.info("Dev: %d (labels count: %s)", len(dev_data), dev_data_labels)
     logger.info("Test: %d", len(test_data))
 
     train_pickle_data_n = sum([t.shape[0] for t in train_pickle_data]) if bool(train_pickle_fn) else len(train_data)
@@ -1346,42 +1353,51 @@ def main(args):
 
         aux_dev_pickle_data = [] if dev_pickle_data is None else None
         aux_dev_lm_data = [] if dev_lm_data is None and lang_model and lm_frozen_params else None
-        dev_results = eval(model, translation_model, make_batches(dev_data, batch_size, pt_data=dev_pickle_data, lm_data=dev_lm_data),
-                           direction, device, decoder_start_token_token, eos_token_token, translation_tokenizer, max_length, max_new_tokens,
-                           print_desc="dev", pt_data_update=aux_dev_pickle_data, lm_data_update=aux_dev_lm_data, **eval_kwargs)
+        abort_dev_eval = not dev_data_balanced and epoch == 0 and patience_metric == "acc"
 
-        if aux_dev_pickle_data is not None:
-            # Avoid recalculating the dev set MT representation next time
+        if abort_dev_eval:
+            logger.warning("Evaluation before training aborted: development data is unbalanced (%s), but the patience metric is accuracy, which may prevent improvements when evaluation is performed before training", dev_data_labels)
 
-            assert dev_pickle_data is None
-            assert len(aux_dev_pickle_data) > 0
+            early_stopping_metric_dev = early_stopping_best_result_dev
+        else:
+            dev_results = eval(model, translation_model, make_batches(dev_data, batch_size, pt_data=dev_pickle_data, lm_data=dev_lm_data),
+                               direction, device, decoder_start_token_token, eos_token_token, translation_tokenizer, max_length, max_new_tokens,
+                               print_desc="dev", pt_data_update=aux_dev_pickle_data, lm_data_update=aux_dev_lm_data, **eval_kwargs)
 
-            dev_pickle_data = aux_dev_pickle_data
+            if aux_dev_pickle_data is not None:
+                # Avoid recalculating the dev set MT representation next time
 
-            logger.debug("Dev pickle data stored in memory")
+                assert dev_pickle_data is None
+                assert len(aux_dev_pickle_data) > 0
 
-        if aux_dev_lm_data is not None:
-            # Avoid recalculating the dev set LM representation next time
+                dev_pickle_data = aux_dev_pickle_data
 
-            assert dev_lm_data is None
+                logger.debug("Dev pickle data stored in memory")
 
-            if lang_model:
-                assert len(aux_dev_lm_data) > 0
+            if aux_dev_lm_data is not None:
+                # Avoid recalculating the dev set LM representation next time
 
-            dev_lm_data = aux_dev_lm_data
+                assert dev_lm_data is None
 
-            logger.debug("Dev LM data stored in memory")
+                if lang_model:
+                    assert len(aux_dev_lm_data) > 0
+
+                dev_lm_data = aux_dev_lm_data
+
+                logger.debug("Dev LM data stored in memory")
+
+            logger.info("Dev eval: %s", dev_results)
+
+            early_stopping_metric_dev = dev_results[patience_metric]
 
         if len(epoch_loss) > 0 and sum_epoch_loss < early_stopping_best_loss:
             logger.info("Better loss result: %s -> %s", early_stopping_best_loss, sum_epoch_loss)
 
             early_stopping_best_loss = sum_epoch_loss
 
-        logger.info("Dev eval: %s", dev_results)
-
-        early_stopping_metric_dev = dev_results[patience_metric]
-
         if early_stopping_metric_dev > early_stopping_best_result_dev:
+            assert not abort_dev_eval
+
             logger.info("Patience better dev result (metric: %s): %s -> %s", patience_metric, early_stopping_best_result_dev, early_stopping_metric_dev)
 
             current_patience = 0
@@ -1395,7 +1411,7 @@ def main(args):
 
             if lm_model_output and lang_model is not None:
                 torch.save(lang_model.state_dict(), lm_model_output)
-        elif patience > 0:
+        elif not abort_dev_eval and patience > 0:
             current_patience += 1
 
             logger.info("Exhausting patience... %d / %d", current_patience, patience)
