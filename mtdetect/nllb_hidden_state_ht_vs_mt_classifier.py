@@ -1035,38 +1035,41 @@ def main(args):
     min_bsz_idx = None
     min_bsz = None
 
-    if bool(train_pickle_fn):
-        all_bsz = [len(d) for d in train_data]
-        all_bsz_pickle = [t.shape[0] for t in train_pickle_data]
+    if do_inference and skip_train_eval:
+        pass
+    else:
+        if bool(train_pickle_fn):
+            all_bsz = [len(d) for d in train_data]
+            all_bsz_pickle = [t.shape[0] for t in train_pickle_data]
 
-        assert len(all_bsz) == len(all_bsz_pickle)
-        assert all_bsz == all_bsz_pickle
+            assert len(all_bsz) == len(all_bsz_pickle)
+            assert all_bsz == all_bsz_pickle
 
-        all_bsz_count = {k: all_bsz.count(k) for k in set(all_bsz)}
+            all_bsz_count = {k: all_bsz.count(k) for k in set(all_bsz)}
 
-        assert len(all_bsz_count) in (1, 2), all_bsz_count
-        assert batch_size in all_bsz_count.keys()
+            assert len(all_bsz_count) in (1, 2), all_bsz_count
+            assert batch_size in all_bsz_count.keys()
 
-        if len(all_bsz_count) == 2:
-            all_bsz_count_keys = list(all_bsz_count.keys())
+            if len(all_bsz_count) == 2:
+                all_bsz_count_keys = list(all_bsz_count.keys())
 
-            all_bsz_count_keys.remove(batch_size)
+                all_bsz_count_keys.remove(batch_size)
 
-            assert len(all_bsz_count_keys) == 1
-            assert all_bsz_count[all_bsz_count_keys[0]] == 1
+                assert len(all_bsz_count_keys) == 1
+                assert all_bsz_count[all_bsz_count_keys[0]] == 1
 
-            min_bsz = all_bsz_count_keys[0]
-            min_bsz_idx = all_bsz.index(min_bsz)
-        else:
-            min_bsz = batch_size
-            min_bsz_idx = len(train_data) - 1
+                min_bsz = all_bsz_count_keys[0]
+                min_bsz_idx = all_bsz.index(min_bsz)
+            else:
+                min_bsz = batch_size
+                min_bsz_idx = len(train_data) - 1
 
-        # batch-size -> flat (expected format)
-        train_data = [d[i] for d in train_data for i in range(len(d))]
+            # batch-size -> flat (expected format)
+            train_data = [d[i] for d in train_data for i in range(len(d))]
 
-    assert isinstance(train_data, list), type(train_data)
-    assert isinstance(train_data[0], tuple), type(train_data[0])
-    assert isinstance(train_data[0][0], str), type(train_data[0][0])
+        assert isinstance(train_data, list), type(train_data)
+        assert isinstance(train_data[0], tuple), type(train_data[0])
+        assert isinstance(train_data[0][0], str), type(train_data[0][0])
 
     # training set groups
     train_data_groups = [d[5] for d in train_data]
@@ -1117,6 +1120,12 @@ def main(args):
     projection_in = max(n_pickle_files, 1) * translation_model.config.d_model if concat_layers else translation_model.config.d_model # 1024 for facebook/nllb-200-distilled-600M
 
     for idx, (desc, _p, _d) in enumerate((("train", train_pickle_data, train_data), ("dev", dev_pickle_data, dev_data), ("test", test_pickle_data, test_data))):
+        if do_inference:
+            if desc == "train" and skip_train_eval:
+                continue
+            if desc == "test" and skip_test_eval:
+                continue
+
         assert isinstance(_d, list), type(_d)
         assert isinstance(_d[0], tuple), type(_d[0])
         assert isinstance(_d[0][0], str), type(_d[0][0])
