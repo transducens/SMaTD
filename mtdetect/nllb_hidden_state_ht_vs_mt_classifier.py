@@ -721,8 +721,8 @@ def eval(model, translation_model, data_generator, direction, device, decoder_st
             assert batch_lm is None
 
         if batch_pt is None:
-            src = [f"{source_lang_token} {_src}{eos_token_token}" for _src in src]
-            trg = [f"{decoder_start_token_token}{target_lang_token} {_trg}{eos_token_token}" for _trg in trg]
+            src = [f"{_source_lang_token} {_src}{eos_token_token}" for _src, _source_lang_token in zip(src, source_lang_token)]
+            trg = [f"{decoder_start_token_token}{_target_lang_token} {_trg}{eos_token_token}" for _trg, _target_lang_token in zip(trg, target_lang_token)]
             src_inputs = preprocess(src, translation_tokenizer, device, max_length)
             trg_inputs = preprocess(trg, translation_tokenizer, device, max_new_tokens)
             translation_output = get_model_last_hidden_state(translation_model, src_inputs, trg_inputs, skip_modules=("encoder",), to_cpu=False, layer=layer)
@@ -941,6 +941,7 @@ def main(args):
     pretrained_model = args.pretrained_model
     pretrained_model_layer = args.pretrained_model_target_layer
     skip_train_eval = args.skip_train_set_eval
+    skip_dev_eval = args.skip_dev_set_eval
     skip_test_eval = args.skip_test_set_eval
     patience = args.patience
     patience_metric = args.dev_patience_metric
@@ -987,10 +988,10 @@ def main(args):
     # read data
     n_pickle_files = train_pickle_fn.count(':') + (0 if len(train_pickle_fn) == 0 else 1)
     train_data = [] if do_inference and skip_train_eval else read(train_fn, _src_lang, _trg_lang, limit=None if limit is None else (limit * batch_size), return_groups=True)
-    dev_data = read(dev_fn, _src_lang, _trg_lang, limit=None if limit is None else (limit * batch_size))
+    dev_data = [] if do_inference and skip_dev_eval else read(dev_fn, _src_lang, _trg_lang, limit=None if limit is None else (limit * batch_size))
     test_data = [] if do_inference and skip_test_eval else read(test_fn, _src_lang, _trg_lang, limit=None if limit is None else (limit * batch_size))
     train_pickle_data = [] if bool(train_pickle_fn) and do_inference and skip_train_eval else (read_pickle(train_pickle_fn, concat_layers=concat_layers, k="decoder_last_hidden_state", limit=limit, max_split_size=batch_size) if bool(train_pickle_fn) else None)
-    dev_pickle_data = read_pickle(dev_pickle_fn, concat_layers=concat_layers, k="decoder_last_hidden_state", limit=limit, max_split_size=batch_size) if bool(dev_pickle_fn) else None
+    dev_pickle_data = [] if bool(dev_pickle_fn) and do_inference and skip_dev_eval else read_pickle(dev_pickle_fn, concat_layers=concat_layers, k="decoder_last_hidden_state", limit=limit, max_split_size=batch_size) if bool(dev_pickle_fn) else None
     test_pickle_data = [] if bool(test_pickle_fn) and do_inference and skip_test_eval else (read_pickle(test_pickle_fn, concat_layers=concat_layers, k="decoder_last_hidden_state", limit=limit, max_split_size=batch_size) if bool(test_pickle_fn) else None)
     all_pickle_data_loaded = bool(train_pickle_fn) and bool(dev_pickle_fn) and bool(test_pickle_fn)
     dev_data_labels = {k: sum([1 if d[2] == k else 0 for d in dev_data]) for k in set([d[2] for d in dev_data])}
@@ -1083,8 +1084,9 @@ def main(args):
     groups_balanced2uniq_groups = {group_balanced: set(groups_balanced2group[group_balanced]) for group_balanced in uniq_train_data_groups_balanced}
     train_groups_processing = len(train_data_groups) != len(uniq_train_data_groups) or len(uniq_train_data_groups_balanced) > 1
 
-    if train_groups_processing:
-        assert not bool(train_pickle_fn), "Pickle files are not supported with groups: in-place tensors will be calculated"
+    if train_groups_processing or min_bsz is None:
+        if train_groups_processing:
+            assert not bool(train_pickle_fn), "Pickle files are not supported with groups: in-place tensors will be calculated"
 
         min_bsz = len(uniq_train_data_groups) % batch_size
         min_bsz = batch_size if min_bsz == 0 else min_bsz
@@ -1123,6 +1125,8 @@ def main(args):
         if do_inference:
             if desc == "train" and skip_train_eval:
                 continue
+            if desc == "dev" and skip_dev_eval:
+                continue
             if desc == "test" and skip_test_eval:
                 continue
 
@@ -1137,13 +1141,13 @@ def main(args):
 
             for idx2, d in enumerate(_p):
                 assert isinstance(d, torch.Tensor), type(d)
-                assert d.shape[-1] == projection_in, f"{d.shape}[-1] vs {projection_in}"
+                assert d.shape[-1] == projection_in, f"{d.shape[-1]} vs {projection_in}"
 
                 if desc == "train":
                     if idx2 == min_bsz_idx:
                         assert d.shape[0] == min_bsz, f"{min_bsz} {min_bsz_idx} {d.shape}"
                     else:
-                        assert d.shape[0] == batch_size
+                        assert d.shape[0] == batch_size, f"{d.shape[0]} vs {batch_size}"
                 else:
                     if idx2 + 1 == len(_p):
                         _bsz = len(_d) % batch_size
@@ -1151,7 +1155,7 @@ def main(args):
 
                         assert d.shape[0] == _bsz
                     else:
-                        assert d.shape[0] == batch_size
+                        assert d.shape[0] == batch_size, f"{d.shape[0]} vs {batch_size}"
 
                 s += d.shape[0]
 
@@ -1463,8 +1467,8 @@ def main(args):
 #                if debug:
 #                    translation_model = translation_model.to(device)
 
-                src_translation_model = [f"{source_lang_token} {_src}{eos_token_token}" for _src in src]
-                trg_translation_model = [f"{decoder_start_token_token}{target_lang_token} {_trg}{eos_token_token}" for _trg in trg]
+                src_translation_model = [f"{_source_lang_token} {_src}{eos_token_token}" for _src, _source_lang_token in zip(src, source_lang_token)]
+                trg_translation_model = [f"{decoder_start_token_token}{_target_lang_token} {_trg}{eos_token_token}" for _trg, _target_lang_token in zip(trg, target_lang_token)]
                 src_inputs = preprocess(src_translation_model, translation_tokenizer, device, max_length)
                 trg_inputs = preprocess(trg_translation_model, translation_tokenizer, device, max_new_tokens)
 
@@ -1643,9 +1647,12 @@ def main(args):
     else:
         logger.info("Final train eval: skip")
 
-    dev_results = eval(model, translation_model, make_batches(dev_data, batch_size, pt_data=dev_pickle_data, lm_data=dev_lm_data), direction, device, decoder_start_token_token, eos_token_token, translation_tokenizer, max_length, max_new_tokens, print_desc="dev", **eval_kwargs)
+    if not skip_dev_eval:
+        dev_results = eval(model, translation_model, make_batches(dev_data, batch_size, pt_data=dev_pickle_data, lm_data=dev_lm_data), direction, device, decoder_start_token_token, eos_token_token, translation_tokenizer, max_length, max_new_tokens, print_desc="dev", **eval_kwargs)
 
-    logger.info("Final dev eval: %s", dev_results)
+        logger.info("Final dev eval: %s", dev_results)
+    else:
+        logger.info("Final dev eval: skip")
 
     if not skip_test_eval:
         test_results = eval(model, translation_model, make_batches(test_data, batch_size, pt_data=test_pickle_data, lm_data=test_lm_data), direction, device, decoder_start_token_token, eos_token_token, translation_tokenizer, max_length, max_new_tokens, print_desc="test", **eval_kwargs)
@@ -1674,7 +1681,7 @@ def initialization():
     parser.add_argument('--pickle-test-filename', type=str, default='', help="Pickle filename with test data. The order and batch size is expected to match with the provided flags")
     parser.add_argument('--batch-size', type=int, default=32, help="Batch size. Elements which will be processed before proceed to train")
     parser.add_argument('--epochs', type=int, default=100, help="Epochs")
-    parser.add_argument('--pretrained-model', default="facebook/nllb-200-distilled-600M", help="Pretrained translation model to calculate hidden states (not used if pickle files are provided)")
+    parser.add_argument('--pretrained-model', default="facebook/nllb-200-3.3B", help="Pretrained translation model to calculate hidden states (not used if pickle files are provided)")
     parser.add_argument('--pretrained-model-target-layer', type=int, default=None,
                         help="Pretrained translation model hidden state layer to use in order to train the classifier (not used if pickle files are provided)")
     parser.add_argument('--lm-pretrained-model', help="Pretrained language model (encoder-like) to train together with classifier") # default empty: means NO lm
@@ -1711,6 +1718,7 @@ def initialization():
     parser.add_argument('--threshold', type=float, default=0.5, help="Threshold to consider a given text to be HT")
     parser.add_argument('--dev-patience-metric', type=str, choices=["acc", "macro_f1"], default="acc", help="Metric to calculate patience using the dev set")
     parser.add_argument('--skip-train-set-eval', action="store_true", help="Skip training evaluation during training or inference")
+    parser.add_argument('--skip-dev-set-eval', action="store_true", help="Skip development evaluation during training or inference")
     parser.add_argument('--skip-test-set-eval', action="store_true", help="Skip test evaluation during training or inference")
     parser.add_argument('--data-limit', type=int, default=None, help="Data limit reading in batches (debug purposes). If multiple files are provided, the limit is applied to each file, not the total")
     parser.add_argument('--lm-ensemble-approach', type=str, choices=["token", "classifier", "independent"], default="token",
