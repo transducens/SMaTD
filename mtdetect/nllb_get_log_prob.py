@@ -31,21 +31,10 @@ print(f"Pretrained model: {pretrained_model}", file=sys.stderr)
 print(f"Batch size: {bsz}", file=sys.stderr)
 print(f"Normalize: {normalize}", file=sys.stderr)
 
-src_lang, trg_lang = (_src_lang, _trg_lang) if direction == "src2trg" else (_trg_lang, _src_lang)
-source_lang_token = src_lang
-target_lang_token = trg_lang
-
-# Load model
-tokenizer_kwargs = {}
-
-if "nllb-200" in pretrained_model:
-    tokenizer_kwargs["src_lang"] = src_lang
-    tokenizer_kwargs["trg_lang"] = trg_lang
-
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model = transformers.AutoModelForSeq2SeqLM.from_pretrained(pretrained_model)
 model = model.to(device).eval()
-tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model, **tokenizer_kwargs)
+tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model)
 max_length = model.config.max_length
 max_new_tokens = model.generation_config.max_length
 eos_token_token = tokenizer.convert_ids_to_tokens(model.generation_config.eos_token_id)
@@ -145,6 +134,7 @@ def run_and_print_results(all_src, all_trg, extra_data, src_inputs, trg_inputs, 
     for src, trg, ntokens, log_prob, prob, _extra_data, log_prob_per_token in zip(all_src, all_trg, all_ntokens, batch_log_probs, batch_probs, extra_data, batch_log_probs_all):
         assert isinstance(log_prob_per_token, list), log_prob_per_token
 
+        _extra_data = '|'.join(_extra_data)
         _log_prob_per_token = '|'.join(map(str, log_prob_per_token))
         perplexity = [np.exp(-1. * sum(log_prob_per_token[:i + 1]) / (i + 1)) for i in range(len(log_prob_per_token))]
         _perplexity = '|'.join(map(str, perplexity))
@@ -312,7 +302,7 @@ if __name__ == "__main__":
         _data = l.strip("\r\n").split('\t')
         _src = _data[0]
         _trg = _data[1]
-        _extra_data = '|'.join(_data[2:])
+        _extra_data = _data[2:]
 
         if normalize:
             _src = normalizer.get_clean_sentence(_src)
@@ -321,8 +311,19 @@ if __name__ == "__main__":
         src, trg = (_src, _trg) if direction == "src2trg" else (_trg, _src)
 
         if "nllb-200" in pretrained_model:
-            src = f"{source_lang_token} {src}{eos_token_token}"
-            trg = f"{decoder_start_token_token}{target_lang_token} {trg}{eos_token_token}"
+            if run is run_and_store_last_hidden_layer_with_pickle:
+                # TODO apply the same logic for the other run method?
+
+                _source_lang_token = _data[5] if len(_data) > 5 else _src_lang
+                _target_lang_token = _data[6] if len(_data) > 6 else _trg_lang
+            else:
+                _source_lang_token = _src_lang
+                _target_lang_token = _trg_lang
+
+            _source_lang_token, _target_lang_token = (_source_lang_token, _target_lang_token) if direction == "src2trg" else (_target_lang_token, _source_lang_token)
+
+            src = f"{_source_lang_token} {src}{eos_token_token}"
+            trg = f"{decoder_start_token_token}{_target_lang_token} {trg}{eos_token_token}"
         else:
             src = f"{src}{eos_token_token}"
             trg = f"{decoder_start_token_token} {trg}{eos_token_token}"
