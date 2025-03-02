@@ -189,6 +189,13 @@ def main(args):
     dev_patience_metric = args.dev_patience_metric
     multiplicative_inverse_temperature_sampling = args.multiplicative_inverse_temperature_sampling
     swap_lang = args.swap_lang
+    loss_pos_weight = args.loss_pos_weight
+    loss_pos_weight = None if loss_pos_weight < 0.0 else loss_pos_weight
+    loss_pos_weight = torch.FloatTensor([loss_pos_weight]) if loss_pos_weight is not None else loss_pos_weight
+    disable_training_group_balanced_sampler = args.disable_training_group_balanced_sampler
+
+    if loss_pos_weight is not None:
+        logger.debug("Loss pos weight: %s", loss_pos_weight)
 
     if gradient_accumulation_steps > 1:
         assert (batch_size % gradient_accumulation_steps) == 0, f"batch_size % gradient_accumulation_steps != 0 -> {batch_size % gradient_accumulation_steps} != 0"
@@ -254,8 +261,9 @@ def main(args):
     except AttributeError:
         logger.warning("Could not get the embedding size...")
 
-    loss_function = nn.BCEWithLogitsLoss(reduction="mean") # Regression: raw input, not normalized
-                                                           #  (i.e. sigmoid is applied in the loss function)
+    loss_pos_weight = loss_pos_weight.to(device) if loss_pos_weight is not None else loss_pos_weight
+    loss_function = nn.BCEWithLogitsLoss(reduction="mean", pos_weight=loss_pos_weight) # Regression: raw input, not normalized
+                                                                                       #  (i.e. sigmoid is applied in the loss function)
 
     if apply_inference:
         assert writer is None
@@ -287,7 +295,7 @@ def main(args):
         "temperature_sampling": 1 / multiplicative_inverse_temperature_sampling,
         "swap_lang": swap_lang,
     }
-    dataset_train, dataloader_train = load_dataset(filename_dataset_train, "train", **dataset_static_args, group_balanced_sampler=True, shuffle=True)
+    dataset_train, dataloader_train = load_dataset(filename_dataset_train, "train", **dataset_static_args, group_balanced_sampler=False if disable_training_group_balanced_sampler else True, shuffle=True)
     dataset_dev, _ = load_dataset(filename_dataset_dev, "dev", **dataset_static_args)
 
     #training_steps_per_epoch = len(dataloader_train) // num_processes
@@ -547,6 +555,11 @@ def initialization():
     parser.add_argument('--multiplicative-inverse-temperature-sampling', type=float, default=0.3, help="See https://arxiv.org/pdf/1907.05019 (section 4.2). Default value has been set the one used in the NLLB paper")
     parser.add_argument('--swap-lang', action="store_true",
                         help="In the bilingual data, swap the order of the sentences for each language")
+    parser.add_argument('--loss-pos-weight', type=float, default=-1.0,
+                        help="Weight applied to the positive class in the loss function. For further details, see BCEWithLogitsLoss and "
+                             "https://discuss.pytorch.org/t/weight-vs-pos-weight-in-nn-bcewithlogitsloss/114859")
+    parser.add_argument('--disable-training-group-balanced-sampler', action="store_true",
+                        help="By default, the training group balanced sampler is enabled and disabled for development and testing. This flag disables the training group balanced sampler")
 
     parser.add_argument('--seed', type=int, default=71213,
                         help="Seed in order to have deterministic results (not fully guaranteed). "

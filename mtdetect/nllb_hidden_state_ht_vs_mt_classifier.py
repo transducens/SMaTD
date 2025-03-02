@@ -971,6 +971,9 @@ def main(args):
     frozen_params = args.frozen_params
     concat_layers = args.concat_pickle_layers
     temperature_sampling = 1 / args.multiplicative_inverse_temperature_sampling
+    loss_pos_weight = args.loss_pos_weight
+    loss_pos_weight = None if loss_pos_weight < 0.0 else loss_pos_weight
+    loss_pos_weight = torch.FloatTensor([loss_pos_weight]) if loss_pos_weight is not None else loss_pos_weight
 
     if lm_pretrained_model:
         logger.info("LM is going to be used: %s (local file: %s)", lm_pretrained_model, lm_model_input)
@@ -979,6 +982,9 @@ def main(args):
         logger.info("Gradient accumulation enabled (i.e., >1): %d (note that if disabled, the same results would be obtained if dropout is disabled for both HT vs MT classifier and language model, train shuffle is disabled, and float precision errors are ignored)", gradient_accumulation)
 
     logger.info("Batch size: %d (actual batch size: %d)", batch_size, actual_batch_size)
+
+    if loss_pos_weight is not None:
+        logger.debug("Loss pos weight: %s", loss_pos_weight)
 
     assert len(train_fn.split(':')) == len(dev_fn.split(':')) == len(test_fn.split(':'))
 
@@ -1325,7 +1331,8 @@ def main(args):
     current_patience = 0
     epoch = 0
     do_training = not do_inference and (epoch < epochs or train_until_patience)
-    loss_function = nn.BCEWithLogitsLoss(reduction="none")
+    loss_pos_weight = loss_pos_weight.to(device) if loss_pos_weight is not None else loss_pos_weight
+    loss_function = nn.BCEWithLogitsLoss(reduction="none", pos_weight=loss_pos_weight)
     #loss_function = nn.BCELoss(reduction="none")
     loss_apply_sigmoid = False # Should be True if loss_function = nn.BCELoss()
     #loss_apply_sigmoid = True
@@ -1732,6 +1739,9 @@ def initialization():
     parser.add_argument('--stochastic-depth', type=float, default=0.0, help="Stochastic depth probability (https://arxiv.org/abs/1603.09382). Randomly disables whole layers at batch level")
     parser.add_argument('--frozen-params', action='store_true', help="Freeze classifier parameters (i.e., do not train)")
     parser.add_argument('--concat-pickle-layers', action='store_true', help="When loading multiple pickle files, they will be concatenated instead of aggregated")
+    parser.add_argument('--loss-pos-weight', type=float, default=-1.0,
+                        help="Weight applied to the positive class in the loss function. For further details, see BCEWithLogitsLoss and "
+                             "https://discuss.pytorch.org/t/weight-vs-pos-weight-in-nn-bcewithlogitsloss/114859")
 
     parser.add_argument('--seed', type=int, default=71213,
                         help="Seed in order to have deterministic results (not fully guaranteed). "
