@@ -1168,19 +1168,20 @@ def main(args):
             assert s == len(_d), f"{idx}: {s} vs {len(_d)}"
 
     # LM
-    lang_model, lang_model_tokenizer = load_model(lm_model_input, lm_pretrained_model, None, classifier_dropout=lm_classifier_dropout_p if lm_stochastic_depth == "independent" else 0.0) if lm_pretrained_model else (None, None)
+    lang_model, lang_model_tokenizer = load_model(lm_model_input, lm_pretrained_model, None, classifier_dropout=lm_classifier_dropout_p if lm_ensemble_approach == "independent" else 0.0) if lm_pretrained_model else (None, None)
     max_length_encoder = 512 # TODO use argument
     _max_length_encoder = max_length_encoder
-    train_lm_data = [] if lang_model and lm_frozen_params and not do_inference else None
-    dev_lm_data = [] if lang_model and lm_frozen_params and not do_inference else None
-    test_lm_data = [] if lang_model and lm_frozen_params and not do_inference else None
+    train_lm_data = [] if lang_model and lm_frozen_params and not do_inference and not train_groups_processing else None
+    dev_lm_data = [] if lang_model and lm_frozen_params and not do_inference and not train_groups_processing else None
+    test_lm_data = [] if lang_model and lm_frozen_params and not do_inference and not train_groups_processing else None
 
     if lang_model:
         # Add LM data to inputs
         lang_model = lang_model.eval()
         lang_model = lang_model.to(device)
 
-        assert n_pickle_files > 0, "LM is only supported with pickle files (easier implementation)"
+        if not train_groups_processing:
+            assert n_pickle_files > 0, "LM is only supported with pickle files (easier implementation)"
 
         max_length_encoder = utils.get_encoder_max_length(lang_model, lang_model_tokenizer, max_length_tokens=_max_length_encoder)
         max_length_encoder = min(max_length_encoder, _max_length_encoder)
@@ -1505,7 +1506,8 @@ def main(args):
                 data_lm = batch_lm.to(device)
             else:
                 if lang_model:
-                    assert not lm_frozen_params
+                    if not train_groups_processing:
+                        assert not lm_frozen_params
 
                     batch = [f"{_src}{lang_model_tokenizer.sep_token}{_trg}" for _src, _trg in zip(src, trg)]
                     classifier_token = get_lang_model_cls_token(batch, lang_model, lang_model_tokenizer, device, max_length_encoder, to_cpu=False, detach=False)
@@ -1643,7 +1645,7 @@ def main(args):
             model = model.to(device)
 
         if lm_model_output and lang_model is not None:
-            lang_model, lang_model_tokenizer = load_model(lm_model_output, lm_pretrained_model, None, classifier_dropout=lm_classifier_dropout_p if lm_stochastic_depth == "independent" else 0.0)
+            lang_model, lang_model_tokenizer = load_model(lm_model_output, lm_pretrained_model, None, classifier_dropout=lm_classifier_dropout_p if lm_ensemble_approach == "independent" else 0.0)
             lang_model = lang_model.eval()
             lang_model = lang_model.to(device)
 
