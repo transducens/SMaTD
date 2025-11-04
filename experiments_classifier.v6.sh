@@ -82,7 +82,7 @@ for m in $(if [[ "$l" == "all" ]]; then echo "google deepl Unbabel/TowerInstruct
 
             mkdir -p "${prefix}.model"
 
-            PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python mtdetect ./${f_prefix_cwd}.{train,dev,test}${data_fn_suffix} \
+            PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python smatd-lm-baseline ./${f_prefix_cwd}.{train,dev,test}${data_fn_suffix} \
                 --pretrained-model "$lm" --model-output "${prefix}.model" --dev-patience-metric "$patience_metric" --seed "$seed" $default_args $extra_args \
             &> "${prefix}.out"
 
@@ -355,7 +355,7 @@ for explainability_model in $(echo "facebook/nllb-200-3.3B"); do
 
         echo "$(date) check: ${prefix}.out"
 
-        python3 ./mtdetect/nllb_hidden_state_ht_vs_mt_classifier.py \
+        smatd \
             ./${f_prefix_cwd}.{train,dev,test}${data_fn_suffix} \
             $default_args_explainability --dev-patience-metric "$patience_metric" --source-lang "$nllb_l1" --target-lang "$nllb_l2" \
             --direction $direction_str --model-output "${prefix}.model_output" --pretrained-model "$explainability_model" \

@@ -84,7 +84,7 @@ for s in $(echo "test"); do
     echo "$(date) check baseline: ${prefix}.out"
 
     cat "$inference_file" \
-      | PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python mtdetect --inference \
+      | PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python smatd-lm-baseline --inference \
         --pretrained-model "$lm" --model-input "$lm_model_input" \
         --verbose --batch-size 32 \
     &> "${prefix}.out" &
@@ -198,7 +198,7 @@ fi
 
 echo "check: ${prefix}.out"
 
-python3 ./mtdetect/nllb_hidden_state_ht_vs_mt_classifier.py \
+smatd \
     ./${f_prefix_cwd}.{train,dev,test}.${t2}.out.all.shuf \
     --pickle-train-filename "$pickle_train" \
     --pickle-dev-filename "$pickle_dev" \

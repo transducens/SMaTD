@@ -44,28 +44,29 @@ if __name__ == "__main__":
     requirements = reqs_from_file("requirements.txt")
 
     setuptools.setup(
-        name="MTDetect",
+        name="SMaTD",
         version="1.0",
         install_requires=requirements,
         #license="GNU General Public License v3.0",
         author="Cristian García-Romero",
-        author_email="cgr71ii@gmail.com",
+        author_email="cgarcia@dlsi.ua.es",
         #maintainer=,
         #maintainer_email,
         description="Detection of machine translation",
         long_description=long_description,
         long_description_content_type="text/markdown",
-        url="https://github.com/transducens/mtdetect",
-        packages=["mtdetect", "mtdetect.utils"],
+        url="https://github.com/transducens/SMaTD",
+        packages=["smatd", "smatd.utils"],
         #classifiers=[],
         #project_urls={},
         #package_data={  # Not available in the built package but just when building binaries!
-        #    "mtdetect": [
+        #    "smatd": [
         #    ]
         #},
         entry_points={
             "console_scripts": [
-                "mtdetect = mtdetect.cli:main",
+                "smatd-lm-baseline = smatd.cli:main_lm_baseline",
+                "smatd = smatd.cli:main",
             ]
         },
         #cmdclass={
