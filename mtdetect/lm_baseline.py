@@ -8,9 +8,9 @@ import argparse
 import warnings
 import contextlib
 
-import mtdetect.utils.utils as utils
-import mtdetect.dataset as dataset
-import mtdetect.inference as inference
+import smatd.utils.utils as utils
+import smatd.dataset as dataset
+import smatd.inference as inference
 
 import torch
 from torch.optim import Adam, AdamW, SGD
@@ -20,7 +20,7 @@ import accelerate
 import numpy as np
 from torch.utils.tensorboard import SummaryWriter
 
-logger = logging.getLogger("mtdetect")
+logger = logging.getLogger("smatd.lm_baseline")
 accelerator = None
 writer = None
 
@@ -506,7 +506,7 @@ def main(args):
 
 def initialization():
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-                                     description="MTDetect")
+                                     description="SMaTD: LM baseline for detection of machine translation")
     inference = "--inference" in sys.argv
     lr_scheduler_conf = utils.get_options_from_argv("--lr-scheduler", "inverse_sqrt_chichirau_et_al", utils.argparse_pytorch_conf.lr_scheduler_args)
     optimizer_conf = utils.get_options_from_argv("--optimizer", "adamw_no_wd", utils.argparse_pytorch_conf.optimizer_args)

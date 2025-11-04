@@ -2,7 +2,7 @@
 import os
 import logging
 
-import mtdetect.utils.utils as utils
+import smatd.utils.utils as utils
 
 import torch
 from torch.utils.data import (
@@ -14,7 +14,7 @@ import numpy as np
 import more_itertools
 import transformers
 
-logger = logging.getLogger("mtdetect")
+logger = logging.getLogger("smatd")
 
 def remove_padding(sequence_batch, pad_token_id):
     _sequence_batch = sequence_batch.tolist()

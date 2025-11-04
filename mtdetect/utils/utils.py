@@ -15,7 +15,7 @@ import torch
 import transformers
 import numpy as np
 
-logger = logging.getLogger("mtdetect")
+logger = logging.getLogger("smatd")
 
 def wc_l(fd, do_not_count_empty=True):
     no_lines = 0

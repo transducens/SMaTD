@@ -1,7 +1,7 @@
 
 import sys
 
-import mtdetect.translation.util as util
+import smatd.translation.util as util
 
 import torch
 import transformers

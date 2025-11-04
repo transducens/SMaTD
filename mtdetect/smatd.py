@@ -10,8 +10,8 @@ import argparse
 
 del sys.path[0] # remove wd path
 
-import mtdetect.inference as inference
-import mtdetect.utils.utils as utils
+import smatd.inference as inference
+import smatd.utils.utils as utils
 
 import torch
 import torch.nn as nn
@@ -1669,7 +1669,7 @@ def main(args):
 
 def initialization():
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-                                     description="MTDetect classifier using NLLB hidden states (+LM)")
+                                     description="SMaTD and SMaTD+LM")
 
     lr_scheduler_conf = utils.get_options_from_argv("--lr-scheduler", "inverse_sqrt_chichirau_et_al", utils.argparse_pytorch_conf.lr_scheduler_args)
     optimizer_conf = utils.get_options_from_argv("--optimizer", "adamw_no_wd", utils.argparse_pytorch_conf.optimizer_args)

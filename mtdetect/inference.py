@@ -2,15 +2,15 @@
 import sys
 import logging
 
-import mtdetect.dataset as dataset
-import mtdetect.utils.utils as utils
+import smatd.dataset as dataset
+import smatd.utils.utils as utils
 
 import torch
 import sklearn.metrics
 from sklearn.utils.multiclass import unique_labels
 import numpy as np
 
-logger = logging.getLogger("mtdetect")
+logger = logging.getLogger("smatd")
 
 def inference(model, inputs_and_outputs, loss_function=None, device=None, threshold=0.5):
     # Inputs and outputs
