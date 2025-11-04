@@ -53,4 +53,7 @@ TODO
 
 This work was co-funded by the Conselleria de Innovación, Universidades, Ciencia y Sociedad Digital (Generalitat Valenciana) and the European Social Fund through grant CIACIF/2021/365. It was also part of the work conducted in R+D+i projects PID2021-27999NB-I00 and PID2024-158157OB-C31 funded by the Spanish Ministry of Science and Innovation (MCIN), the Spanish Research Agency (AEI/10.13039/501100011033) and the European Regional Development Fund A way to make Europe. Some of the computational resources used were funded by the Valencia Government and the European Regional Development Fund (ERDF) through project IDIFEDER/2020/003.
 
-![European Social Fund](img/ua-micin.png)
+<p align="center">
+  <img src="img/genval.png" width="80px">
+  <img src="img/MICIU+Cofinanciado+AEI.jpg" width="80px">
+</p>
