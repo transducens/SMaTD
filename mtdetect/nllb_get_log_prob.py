@@ -50,10 +50,14 @@ def get_log_prob(src_inputs, trg_inputs, length_normalization=False):
     all_ntokens = []
     batch_log_probs = []
     batch_log_probs_all = []
+    batch_log_probs_predicted_all = []
+    batch_entropy_all = []
 
     for bsz_idx in range(trg_inputs['input_ids'].shape[0]):
         batch_log_probs.append(0)
         batch_log_probs_all.append([])
+        batch_log_probs_predicted_all.append([])
+        batch_entropy_all.append([])
         ntokens = 0
 
         for idx in range(1, trg_inputs['input_ids'].shape[-1] - 1):
@@ -62,9 +66,12 @@ def get_log_prob(src_inputs, trg_inputs, length_normalization=False):
             if token_id == tokenizer.pad_token_id:
                 break
 
-            log_prob = log_probs[bsz_idx,idx,token_id].item()
+            log_prob = log_probs[bsz_idx,idx,token_id].item() # observed token
+            predicted_log_prob = log_probs[bsz_idx,idx,:].max().item() # predicted token (max)
             batch_log_probs[-1] += log_prob
             batch_log_probs_all[-1].append(log_prob)
+            batch_log_probs_predicted_all[-1].append(predicted_log_prob)
+            batch_entropy_all[-1].append(-1. * (log_probs[bsz_idx,idx,:] * torch.exp(log_probs[bsz_idx,idx,:])).sum().item()) # entropy = -sum(p * log(p)), for all tokens in the vocabulary
             ntokens += 1
 
         all_ntokens.append(ntokens)
@@ -72,7 +79,20 @@ def get_log_prob(src_inputs, trg_inputs, length_normalization=False):
         if length_normalization:
             batch_log_probs[-1] /= all_ntokens[-1]
 
-    return batch_log_probs, all_ntokens, list(np.exp(batch_log_probs)), batch_log_probs_all
+    batch_probs = list(np.exp(batch_log_probs))
+
+    #return batch_log_probs, all_ntokens, batch_probs, batch_log_probs_all
+    return {
+        "batch_log_probs": batch_log_probs, # prob per sentence in the batch (sum due to log) for the observed tokens
+        "batch_ntokens": all_ntokens,
+        "batch_probs": batch_probs,
+        "batch_log_probs_all": batch_log_probs_all, # list (batch) of list of log_probs per token for the observed tokens
+        "batch_log_probs_predicted_all": batch_log_probs_predicted_all, # list (batch) of list of log_probs per token for the predicted tokens (max); the input tokens are the observed tokens, not the predicted ones
+        "batch_entropy_all": batch_entropy_all, # list (batch) of list of entropy per token
+        "llmixtic_alpha": batch_log_probs_predicted_all, # alias
+        "llmixtic_beta": batch_entropy_all, # alias
+        "llmixtic_gamma": batch_log_probs_all, # alias
+    }
 
 def get_model_hidden_state(src_inputs, trg_inputs, layer=-1):
     model_output = model(**src_inputs, decoder_input_ids=trg_inputs["input_ids"], output_hidden_states=True)
@@ -126,14 +146,30 @@ def preprocess(text, tokenizer, device, max_length):
     return inputs
 
 def run_and_print_results(all_src, all_trg, extra_data, src_inputs, trg_inputs, perplexity_skip_values=5):
-    batch_log_probs, all_ntokens, batch_probs, batch_log_probs_all = get_log_prob(src_inputs, trg_inputs)
+    #batch_log_probs, all_ntokens, batch_probs, batch_log_probs_all = get_log_prob(src_inputs, trg_inputs)
+    batch_results = get_log_prob(src_inputs, trg_inputs)
+    batch_log_probs = batch_results["batch_log_probs"]
+    all_ntokens = batch_results["batch_ntokens"]
+    batch_probs = batch_results["batch_probs"]
+    batch_log_probs_all = batch_results["batch_log_probs_all"]
+    llmixtic_alpha = batch_results["llmixtic_alpha"]
+    llmixtic_beta = batch_results["llmixtic_beta"]
+    llmixtic_gamma = batch_results["llmixtic_gamma"]
 
     assert len(all_src) == len(all_trg) == len(extra_data) == len(batch_log_probs) == len(all_ntokens) == len(batch_probs) == len(batch_log_probs_all)
+    assert len(all_src) == len(llmixtic_alpha) == len(llmixtic_beta) == len(llmixtic_gamma)
     assert isinstance(batch_log_probs_all, list), batch_log_probs_all
+    assert isinstance(llmixtic_alpha, list), llmixtic_alpha
+    assert isinstance(llmixtic_beta, list), llmixtic_beta
+    assert isinstance(llmixtic_gamma, list), llmixtic_gamma
 
-    for src, trg, ntokens, log_prob, prob, _extra_data, log_prob_per_token in zip(all_src, all_trg, all_ntokens, batch_log_probs, batch_probs, extra_data, batch_log_probs_all):
+    for src, trg, ntokens, log_prob, prob, _extra_data, log_prob_per_token, llmixtic_alpha_per_token, llmixtic_beta_per_token, llmixtic_gamma_per_token in zip(all_src, all_trg, all_ntokens, batch_log_probs, batch_probs, extra_data, batch_log_probs_all, llmixtic_alpha, llmixtic_beta, llmixtic_gamma):
         assert isinstance(log_prob_per_token, list), log_prob_per_token
+        assert isinstance(llmixtic_alpha_per_token, list), llmixtic_alpha_per_token
+        assert isinstance(llmixtic_beta_per_token, list), llmixtic_beta_per_token
+        assert isinstance(llmixtic_gamma_per_token, list), llmixtic_gamma
 
+        # load data
         _extra_data = '|'.join(_extra_data)
         _log_prob_per_token = '|'.join(map(str, log_prob_per_token))
         perplexity = [np.exp(-1. * sum(log_prob_per_token[:i + 1]) / (i + 1)) for i in range(len(log_prob_per_token))]
@@ -142,8 +178,17 @@ def run_and_print_results(all_src, all_trg, extra_data, src_inputs, trg_inputs, 
         max_abs_diff_consecutive_perplexity_skip = {skip: max(max_abs_diff_consecutive_perplexity_skip[skip]) if len(max_abs_diff_consecutive_perplexity_skip[skip]) else -1.0 for skip in range(perplexity_skip_values)}
         _max_abs_diff_consecutive_perplexity_skip = '|'.join(map(str, [max_abs_diff_consecutive_perplexity_skip[skip] for skip in range(perplexity_skip_values)]))
         max_abs_diff_consecutive_log_prob = max([abs(log_prob_per_token[i] - log_prob_per_token[i + 1]) for i in range(len(log_prob_per_token) - 1)])
+        ## llmixtic
+        _llmixtic_alpha_per_token = '|'.join(map(str, llmixtic_alpha_per_token))
+        _llmixtic_beta_per_token = '|'.join(map(str, llmixtic_beta_per_token))
+        _llmixtic_gamma_per_token = '|'.join(map(str, llmixtic_gamma_per_token))
 
-        print(f"{ntokens}\t{log_prob}\t{prob}\t{src}\t{trg}\t{_extra_data}\t{max_abs_diff_consecutive_log_prob}\t{_log_prob_per_token}\t{_max_abs_diff_consecutive_perplexity_skip}\t{_perplexity}")
+        # print
+        msg = f"{ntokens}\t{log_prob}\t{prob}\t{src}\t{trg}\t{_extra_data}\t{max_abs_diff_consecutive_log_prob}\t{_log_prob_per_token}\t{_max_abs_diff_consecutive_perplexity_skip}\t{_perplexity}"
+        ## llmixtic
+        msg += f"\t{_llmixtic_alpha_per_token}\t{_llmixtic_beta_per_token}\t{_llmixtic_gamma_per_token}"
+
+        print(msg)
 
     return None
 

@@ -139,7 +139,7 @@ def inference_from_stdin(model, tokenizer, batch_size, loss_function=None, devic
 
     _dataset = dataset.SmartBatchingURLsDataset(input_data, output_data, tokenizer, max_length_tokens,
                                                 set_desc="stdin_inference")
-    dataloader = _dataset.get_dataloader(batch_size, device, dataset_workers)
+    dataloader = _dataset.get_dataloader(batch_size, device, dataset_workers, sampler=torch.utils.data.SequentialSampler(_dataset))
 
     for batch in dataloader:
         tokens = [len(urls[urls != tokenizer.pad_token_id]) for urls in batch["url_tokens"]]

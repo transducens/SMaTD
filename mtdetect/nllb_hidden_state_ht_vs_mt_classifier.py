@@ -681,8 +681,6 @@ def eval(model, translation_model, data_generator, direction, device, decoder_st
     pt_data_update = kwargs["pt_data_update"] if "pt_data_update" in kwargs else None
     lm_data_update = kwargs["lm_data_update"] if "lm_data_update" in kwargs else None
 
-    assert not print_result, "Code not working"
-
     training = model.training
     lang_model_training = False
 
@@ -797,13 +795,11 @@ def eval(model, translation_model, data_generator, direction, device, decoder_st
         all_labels.extend(labels.tolist())
 
         if print_result:
-            # TODO not working
-            assert len(data["source_text"]) == len(outputs)
-            assert len(data["target_text"]) == len(outputs)
+            # This version is different from inference.py
             assert len(labels) == len(outputs)
             assert len(outputs) == len(outputs_classification)
 
-            for source_text, target_text, output, label, output_classification_aux in zip(data["source_text"], data["target_text"], outputs, labels, outputs_classification):
+            for output, label, output_classification_aux in zip(outputs, labels, outputs_classification):
                 output_classification = int(output >= threshold)
 
                 assert output_classification in (0, 1), output_classification
@@ -821,7 +817,7 @@ def eval(model, translation_model, data_generator, direction, device, decoder_st
                 else:
                     raise Exception(f"Unexpected values: {output_classification} vs {label}")
 
-                print(f"inference: {print_desc}\t{print_idx}\t{output}\tlabel={label}\t{conf_mat_value}\t{source_text}\t{target_text}")
+                print(f"inference: {print_desc}\t{print_idx}\t{output}\tlabel={label}\t{conf_mat_value}")
 
                 print_idx += 1
 
@@ -938,6 +934,7 @@ def main(args):
     num_layers = args.num_layers
     nhead = args.num_attention_heads
     do_inference = args.inference
+    inference_print_results = args.inference_print_results
     pretrained_model = args.pretrained_model
     pretrained_model_layer = args.pretrained_model_target_layer
     skip_train_eval = args.skip_train_set_eval
@@ -1180,7 +1177,7 @@ def main(args):
         lang_model = lang_model.eval()
         lang_model = lang_model.to(device)
 
-        if not train_groups_processing:
+        if not do_inference and not train_groups_processing:
             assert n_pickle_files > 0, "LM is only supported with pickle files (easier implementation)"
 
         max_length_encoder = utils.get_encoder_max_length(lang_model, lang_model_tokenizer, max_length_tokens=_max_length_encoder)
@@ -1342,7 +1339,7 @@ def main(args):
     early_stopping_best_loss = np.inf
     early_stopping_best_result_dev = -np.inf # accuracy
     eval_kwargs = {
-        "print_result": False,
+        "print_result": inference_print_results,
         #"print_desc": '-',
         "threshold": threshold,
         "layer": pretrained_model_layer,
@@ -1698,6 +1695,8 @@ def initialization():
     parser.add_argument('--model-input', type=str, default='', help="Classifier input path which will be loaded")
     parser.add_argument('--model-output', type=str, default='', help="Classifier output path where the model will be stored")
     parser.add_argument('--inference', action="store_true", help="Do not train, just apply inference to the train, dev and test files")
+    parser.add_argument('--inference-print-results', action="store_true",
+                        help="Print results per line")
     parser.add_argument('--patience', type=int, default=6,
                         help="Patience to stop training. If the specified value is greater than 0, epochs and patience will be taken into account")
     parser.add_argument('--train-until-patience', action="store_true",
