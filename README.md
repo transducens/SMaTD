@@ -1,6 +1,6 @@
 # SMaTD
 
-`SMaTD` (**S**urrogate **Ma**chine **T**ranslation **D**etection) is a tool implemented in python that leverages the interal representations of a machine translation (MT) system to determine, given a source sentence, whether a translation is human- or machine-generated.
+`SMaTD` (**S**urrogate **Ma**chine **T**ranslation **D**etection) is a tool implemented in python that leverages the internal representations of a machine translation (MT) system to determine, given a source sentence, whether a translation is human- or machine-generated.
 
 In this repository, you will find the code, along with the dataset and the models trained during our research, available in the [releases section](../../releases).
 
