@@ -41,7 +41,7 @@ smatd-lm-baseline --help
 
 Some scripts require pickle files, but generating sentence representations on the fly is also supported. Use `smatd/nllb_get_log_prob.py` to create these files. This consumes more disk space but greatly reduces time when training for multiple epochs.
 
-Check the `--help` flag for `smatd` and `smatd-lm-baseline` to see the available configuration options. The experiment scripts may also serve as a good starting point.
+Check the `--help` flag for `smatd` and `smatd-lm-baseline` to see the available configuration options. The experiment scripts may also serve as a good starting point for training. For inference, you may check out the file `inference_example.sh`.
 
 ## Citation
 
