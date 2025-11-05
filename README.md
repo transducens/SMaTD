@@ -34,14 +34,14 @@ Check out the installation:
 # Usage
 
 smatd --help
-smatd_lm_baseline --help
+smatd-lm-baseline --help
 ```
 
 ## Usage
 
 Some scripts require pickle files, but generating sentence representations on the fly is also supported. Use `smatd/nllb_get_log_prob.py` to create these files. This consumes more disk space but greatly reduces time when training for multiple epochs.
 
-Check the `--help` flag for `smatd` and `smatd_lm_baseline` to see the available configuration options. The experiment scripts may also serve as a good starting point.
+Check the `--help` flag for `smatd` and `smatd-lm-baseline` to see the available configuration options. The experiment scripts may also serve as a good starting point.
 
 ## Citation
 
