@@ -50,8 +50,7 @@ If you use SMaTD or the resources provided in this repository, please cite our w
 ```
 @misc{garcíaromero2025automaticmachinetranslationdetection,
       title={Automatic Machine Translation Detection Using a Surrogate Multilingual Translation Model}, 
-      author={Cristian Garc\'ia-Romero, Miquel Espl\`a-Gomis, Felipe
-  S\'anchez-Mart\'inez},
+      author={Cristian Garc\'ia-Romero, Miquel Espl\`a-Gomis, Felipe S\'anchez-Mart\'inez},
       year={2025},
       eprint={2511.02958},
       archivePrefix={arXiv},
