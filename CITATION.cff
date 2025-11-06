@@ -1,0 +1,45 @@
+# This CITATION.cff file was generated with cffinit.
+# Visit https://bit.ly/cffinit to generate yours today!
+
+cff-version: 1.2.0
+title: SMaTD
+message: >-
+  If you use this software, please cite it using the
+  metadata from this file.
+type: software
+authors:
+  - given-names: Cristian
+    family-names: García-Romero
+    email: cristian.gr@ua.es
+    affiliation: >-
+      Universitat d'Alacant, Transducens research group,
+      Spain
+    orcid: 'https://orcid.org/0000-0002-0483-4358'
+  - given-names: Miquel
+    family-names: Esplà-Gomis
+    email: miquel.espla@ua.es
+    affiliation: >-
+      Universitat d'Alacant, Transducens research group,
+      Spain
+    orcid: 'https://orcid.org/0000-0002-2682-066X'
+  - given-names: Felipe
+    family-names: Sánchez-Martínez
+    email: fsanchez@ua.es
+    affiliation: >-
+      Universitat d'Alacant, Transducens research group,
+      Spain
+    orcid: 'https://orcid.org/0000-0002-2295-2630'
+identifiers:
+  - type: doi
+    value: 10.48550/arXiv.2511.02958
+    description: arXiv preprint (Pre-MIT Press publication version)
+repository-code: 'https://github.com/transducens/SMaTD'
+abstract: >-
+  SMaTD leverages the internal representations of a machine
+  translation system to determine, given a source sentence,
+  whether a translation is human- or machine-generated.
+keywords:
+  - machine translation detection
+license: Apache-2.0
+commit: 3288b6b05348399a8c10f563e6bb27c2221ba188
+version: 2ce6a2444499e23d68cd48a8086c1dbc8f86ebd8
