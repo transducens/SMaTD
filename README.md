@@ -47,7 +47,18 @@ Check the `--help` flag for `smatd` and `smatd-lm-baseline` to see the available
 
 If you use SMaTD or the resources provided in this repository, please cite our work as follows:
 
-TODO
+```
+@misc{garcíaromero2025automaticmachinetranslationdetection,
+      title={Automatic Machine Translation Detection Using a Surrogate Multilingual Translation Model}, 
+      author={Cristian Garc\'ia-Romero, Miquel Espl\`a-Gomis, Felipe
+  S\'anchez-Mart\'inez},
+      year={2025},
+      eprint={2511.02958},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2511.02958}, 
+}
+```
 
 ## Acknowledgements
 
